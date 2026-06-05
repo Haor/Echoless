@@ -10,6 +10,9 @@ members = [
     "crates/echoless-core",
     "crates/echoless-cli",
 ]
+# vendored sonora fork 是独立子 workspace(edition 2024/resolver 3),不并入本 workspace;
+# 经 path 依赖引用。见 vendor/sonora/Cargo.toml。
+exclude = ["vendor/sonora"]
 
 [workspace.package]
 edition = "2021"

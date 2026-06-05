@@ -1,0 +1,483 @@
+//! Residual echo power estimation.
+//!
+//! Ported from `modules/audio_processing/aec3/residual_echo_estimator.h/cc`.
+
+use crate::aec_state::AecState;
+use crate::common::FFT_LENGTH_BY_2_PLUS_1;
+use crate::config::{EchoCanceller3Config, EchoModel};
+use crate::render_buffer::RenderBuffer;
+use crate::reverb_model::ReverbModel;
+use crate::spectrum_buffer::SpectrumBuffer;
+
+const DEFAULT_TRANSPARENT_MODE_GAIN: f32 = 0.01;
+
+/// Input data for residual echo power estimation.
+pub(crate) struct ResidualEchoInput<'a> {
+    pub aec_state: &'a AecState,
+    pub render_buffer: &'a RenderBuffer<'a>,
+    pub s2_linear: &'a [[f32; FFT_LENGTH_BY_2_PLUS_1]],
+    pub y2: &'a [[f32; FFT_LENGTH_BY_2_PLUS_1]],
+    pub dominant_nearend: bool,
+}
+
+/// Estimates the residual echo power based on ERLE and the linear power
+/// estimate.
+fn linear_estimate(
+    s2_linear: &[[f32; FFT_LENGTH_BY_2_PLUS_1]],
+    erle: &[[f32; FFT_LENGTH_BY_2_PLUS_1]],
+    r2: &mut [[f32; FFT_LENGTH_BY_2_PLUS_1]],
+) {
+    debug_assert_eq!(s2_linear.len(), erle.len());
+    debug_assert_eq!(s2_linear.len(), r2.len());
+    for ((r2_ch, s2_ch), erle_ch) in r2.iter_mut().zip(s2_linear.iter()).zip(erle.iter()) {
+        for ((r2_k, &s2_k), &erle_k) in r2_ch.iter_mut().zip(s2_ch.iter()).zip(erle_ch.iter()) {
+            debug_assert!(erle_k > 0.0);
+            *r2_k = s2_k / erle_k;
+        }
+    }
+}
+
+/// Estimates the residual echo power based on the echo path gain.
+fn non_linear_estimate(
+    echo_path_gain: f32,
+    x2: &[f32; FFT_LENGTH_BY_2_PLUS_1],
+    r2: &mut [[f32; FFT_LENGTH_BY_2_PLUS_1]],
+) {
+    for r2_ch in r2.iter_mut() {
+        for (r2_k, &x2_k) in r2_ch.iter_mut().zip(x2.iter()) {
+            *r2_k = x2_k * echo_path_gain;
+        }
+    }
+}
+
+/// Applies a soft noise gate to the echo generating power.
+fn apply_noise_gate(config: &EchoModel, x2: &mut [f32; FFT_LENGTH_BY_2_PLUS_1]) {
+    for x2_k in x2.iter_mut() {
+        if config.noise_gate_power > *x2_k {
+            *x2_k = (*x2_k - config.noise_gate_slope * (config.noise_gate_power - *x2_k)).max(0.0);
+        }
+    }
+}
+
+/// Computes the render indexes to analyze around the delay.
+fn get_render_indexes_to_analyze(
+    spectrum_buffer: &SpectrumBuffer,
+    echo_model: &EchoModel,
+    filter_delay_blocks: i32,
+) -> (usize, usize) {
+    let window_start = (filter_delay_blocks - echo_model.render_pre_window_size as i32).max(0);
+    let window_end = filter_delay_blocks + echo_model.render_post_window_size as i32;
+    let idx_start = spectrum_buffer
+        .index
+        .offset_index(spectrum_buffer.index.read, window_start);
+    let idx_stop = spectrum_buffer
+        .index
+        .offset_index(spectrum_buffer.index.read, window_end + 1);
+    (idx_start, idx_stop)
+}
+
+/// Estimates the echo generating signal power as gated maximal power over a
+/// time window.
+fn echo_generating_power(
+    num_render_channels: usize,
+    spectrum_buffer: &SpectrumBuffer,
+    echo_model: &EchoModel,
+    filter_delay_blocks: i32,
+    x2: &mut [f32; FFT_LENGTH_BY_2_PLUS_1],
+) {
+    let (idx_start, idx_stop) =
+        get_render_indexes_to_analyze(spectrum_buffer, echo_model, filter_delay_blocks);
+
+    x2.fill(0.0);
+    if num_render_channels == 1 {
+        let mut k = idx_start;
+        while k != idx_stop {
+            for (x2_j, &buf_j) in x2.iter_mut().zip(spectrum_buffer.buffer[k][0].iter()) {
+                *x2_j = x2_j.max(buf_j);
+            }
+            k = spectrum_buffer.index.inc_index(k);
+        }
+    } else {
+        let mut k = idx_start;
+        while k != idx_stop {
+            let mut render_power = [0.0f32; FFT_LENGTH_BY_2_PLUS_1];
+            for ch in 0..num_render_channels {
+                let channel_power = &spectrum_buffer.buffer[k][ch];
+                for (rp_j, &cp_j) in render_power.iter_mut().zip(channel_power.iter()) {
+                    *rp_j += cp_j;
+                }
+            }
+            for (x2_j, &rp_j) in x2.iter_mut().zip(render_power.iter()) {
+                *x2_j = x2_j.max(rp_j);
+            }
+            k = spectrum_buffer.index.inc_index(k);
+        }
+    }
+}
+
+/// Estimates the residual echo power after echo cancellation.
+#[derive(Debug)]
+pub(crate) struct ResidualEchoEstimator {
+    config: EchoCanceller3Config,
+    num_render_channels: usize,
+    early_reflections_transparent_mode_gain: f32,
+    late_reflections_transparent_mode_gain: f32,
+    early_reflections_general_gain: f32,
+    late_reflections_general_gain: f32,
+    erle_onset_compensation_in_dominant_nearend: bool,
+    x2_noise_floor: [f32; FFT_LENGTH_BY_2_PLUS_1],
+    x2_noise_floor_counter: [i32; FFT_LENGTH_BY_2_PLUS_1],
+    echo_reverb: ReverbModel,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReverbType {
+    Linear,
+    NonLinear,
+}
+
+impl ResidualEchoEstimator {
+    pub(crate) fn new(config: &EchoCanceller3Config, num_render_channels: usize) -> Self {
+        // Field trials default to not enabled — use default gains.
+        let early_reflections_general_gain = config.ep_strength.default_gain;
+        let late_reflections_general_gain = config.ep_strength.default_gain;
+        let erle_onset_compensation_in_dominant_nearend = config
+            .ep_strength
+            .erle_onset_compensation_in_dominant_nearend;
+
+        let mut estimator = Self {
+            config: config.clone(),
+            num_render_channels,
+            early_reflections_transparent_mode_gain: DEFAULT_TRANSPARENT_MODE_GAIN,
+            late_reflections_transparent_mode_gain: DEFAULT_TRANSPARENT_MODE_GAIN,
+            early_reflections_general_gain,
+            late_reflections_general_gain,
+            erle_onset_compensation_in_dominant_nearend,
+            x2_noise_floor: [0.0; FFT_LENGTH_BY_2_PLUS_1],
+            x2_noise_floor_counter: [0; FFT_LENGTH_BY_2_PLUS_1],
+            echo_reverb: ReverbModel::new(),
+        };
+        estimator.reset();
+        estimator
+    }
+
+    /// Estimates the residual echo power.
+    pub(crate) fn estimate(
+        &mut self,
+        input: &ResidualEchoInput<'_>,
+        r2: &mut [[f32; FFT_LENGTH_BY_2_PLUS_1]],
+        r2_unbounded: &mut [[f32; FFT_LENGTH_BY_2_PLUS_1]],
+    ) {
+        debug_assert_eq!(r2.len(), input.y2.len());
+        debug_assert_eq!(r2.len(), input.s2_linear.len());
+
+        let num_capture_channels = r2.len();
+
+        // Estimate the power of stationary noise in the render signal.
+        self.update_render_noise_power(input.render_buffer);
+
+        // NeuralResidualEchoEstimator is skipped (not ported).
+
+        // Estimate the residual echo power.
+        if input.aec_state.usable_linear_estimate() {
+            // When there is saturated echo, assume the same spectral content
+            // as is present in the microphone signal.
+            if input.aec_state.saturated_echo() {
+                for ch in 0..num_capture_channels {
+                    r2[ch].copy_from_slice(&input.y2[ch]);
+                    r2_unbounded[ch].copy_from_slice(&input.y2[ch]);
+                }
+            } else {
+                let onset_compensated =
+                    self.erle_onset_compensation_in_dominant_nearend || !input.dominant_nearend;
+                linear_estimate(input.s2_linear, input.aec_state.erle(onset_compensated), r2);
+                linear_estimate(
+                    input.s2_linear,
+                    input.aec_state.erle_unbounded(),
+                    r2_unbounded,
+                );
+            }
+
+            self.update_reverb(
+                ReverbType::Linear,
+                input.aec_state,
+                input.render_buffer,
+                input.dominant_nearend,
+            );
+            self.add_reverb(r2);
+            self.add_reverb(r2_unbounded);
+        } else {
+            let echo_path_gain = self.get_echo_path_gain(input.aec_state, true);
+
+            // When there is saturated echo, assume the same spectral content
+            // as is present in the microphone signal.
+            if input.aec_state.saturated_echo() {
+                for ch in 0..num_capture_channels {
+                    r2[ch].copy_from_slice(&input.y2[ch]);
+                    r2_unbounded[ch].copy_from_slice(&input.y2[ch]);
+                }
+            } else {
+                // Estimate the echo generating signal power.
+                let mut x2 = [0.0f32; FFT_LENGTH_BY_2_PLUS_1];
+                echo_generating_power(
+                    self.num_render_channels,
+                    input.render_buffer.get_spectrum_buffer(),
+                    &self.config.echo_model,
+                    input.aec_state.min_direct_path_filter_delay(),
+                    &mut x2,
+                );
+                if !input.aec_state.use_stationarity_properties() {
+                    apply_noise_gate(&self.config.echo_model, &mut x2);
+                }
+
+                // Subtract the stationary noise power.
+                for (x2_k, &nf_k) in x2.iter_mut().zip(self.x2_noise_floor.iter()) {
+                    *x2_k -= self.config.echo_model.stationary_gate_slope * nf_k;
+                    *x2_k = x2_k.max(0.0);
+                }
+
+                non_linear_estimate(echo_path_gain, &x2, r2);
+                non_linear_estimate(echo_path_gain, &x2, r2_unbounded);
+            }
+
+            if self.config.echo_model.model_reverb_in_nonlinear_mode
+                && !input.aec_state.transparent_mode_active()
+            {
+                self.update_reverb(
+                    ReverbType::NonLinear,
+                    input.aec_state,
+                    input.render_buffer,
+                    input.dominant_nearend,
+                );
+                self.add_reverb(r2);
+                self.add_reverb(r2_unbounded);
+            }
+        }
+
+        if input.aec_state.use_stationarity_properties() {
+            let mut residual_scaling = [0.0f32; FFT_LENGTH_BY_2_PLUS_1];
+            input
+                .aec_state
+                .get_residual_echo_scaling(&mut residual_scaling);
+            for (r2_ch, r2u_ch) in r2.iter_mut().zip(r2_unbounded.iter_mut()) {
+                for ((r2_k, r2u_k), &rs_k) in r2_ch
+                    .iter_mut()
+                    .zip(r2u_ch.iter_mut())
+                    .zip(residual_scaling.iter())
+                {
+                    *r2_k *= rs_k;
+                    *r2u_k *= rs_k;
+                }
+            }
+        }
+    }
+
+    fn reset(&mut self) {
+        self.echo_reverb.reset();
+        self.x2_noise_floor_counter
+            .fill(self.config.echo_model.noise_floor_hold as i32);
+        self.x2_noise_floor
+            .fill(self.config.echo_model.min_noise_floor_power);
+    }
+
+    fn update_render_noise_power(&mut self, render_buffer: &RenderBuffer<'_>) {
+        let x2 = render_buffer.spectrum(0);
+        let render_power: Vec<f32>;
+        let render_power_ref: &[f32];
+
+        if self.num_render_channels > 1 {
+            let mut power_data = [0.0f32; FFT_LENGTH_BY_2_PLUS_1];
+            for channel_power in &x2[..self.num_render_channels] {
+                for (pd_k, &cp_k) in power_data.iter_mut().zip(channel_power.iter()) {
+                    *pd_k += cp_k;
+                }
+            }
+            render_power = power_data.to_vec();
+            render_power_ref = &render_power;
+        } else {
+            render_power_ref = &x2[0];
+        }
+
+        // Estimate the stationary noise power in a minimum statistics manner.
+        for ((&rp_k, nf_k), nfc_k) in render_power_ref
+            .iter()
+            .zip(self.x2_noise_floor.iter_mut())
+            .zip(self.x2_noise_floor_counter.iter_mut())
+        {
+            if rp_k < *nf_k {
+                // Decrease rapidly.
+                *nf_k = rp_k;
+                *nfc_k = 0;
+            } else {
+                // Increase in a delayed, leaky manner.
+                if *nfc_k >= self.config.echo_model.noise_floor_hold as i32 {
+                    *nf_k = (*nf_k * 1.1).max(self.config.echo_model.min_noise_floor_power);
+                } else {
+                    *nfc_k += 1;
+                }
+            }
+        }
+    }
+
+    fn update_reverb(
+        &mut self,
+        reverb_type: ReverbType,
+        aec_state: &AecState,
+        render_buffer: &RenderBuffer<'_>,
+        dominant_nearend: bool,
+    ) {
+        // Choose reverb partition based on echo power model type.
+        let first_reverb_partition = match reverb_type {
+            ReverbType::Linear => aec_state.filter_length_blocks() as i32 + 1,
+            ReverbType::NonLinear => aec_state.min_direct_path_filter_delay() + 1,
+        };
+
+        // Compute render power for the reverb.
+        let x2 = render_buffer.spectrum(first_reverb_partition);
+        let render_power: [f32; FFT_LENGTH_BY_2_PLUS_1];
+        let render_power_ref: &[f32];
+
+        if self.num_render_channels > 1 {
+            let mut power_data = [0.0f32; FFT_LENGTH_BY_2_PLUS_1];
+            for channel_power in &x2[..self.num_render_channels] {
+                for (pd_k, &cp_k) in power_data.iter_mut().zip(channel_power.iter()) {
+                    *pd_k += cp_k;
+                }
+            }
+            render_power = power_data;
+            render_power_ref = &render_power;
+        } else {
+            render_power_ref = &x2[0];
+        }
+
+        // Update the reverb estimate.
+        let reverb_decay = aec_state.reverb_decay(dominant_nearend);
+        match reverb_type {
+            ReverbType::Linear => {
+                self.echo_reverb.update_reverb(
+                    render_power_ref,
+                    aec_state.get_reverb_frequency_response(),
+                    reverb_decay,
+                );
+            }
+            ReverbType::NonLinear => {
+                let echo_path_gain = self.get_echo_path_gain(aec_state, false);
+                self.echo_reverb.update_reverb_no_freq_shaping(
+                    render_power_ref,
+                    echo_path_gain,
+                    reverb_decay,
+                );
+            }
+        }
+    }
+
+    fn add_reverb(&self, r2: &mut [[f32; FFT_LENGTH_BY_2_PLUS_1]]) {
+        let reverb_power = self.echo_reverb.reverb();
+        for r2_ch in r2.iter_mut() {
+            for (r2_k, &rp_k) in r2_ch.iter_mut().zip(reverb_power.iter()) {
+                *r2_k += rp_k;
+            }
+        }
+    }
+
+    fn get_echo_path_gain(&self, aec_state: &AecState, gain_for_early_reflections: bool) -> f32 {
+        let gain_amplitude = if aec_state.transparent_mode_active() {
+            if gain_for_early_reflections {
+                self.early_reflections_transparent_mode_gain
+            } else {
+                self.late_reflections_transparent_mode_gain
+            }
+        } else if gain_for_early_reflections {
+            self.early_reflections_general_gain
+        } else {
+            self.late_reflections_general_gain
+        };
+        gain_amplitude * gain_amplitude
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crate::block_buffer::BlockBuffer;
+    use crate::fft_buffer::FftBuffer;
+    use crate::spectrum_buffer::SpectrumBuffer;
+
+    fn make_render_buffer(
+        size: usize,
+        num_channels: usize,
+    ) -> (BlockBuffer, SpectrumBuffer, FftBuffer) {
+        let block_buffer = BlockBuffer::new(size, 1, num_channels);
+        let spectrum_buffer = SpectrumBuffer::new(size, num_channels);
+        let fft_buffer = FftBuffer::new(size, num_channels);
+        (block_buffer, spectrum_buffer, fft_buffer)
+    }
+
+    #[test]
+    fn creation_and_reset() {
+        let config = EchoCanceller3Config::default();
+        let estimator = ResidualEchoEstimator::new(&config, 1);
+        // Noise floor should be initialized.
+        for &v in &estimator.x2_noise_floor {
+            assert_eq!(v, config.echo_model.min_noise_floor_power);
+        }
+    }
+
+    #[test]
+    fn nonlinear_estimate_produces_output() {
+        let config = EchoCanceller3Config::default();
+        let mut estimator = ResidualEchoEstimator::new(&config, 1);
+        let aec_state = AecState::new(&config, 1);
+
+        let size = 20;
+        let (bb, sb, fb) = make_render_buffer(size, 1);
+        let rb = RenderBuffer::new(&bb, &sb, &fb);
+
+        let s2_linear = [[0.0f32; FFT_LENGTH_BY_2_PLUS_1]];
+        let y2 = [[1.0f32; FFT_LENGTH_BY_2_PLUS_1]];
+        let mut r2 = [[0.0f32; FFT_LENGTH_BY_2_PLUS_1]];
+        let mut r2_unbounded = [[0.0f32; FFT_LENGTH_BY_2_PLUS_1]];
+
+        // AecState defaults to usable_linear_estimate=false, so nonlinear path.
+        estimator.estimate(
+            &ResidualEchoInput {
+                aec_state: &aec_state,
+                render_buffer: &rb,
+                s2_linear: &s2_linear,
+                y2: &y2,
+                dominant_nearend: false,
+            },
+            &mut r2,
+            &mut r2_unbounded,
+        );
+        // R2 should be computed (may be zero since render buffer is empty).
+        // The test mainly verifies no panics.
+    }
+
+    #[test]
+    fn noise_gate_reduces_power() {
+        let config = EchoCanceller3Config::default();
+        let mut x2 = [0.0f32; FFT_LENGTH_BY_2_PLUS_1];
+        // Set power below the noise gate.
+        x2.fill(config.echo_model.noise_gate_power * 0.5);
+        let original = x2;
+        apply_noise_gate(&config.echo_model, &mut x2);
+        // After noise gating, power should be reduced.
+        for k in 0..FFT_LENGTH_BY_2_PLUS_1 {
+            assert!(x2[k] <= original[k]);
+        }
+    }
+
+    #[test]
+    fn echo_path_gain_transparent_vs_normal() {
+        let config = EchoCanceller3Config::default();
+        let estimator = ResidualEchoEstimator::new(&config, 1);
+        let aec_state = AecState::new(&config, 1);
+
+        let normal_gain = estimator.get_echo_path_gain(&aec_state, true);
+        // normal aec_state has transparent_mode_active=false
+        let expected = config.ep_strength.default_gain * config.ep_strength.default_gain;
+        assert!((normal_gain - expected).abs() < 1e-6);
+    }
+}

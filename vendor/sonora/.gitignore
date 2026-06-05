@@ -1,0 +1,15 @@
+/target
+**/*.rs.bk
+*.swp
+*.swo
+*.stamp
+.DS_Store
+
+# Fuzzing
+fuzz/artifacts/
+fuzz/corpus/
+
+# Coverage
+lcov.info
+*.profraw
+*.profdata
