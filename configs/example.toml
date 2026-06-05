@@ -1,0 +1,17 @@
+# 管线配置示例(CLI 用 TOML;后期 Electron 用等价 JSON,映射到同一 PipelineConfig)
+mic = "default"          # 麦克风设备
+reference = "system"     # far-end 参考:Win=loopback / mac=Process Tap
+output = "BlackHole 2ch" # 虚拟麦输出:Win=VB-Cable 名 / mac=BlackHole 名
+sample_rate = 48000
+frame_ms = 10
+
+# 处理链:有序节点 = 串联;单个节点 = 单开;空 = 直通。运行时可换。
+# 每个 [[chain]] 的 kind 之外的键都作为该方案的参数。
+[[chain]]
+kind = "sonora_aec3"
+initial_delay_ms = 80
+max_tail_ms = 256
+
+[[chain]]
+kind = "localvqe"
+model = "models/localvqe-v1.3.gguf"

@@ -1,0 +1,31 @@
+# 跨平台实时 AEC 工具 — cargo workspace 骨架
+# 设计见 ../research/cross_platform_architecture.md
+[workspace]
+resolver = "2"
+members = [
+    "crates/echoless-hal",
+    "crates/echoless-hal-win",
+    "crates/echoless-hal-mac",
+    "crates/echoless-processors",
+    "crates/echoless-core",
+    "crates/echoless-cli",
+]
+
+[workspace.package]
+edition = "2021"
+version = "0.1.0"
+license = "MIT"
+# sonora 依赖要求 rust-version 1.91 + edition 2024(本机已 1.96)
+rust-version = "1.91"
+
+[workspace.dependencies]
+anyhow = "1"
+thiserror = "1"
+hound = "3.5"
+bitflags = "2"
+toml = "0.8"
+serde = { version = "1", features = ["derive"] }
+clap = { version = "4", features = ["derive"] }
+crossbeam-channel = "0.5"
+# rubato 留作处理器边界 SRC 的正式实现(蓝本 §10);骨架先用 chain.rs 里的占位线性重采样
+rubato = "0.15"

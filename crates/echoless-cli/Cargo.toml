@@ -1,0 +1,24 @@
+[package]
+name = "echoless-cli"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+description = "AEC 工具 CLI 前端(当前):离线跑链可用;实时/设备依赖平台 HAL(TODO)"
+
+[[bin]]
+name = "echoless"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+toml.workspace = true
+echoless-hal = { path = "../echoless-hal" }
+echoless-core = { path = "../echoless-core" }
+echoless-processors = { path = "../echoless-processors" }
+
+[target.'cfg(windows)'.dependencies]
+echoless-hal-win = { path = "../echoless-hal-win" }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+echoless-hal-mac = { path = "../echoless-hal-mac" }
