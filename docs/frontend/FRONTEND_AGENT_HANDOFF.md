@@ -81,6 +81,216 @@ agc = false
 - 不要用 stdout 人类文本作为长期数据源。
 - 不要把 CLI 命令删除或重命名。
 
+## Product Capability Map for UI/UX
+
+Echoless 是一个本地实时 reference-based AEC 工具。GUI 的核心价值不是展示算法细节,而是让用户稳定完成这条链路:
+
+```text
+microphone + system/reference audio -> selected backend -> virtual microphone/output device
+```
+
+### 当前可设计成产品能力
+
+| 能力 | 当前后端状态 | 前端建议 |
+|---|---|---|
+| Realtime AEC3 | 可用,主路径 | 首页默认启动项,标记 Recommended |
+| Mic / reference / output routing | CLI 可选设备,JSON 可列设备 | Devices 页做三段式链路选择 |
+| Reference mono / stereo | 可用 | Processing 页基础控制,默认 mono |
+| Noise suppression | AEC3 内置 NS 可调 | 普通模式可放 off/low/moderate/high,默认 off |
+| AGC | AEC3 内置 AGC 可开关 | 高级模式,默认 off |
+| Runtime status | JSONL 可输出 | 首页实时状态、meter、badge、延迟 |
+| User latency estimate | JSONL 已输出 | 首页显示 Estimated app latency |
+| AEC alignment delay | JSONL 已输出 | 诊断/高级信息,不要当成用户延迟 |
+| Diagnostics recording | 可写 mic/ref/out WAV + stats.csv + metadata | Diagnostics 页一键录制与 session 列表 |
+| LocalVQE | 可 standalone,实验 | Processing 页 Experimental backend |
+| RTX AEC | Windows-only,doctor/install/offline/realtime 已有 | Windows 且 doctor ok 才可选 |
+| Passthrough | 可用 | 诊断模式,用于排查设备链路 |
+| Offline processing | CLI 可用 | 首版可不做主 UI,可留高级入口 |
+| Config validate | JSON 可用 | 保存/启动前调用,展示结构化错误 |
+
+### 不应表现成已完成产品能力
+
+| 能力 | 当前状态 | 前端处理 |
+|---|---|---|
+| 原生虚拟麦驱动 | 未实现 | 提示用户选择 VB-Cable / BlackHole / Virtual Desktop Mic 等外部设备 |
+| 原生 WASAPI/CoreAudio HAL | stub,实时 MVP 走 cpal | 不在 UI 承诺 native HAL |
+| 参数热更新 | 首版不支持 | 运行中变更设备/backend/采样率时提示需要重启 |
+| 自动延迟校准向导 | 未实现独立向导 | 只显示 runtime status 中的估算值 |
+| 自动安装 VB-Cable/BlackHole | 未实现 | 只做说明/链接占位,不要静默安装 |
+| AEC3 + LocalVQE 默认级联 | 不推荐 | 不作为默认流程 |
+| macOS RTX AEC | 不可用 | 禁用或隐藏 RTX backend |
+
+## Primary User Flows
+
+### 1. First Run Setup
+
+目标: 用户第一次打开应用时能建立完整音频链路。
+
+1. 调用 `echoless devices --json`。
+2. 让用户选择 mic、reference、output。
+3. 默认 backend 为 AEC3。
+4. 默认配置为 48k / 10ms / mono reference / NS off / AGC off。
+5. 调用 `echoless config validate --config ... --json`。
+6. 允许 Start。
+
+空态:
+
+- 没有输入设备: 禁用 Start,显示刷新入口。
+- 没有输出设备: 禁用 Start,提示选择/安装虚拟输出设备。
+- reference 为 `none`: 允许启动,但状态应显示 No reference,告诉用户 AEC 不会真正消回声。
+
+### 2. Daily Use
+
+目标: 用户打开应用后用最少操作启动。
+
+- 首页显示 Start / Stop。
+- 首页显示当前 mic/reference/output 摘要。
+- 首页显示 mic/ref/out 三个电平。
+- 首页显示 Estimated app latency。
+- 只有异常时突出显示 drops/runtime errors/high latency。
+- 保留 Diagnostics quick action。
+
+### 3. Tuning
+
+目标: 用户音质或消回声效果不满意时能调整少量有效参数。
+
+- 普通模式只暴露 reference mono/stereo、NS off/low/moderate/high。
+- 高级模式再暴露 AGC、tail_ms、delay_num_filters、linear_stable_echo_path。
+- 参数变更如果影响 runtime,提示需要重启后生效。
+- 不要把所有 AEC3 内部 suppressor 参数铺出来。
+
+### 4. Diagnostics
+
+目标: 用户反馈断音、音量骤降、延迟或回声时能产出可交接证据。
+
+- Diagnostics 页提供 30s / 45s / custom。
+- 启动时把 diagnostics 写进 `PipelineConfig.diagnostics`。
+- runtime status 里的 `diagnostics_session_dir` 出现后展示 session 路径。
+- session 摘要优先显示 max output queue latency、input drops、stale drops、output underruns、runtime errors。
+
+### 5. Backend Experiment
+
+目标: 允许高级用户试听 LocalVQE 或 RTX AEC,但不影响默认 AEC3 保真路径。
+
+- LocalVQE 标记 Experimental,需要模型和动态库路径。
+- RTX AEC 只在 Windows 显示 doctor 结果;doctor 未通过时禁用并显示原因。
+- Passthrough 放在诊断/高级模式。
+
+## Screen-Level UX Requirements
+
+### Main Screen
+
+主屏应是运行控制台,不是 landing page。
+
+- Primary action: Start / Stop。
+- Secondary actions: Diagnostics, Open Processing。
+- Always visible: backend、mic/ref/out 摘要、三个 level meter、estimated app latency。
+- Status badge 优先级:
+  - Runtime error
+  - Dropping audio
+  - High latency
+  - No reference
+  - Running
+  - Ready
+- 不要把算法论文名、内部参数解释放在主屏。
+
+### Devices Screen
+
+- 三个清晰区域: Microphone / Reference / Output。
+- Reference 选项顺序: System audio, None, output devices, input devices。
+- `devices --json` 返回空数组时显示空态,不要崩溃。
+- macOS 上提示用户可能需要 BlackHole / Virtual Desktop Mic。
+- Windows 上提示常见 output 是 VB-Cable Input。
+
+### Processing Screen
+
+- backend 用分段控制或紧凑 cards,不要做大面积营销卡片。
+- AEC3 Recommended 默认展开。
+- LocalVQE / RTX AEC 默认折叠为实验 backend。
+- Advanced 区域折叠,并保持默认不改。
+
+### Diagnostics Screen
+
+- 重点不是画复杂图,而是让用户快速录证据。
+- 显示最近 session 列表、session 路径、关键 counters。
+- 提供打开目录动作。
+- 诊断录制不是自动停止 realtime;录制达到上限后 realtime 仍可能继续运行。
+
+## Error and Empty States
+
+| 状态 | 触发 | UI 行为 |
+|---|---|---|
+| No devices | `inputs` 或 `outputs` 为空 | 禁用 Start,显示 Refresh |
+| No reference | reference = `none` 或 ref 长期静音 | 允许运行,显示 warning |
+| High latency | `estimated_user_latency_ms` 高于阈值 | 显示 warning,引导看 output queue |
+| Dropping audio | drops/underruns 任一递增 | 显示 warning,建议诊断录制 |
+| Runtime error | `runtime_errors > 0` 或 `last_backend_error` | 显示 error,允许 Stop |
+| RTX unavailable | doctor 未通过 | 禁用 RTX card,显示 doctor detail |
+| LocalVQE missing model | validate 返回 model 错误 | 禁用 Start 或提示选择模型 |
+| Config invalid | validate 返回 errors | 显示字段级错误 |
+
+建议阈值:
+
+- `estimated_user_latency_ms < 80`: normal。
+- `80 <= estimated_user_latency_ms < 150`: warning。
+- `estimated_user_latency_ms >= 150`: high latency。
+- `ref_dbfs <= -110` 持续数秒: reference is silent。
+
+## Recommended Control Hierarchy
+
+### Normal
+
+- Backend: AEC3 / LocalVQE / RTX AEC / Passthrough。
+- Mic / Reference / Output。
+- Reference channels: mono / stereo。
+- Noise suppression: off / low / moderate / high。
+- Diagnostics duration。
+
+### Advanced
+
+- sample_rate。
+- frame_ms。
+- AGC。
+- tail_ms。
+- delay_num_filters。
+- linear_stable_echo_path。
+- LocalVQE model/library/threads/noise gate。
+- RTX runtime/model/intensity/on runtime error。
+
+### Hidden from First Version
+
+- AEC3 suppressor internals。
+- external delay estimator mode。
+- ring buffer stale-drop thresholds。
+- native HAL/virtual driver settings。
+
+## Platform-Specific UX Rules
+
+### Windows
+
+- RTX AEC card can be visible, but only enabled after `echoless nvafx doctor --json` is ok。
+- 常见 output 是 VB-Cable Input。
+- RTX AEC 限制: 48000 Hz / 10ms / mono reference。
+
+### macOS
+
+- RTX AEC hidden or disabled。
+- 用户可能需要 BlackHole / Virtual Desktop Mic / Aggregate Device。
+- 首次实时启动可能触发麦克风权限。
+- `devices --json` 可能在某些会话返回空数组,UI 必须有刷新/空态。
+
+## Presets
+
+首版可以把复杂参数包装成预设,避免用户误调。
+
+| Preset | 参数意图 | 默认 |
+|---|---|---|
+| Voice Fidelity | AEC3, NS off, AGC off, mono reference | 是 |
+| Echo Removal | AEC3, NS low/moderate,可提示可能压人声 | 否 |
+| Diagnostic | Passthrough 或 AEC3 + diagnostics,显示更多 counters | 否 |
+
+预设只应改变少量已暴露参数。不要让预设偷偷启用 AEC3 + LocalVQE 级联。
+
 ## UI 信息架构
 
 ### 1. Main
@@ -348,6 +558,84 @@ echoless config validate --config config.toml --json
 用途:
 
 - 排查虚拟麦、设备链路、延迟和 drop 是否来自 AEC backend。
+
+## CLI Backend Readiness Assessment
+
+这是面向前端开工的当前完成度判断。
+
+### Overall
+
+CLI sidecar 后端已经达到 **MVP frontend-ready**:
+
+- 可以列设备。
+- 可以列 backend manifest。
+- 可以校验配置。
+- 可以启动/停止实时进程。
+- 可以输出 JSONL runtime status。
+- 可以输出 diagnostics 证据。
+- 可以继续保留人工 CLI 调试路径。
+
+建议把当前后端视为 **可开始 Tauri 前端实现,但不是最终产品后端**。
+
+### Completion Matrix
+
+| 模块 | 完成度 | 前端可接入程度 | 说明 |
+|---|---:|---|---|
+| CLI text commands | 90% | 可用 | `devices/processors/run/offline/nvafx` 保留 |
+| JSON devices | 75% | 可接 | schema 可用;设备为空态需前端处理 |
+| JSON processor manifest | 80% | 可接 | 参数 manifest 可渲染 UI;后续可继续细化 labels/help |
+| Config validate JSON | 75% | 可接 | 结构校验可用;不加载模型/driver 做重型校验 |
+| Realtime AEC3 | 80% | 可接 | 主路径可用;真实设备体验仍要继续调参 |
+| Runtime JSONL status | 80% | 可接 | 电平、延迟、drop、runtime error 已输出 |
+| Diagnostics recording | 85% | 可接 | WAV/stats/metadata 可用;session 浏览由前端做 |
+| LocalVQE backend | 60% | 实验可接 | standalone 可用;音质和延迟不作为默认承诺 |
+| RTX AEC backend | 70% | Windows 可接 | doctor/install/offline/realtime 已有;授权/分发仍需谨慎 |
+| Config save/load | 60% | 前端自行实现 | 后端有 config schema 和 validate;没有专门 save command |
+| Process lifecycle API | 60% | sidecar 可实现 | 首版用 spawn/kill;还没有 daemon `start/stop` RPC |
+| Hot parameter updates | 20% | 不接 | 首版参数变化重启 runtime |
+| Native virtual mic | 0% | 不接 | 依赖外部虚拟设备 |
+| Native platform HAL | 20% | 不接 | crate 存在但 stub;实时 MVP 走 cpal |
+
+### Ready for Frontend Now
+
+- 设备页: `echoless devices --json`。
+- Backend/Processing 页: `echoless processors --json`。
+- 配置保存前校验: `echoless config validate --config <file> --json`。
+- 运行页: spawn `echoless run --config <file> --status-json`。
+- Stop: 对 sidecar 发 graceful stop,超时后 kill。
+- Diagnostics: 在 config 中写入 `[diagnostics]`,然后从 status 读取 `diagnostics_session_dir`。
+
+### Known Backend Gaps for UI Planning
+
+- 没有长期驻留 daemon;首版按 sidecar child process 管理。
+- 没有专门的 JSON command channel;配置通过文件传入。
+- 没有配置热更新;变更后重启。
+- 没有统一 settings store;前端自己管理用户配置文件。
+- 没有原生虚拟麦安装/创建能力。
+- 没有 built-in device permission assistant。
+- 没有自动读取 diagnostics 历史 session 的 JSON API;前端可先用文件系统扫描或只显示当前 session。
+- `devices --json` 的设备 id 目前是索引字符串,跨重启不保证稳定;保存配置时更稳的是保存用户可识别名称和最近选择。
+
+### Recommended Frontend Adapter Shape
+
+前端可以把后端封成四个 adapter:
+
+```ts
+interface EcholessBackend {
+  listDevices(): Promise<DeviceManifest>;
+  listProcessors(): Promise<ProcessorManifest>;
+  validateConfig(configPath: string): Promise<ConfigValidationResult>;
+  start(configPath: string): AsyncIterable<RuntimeStatus>;
+  stop(): Promise<void>;
+}
+```
+
+实现建议:
+
+- `listDevices/listProcessors/validateConfig` 用一次性 command。
+- `start` spawn 长运行 sidecar,读取 stdout JSONL。
+- stderr 作为 human log 面板输入,不要当状态源。
+- 运行中修改配置时: stop -> rewrite config -> validate -> start。
 
 ## Frontend State Machine
 
