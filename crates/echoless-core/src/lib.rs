@@ -10,13 +10,41 @@ use serde::{Deserialize, Serialize};
 use echoless_hal::{AudioFormat, AudioSink, AudioSource, DeviceInfo};
 use echoless_processors::{chain_from_nodes, NodeConfig, ProcessorStats};
 
-pub use echoless_processors::{EchoProcessor, NodeConfig as ChainNode, ProcessorChain, ProcessorStats as NodeStats};
+pub use echoless_processors::{
+    EchoProcessor, NodeConfig as ChainNode, ProcessorChain, ProcessorStats as NodeStats,
+};
 
 fn default_sample_rate() -> u32 {
     48000
 }
 fn default_frame_ms() -> u32 {
     10
+}
+fn default_reference_channels() -> ReferenceChannels {
+    ReferenceChannels::Mono
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ReferenceChannels {
+    Mono,
+    Stereo,
+}
+
+impl ReferenceChannels {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Mono => "mono",
+            Self::Stereo => "stereo",
+        }
+    }
+
+    pub fn channel_count(self) -> u16 {
+        match self {
+            Self::Mono => 1,
+            Self::Stereo => 2,
+        }
+    }
 }
 
 /// 整条管线配置(设备选择 + 处理链)。TOML/JSON 都映射到它。
@@ -32,6 +60,8 @@ pub struct PipelineConfig {
     pub sample_rate: u32,
     #[serde(default = "default_frame_ms")]
     pub frame_ms: u32,
+    #[serde(default = "default_reference_channels")]
+    pub reference_channels: ReferenceChannels,
     /// 处理链:有序节点;空 = 直通。可单开/串联/组合。
     #[serde(default)]
     pub chain: Vec<NodeConfig>,
@@ -45,6 +75,7 @@ impl Default for PipelineConfig {
             output: "default".into(),
             sample_rate: default_sample_rate(),
             frame_ms: default_frame_ms(),
+            reference_channels: default_reference_channels(),
             chain: Vec::new(),
         }
     }
@@ -100,9 +131,15 @@ where
         );
     }
 
-    sink.start(AudioFormat { sample_rate: cfg.sample_rate, channels: 1 })?;
+    sink.start(AudioFormat {
+        sample_rate: cfg.sample_rate,
+        channels: 1,
+    })?;
 
-    let mut chain = chain_from_nodes(&cfg.chain, cfg.sample_rate, ref_fmt.channels)?;
+    let mut chain_cfg = cfg.chain.clone();
+    apply_reference_channels_to_chain(&mut chain_cfg, cfg.reference_channels);
+    let reference_channels = cfg.reference_channels.channel_count();
+    let mut chain = chain_from_nodes(&chain_cfg, cfg.sample_rate, reference_channels)?;
     let chain_names = chain.names();
     let total_latency_ms = chain.total_latency_ms();
 
@@ -121,10 +158,10 @@ where
             break;
         }
         let near = downmix_to_mono(&mp.data, mp.format.channels, frames);
-        let far_len = (frames as usize) * ref_fmt.channels.max(1) as usize;
-        let far = &rp.data[..far_len.min(rp.data.len())];
+        let far =
+            remap_reference_channels(&rp.data, ref_fmt.channels, frames, cfg.reference_channels);
         let mut out = vec![0f32; frames as usize];
-        chain.process(&near, far, &mut out, frames);
+        chain.process(&near, &far, &mut out, frames);
         sink.write(&out, frames)?;
         total_frames += frames as u64;
     }
@@ -142,13 +179,27 @@ where
     })
 }
 
+pub fn apply_reference_channels_to_chain(nodes: &mut [NodeConfig], mode: ReferenceChannels) {
+    for node in nodes.iter_mut().filter(|node| node.kind == "sonora_aec3") {
+        node.params.insert(
+            "reference_channels".to_string(),
+            toml::Value::String(mode.as_str().to_string()),
+        );
+    }
+}
+
 /// 实时管线(基于泛型 AudioSource/Sink 的版本)。
 ///
 /// 注:MVP 的实时管线已落在 `echoless-cli` 的 cpal 实现(`realtime.rs`)——cpal 的回调
 /// 是 push 模型且 Stream !Send,直接套 pull 式 AudioSource 代价大,故 I/O 与处理分离、
 /// 处理仍走同一个 `ProcessorChain`。此泛型版保留供未来把实时编排抽回 core(经 daemon
 /// 复用)时使用;当前用 cpal 路径,见 cli。
-pub fn run_realtime<M, R, S>(_cfg: &PipelineConfig, mut mic: M, _reference: R, _sink: S) -> anyhow::Result<()>
+pub fn run_realtime<M, R, S>(
+    _cfg: &PipelineConfig,
+    mut mic: M,
+    _reference: R,
+    _sink: S,
+) -> anyhow::Result<()>
 where
     M: AudioSource,
     R: AudioSource,
@@ -169,6 +220,39 @@ fn downmix_to_mono(data: &[f32], channels: u16, frames: u32) -> Vec<f32> {
         }
         let s: f32 = data[start..start + ch].iter().copied().sum::<f32>() / ch as f32;
         out.push(s);
+    }
+    out
+}
+
+fn remap_reference_channels(
+    data: &[f32],
+    channels: u16,
+    frames: u32,
+    mode: ReferenceChannels,
+) -> Vec<f32> {
+    match mode {
+        ReferenceChannels::Mono => downmix_to_mono(data, channels, frames),
+        ReferenceChannels::Stereo => preserve_first_two_channels(data, channels, frames),
+    }
+}
+
+fn preserve_first_two_channels(data: &[f32], channels: u16, frames: u32) -> Vec<f32> {
+    let ch = channels.max(1) as usize;
+    let frames = frames as usize;
+    let mut out = Vec::with_capacity(frames * 2);
+    for f in 0..frames {
+        let start = f * ch;
+        if start >= data.len() {
+            break;
+        }
+        let left = data[start];
+        let right = if ch > 1 {
+            data.get(start + 1).copied().unwrap_or(left)
+        } else {
+            left
+        };
+        out.push(left);
+        out.push(right);
     }
     out
 }

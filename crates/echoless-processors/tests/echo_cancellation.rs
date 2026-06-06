@@ -39,11 +39,12 @@ fn refsig(n: usize) -> f32 {
 fn run(params: toml::Table, paths: &[(usize, f32)]) -> f32 {
     let mut p = registry::build("sonora_aec3").unwrap();
     p.configure(&params).unwrap();
+    let far_channels = p.io_spec().far_channels.max(1) as usize;
 
     let total = SR * 5;
     let warmup = SR * 2;
     let mut near = vec![0.0f32; FRAME];
-    let mut far = vec![0.0f32; FRAME]; // mono
+    let mut far = vec![0.0f32; FRAME * far_channels];
     let mut out = vec![0.0f32; FRAME];
 
     let (mut mic_sq, mut out_sq, mut cnt) = (0.0f64, 0.0f64, 0u64);
@@ -51,7 +52,9 @@ fn run(params: toml::Table, paths: &[(usize, f32)]) -> f32 {
     while i + FRAME <= total {
         for j in 0..FRAME {
             let n = i + j;
-            far[j] = refsig(n);
+            for ch in 0..far_channels {
+                far[j * far_channels + ch] = refsig(n);
+            }
             let mut echo = 0.0;
             for &(d, g) in paths {
                 if n >= d {
@@ -89,4 +92,30 @@ fn tuned_tail_injection_works() {
     params.insert("tail_ms".into(), toml::Value::Integer(120));
     let db = run(params, &[(2400, 0.5)]);
     assert!(db > 18.0, "tail=120ms 注入后回声压低不足:{db:.1} dB");
+}
+
+#[test]
+fn stereo_reference_mode_cancels_single_path_echo() {
+    let mut params = toml::Table::new();
+    params.insert(
+        "reference_channels".into(),
+        toml::Value::String("stereo".into()),
+    );
+
+    let db = run(params, &[(2400, 0.5)]);
+    assert!(db > 18.0, "stereo reference 回声压低不足:{db:.1} dB");
+}
+
+#[test]
+fn stereo_reference_mode_changes_sonora_io_spec() {
+    let mut p = registry::build("sonora_aec3").unwrap();
+    let mut params = toml::Table::new();
+    params.insert(
+        "reference_channels".into(),
+        toml::Value::String("stereo".into()),
+    );
+
+    p.configure(&params).unwrap();
+
+    assert_eq!(p.io_spec().far_channels, 2);
 }

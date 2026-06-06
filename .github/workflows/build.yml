@@ -46,6 +46,23 @@ jobs:
       - name: Build release
         run: cargo build --release --workspace --locked
 
+      - name: LocalVQE C API regression
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake --version
+          git clone --depth 1 --recursive https://github.com/localai-org/LocalVQE.git "${RUNNER_TEMP}/LocalVQE"
+          cmake -S "${RUNNER_TEMP}/LocalVQE/ggml" \
+            -B "${RUNNER_TEMP}/localvqe-build" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DLOCALVQE_BUILD_SHARED=ON
+          cmake --build "${RUNNER_TEMP}/localvqe-build" \
+            --config Release \
+            --target localvqe_shared test_regression regression-assets
+          ctest --test-dir "${RUNNER_TEMP}/localvqe-build" \
+            -C Release \
+            --output-on-failure
+
       - name: Package
         shell: bash
         run: |

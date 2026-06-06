@@ -12,6 +12,7 @@ reference = "system"     # far-end 参考:
 output = "default"       # 输出:虚拟麦设备名(Win=VB-Cable / mac=BlackHole),或 default 试听
 sample_rate = 48000      # 必须能整除 100(10ms 帧);mic/ref/out 共用此率
 frame_ms = 10
+reference_channels = "mono" # mono=当前稳定基线;stereo=保留 L/R far reference 供外放对比测试
 
 # 处理链:有序节点 = 串联;单个 = 单开;空 = 直通。kind 之外的键 = 该方案参数。
 [[chain]]

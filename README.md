@@ -8,8 +8,10 @@
 
 - 真实 WebRTC AEC3 路径:vendored `sonora` fork + `sonora_aec3` 处理器。
 - 实时 MVP:`echoless run --config configs/example.toml` 走 `cpal` + ringbuf。
+- far reference 可用 `reference_channels = "mono" | "stereo"` 切换;默认 mono,stereo 用于外放 L/R 对比试听。
 - 离线评测:`echoless offline` 仍可用。
-- LocalVQE、原生平台 HAL、原生虚拟麦驱动仍是后续阶段;MVP 输出建议接 VB-Cable / BlackHole。
+- LocalVQE 的上游 C API 会在 CI 做跨平台 regression smoke;Rust 实时处理器仍是 stub。
+- 原生平台 HAL、原生虚拟麦驱动仍是后续阶段;MVP 输出建议接 VB-Cable / BlackHole。
 
 ## crate 结构
 
@@ -34,6 +36,9 @@ sonora 经典 AEC3 与 LocalVQE 都是平级 `EchoProcessor` 节点,**可单开 
 
 `ProcessorChain` 自动处理节点间采样率/声道适配与 far ref 分发(每级都拿真实 ref)。
 当前边界 SRC 仍是占位线性重采样;LocalVQE 接入前需要替换成有状态 SRC。
+
+LocalVQE 推理约束见 `docs/localvqe_inference.md`:上游 C API 是 16 kHz mono
+mic + mono far reference,streaming hop 为 256 samples/16 ms。
 
 ## 构建与试跑
 
@@ -68,7 +73,8 @@ cargo run -p echoless-cli --bin echoless -- offline --mic m.wav --reference r.wa
 1. 安装 Rust stable 与 clippy。
 2. 运行 `cargo test --workspace --locked`。
 3. 运行 `cargo clippy --workspace --all-targets --locked -- -D warnings`。
-4. 生成 release artifact:`echoless-windows-*` / `echoless-macos-*`。
+4. 临时 clone LocalVQE,构建 C API shared library,下载官方 GGUF 跑 regression。
+5. 生成 release artifact:`echoless-windows-*` / `echoless-macos-*`。
 
 ## 下一步
 
