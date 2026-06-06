@@ -6,6 +6,8 @@
 > 本文档由五份调研整理合并而成(深度架构调研、技术报告、Neural AEC 模型调研、NVIDIA Broadcast 真伪 AEC 分析、Maxine SDK 接入评估),已统一结构、去除重复,保留全部数据、代码、链接与结论。
 >
 > **2026-06-05 修正:** 已按 `research/reference_repos_exploration_report.md`(reference_repos/ 16 组仓库源码级深扒,经 codex 复核)对本文做 8 处修正,均带 `file:line` 证据。主要变更:① AEC3 内置 `NeuralResidualEchoEstimator` 深度集成接口(§3.3);② `sonora` 升至 4/5 classical AEC3 Rust 主线(§3.2/§4.1);③ Virtual-Audio-Driver 公开版降至 1/5(mic 恒静音,§7.5);④ 虚拟麦克风起点改 simpleaudiosample + Win11 AecApo 路线(§7.3/§7.4);⑤ drift ppm 闭环无 production 实现=创新空间(§6.6);⑥ AEC3 4ms block/band0/external delay 等源码纠正(§4.1);⑦ DATA_DISCONTINUITY 风险 + AECMOS_local 评测(§12/§13);⑧ project-raven/DTLN/TSPNN/NKF/EchoFree 逐项纠正(§3.3/§14)。
+>
+> **2026-06-07 产品决策更新:** 原生虚拟麦克风驱动不再作为 Echoless 路线图目标。本文关于自研虚拟麦、WaveRT/SysVAD/simpleaudiosample、AudioServerPlugin 的分析仍可作为历史调研与风险背景,但当前产品实现长期依赖 VB-Cable / BlackHole / Virtual Desktop Mic 等外部虚拟设备。native HAL 只代表平台音频 I/O 层优化,边界见 `docs/architecture/native_hal_scope.md`。
 
 ---
 

@@ -4,7 +4,7 @@
 //!
 //! - MicSource         = WASAPI shared event-driven 采集(参考 tools/echoless-recorder)
 //! - SystemAudioSource = WASAPI loopback(`AUDCLNT_STREAMFLAGS_LOOPBACK`)
-//! - VirtualMicSink    = MVP 写 VB-Cable;产品 WaveRT(simpleaudiosample 派生)
+//! - VirtualMicSink    = 写入用户选择的外部虚拟设备,例如 VB-Cable
 //!
 //! 现阶段 start() 报错,标明待实现点,让上层 wiring 可编译可运行可定位。
 
@@ -58,7 +58,7 @@ impl VirtualMicSink {
 }
 impl AudioSink for VirtualMicSink {
     fn start(&mut self, _format: AudioFormat) -> anyhow::Result<()> {
-        anyhow::bail!("[win] 虚拟麦输出未实现 (id={}) — MVP 写 VB-Cable,见蓝本 §9 / §9.2", self.id)
+        anyhow::bail!("[win] 虚拟设备输出未实现 (id={}) — 当前实时路径走 cpal 写入 VB-Cable 等外部设备", self.id)
     }
     fn write(&mut self, _interleaved: &[f32], _frames: u32) -> anyhow::Result<()> {
         Ok(())

@@ -16,7 +16,8 @@
 - 不在首版要求参数热更新覆盖所有 backend。需要切换设备、采样率、backend 时可以重启 runtime。
 - 不默认级联 `sonora_aec3 + localvqe` 或 `sonora_aec3 + nvidia_afx_aec`。
 - 不把所有 AEC3 内部 suppressor 参数直接暴露给普通用户。
-- 不在 GUI 首版实现原生虚拟麦驱动。MVP 仍使用 VB-Cable / BlackHole / Virtual Desktop Mic 等外部虚拟设备。
+- 不实现原生虚拟麦驱动。MVP 与后续版本都使用 VB-Cable / BlackHole / Virtual Desktop Mic 等外部虚拟设备。
+- 不在 GUI 首版接 native HAL。native HAL 只是后续可选 I/O 优化,不是虚拟麦;边界见 `docs/architecture/native_hal_scope.md`。
 
 ## 当前基础
 

@@ -112,8 +112,8 @@ microphone + system/reference audio -> selected backend -> virtual microphone/ou
 
 | 能力 | 当前状态 | 前端处理 |
 |---|---|---|
-| 原生虚拟麦驱动 | 未实现 | 提示用户选择 VB-Cable / BlackHole / Virtual Desktop Mic 等外部设备 |
-| 原生 WASAPI/CoreAudio HAL | stub,实时 MVP 走 cpal | 不在 UI 承诺 native HAL |
+| 原生虚拟麦驱动 | 明确不做 | 提示用户选择 VB-Cable / BlackHole / Virtual Desktop Mic 等外部设备 |
+| 原生 WASAPI/CoreAudio HAL | stub,实时 MVP 走 cpal | 不在 UI 承诺 native HAL;仅作为未来 I/O 优化 |
 | 参数热更新 | 首版不支持 | 运行中变更设备/backend/采样率时提示需要重启 |
 | 自动延迟校准向导 | 未实现独立向导 | 只显示 runtime status 中的估算值 |
 | 自动安装 VB-Cable/BlackHole | 未实现 | 只做说明/链接占位,不要静默安装 |
@@ -262,7 +262,8 @@ microphone + system/reference audio -> selected backend -> virtual microphone/ou
 - AEC3 suppressor internals。
 - external delay estimator mode。
 - ring buffer stale-drop thresholds。
-- native HAL/virtual driver settings。
+- native HAL settings。
+- native virtual mic / driver settings。
 
 ## Platform-Specific UX Rules
 
@@ -593,8 +594,8 @@ CLI sidecar 后端已经达到 **MVP frontend-ready**:
 | Config save/load | 60% | 前端自行实现 | 后端有 config schema 和 validate;没有专门 save command |
 | Process lifecycle API | 60% | sidecar 可实现 | 首版用 spawn/kill;还没有 daemon `start/stop` RPC |
 | Hot parameter updates | 20% | 不接 | 首版参数变化重启 runtime |
-| Native virtual mic | 0% | 不接 | 依赖外部虚拟设备 |
-| Native platform HAL | 20% | 不接 | crate 存在但 stub;实时 MVP 走 cpal |
+| Native virtual mic | 0% | 不接 | 明确不做;依赖外部虚拟设备 |
+| Native platform HAL | 20% | 不接 | crate 存在但 stub;实时 MVP 走 cpal;不是虚拟麦 |
 
 ### Ready for Frontend Now
 
@@ -611,10 +612,17 @@ CLI sidecar 后端已经达到 **MVP frontend-ready**:
 - 没有专门的 JSON command channel;配置通过文件传入。
 - 没有配置热更新;变更后重启。
 - 没有统一 settings store;前端自己管理用户配置文件。
-- 没有原生虚拟麦安装/创建能力。
+- 原生虚拟麦安装/创建能力不在路线图内;前端只管理外部虚拟设备选择。
 - 没有 built-in device permission assistant。
 - 没有自动读取 diagnostics 历史 session 的 JSON API;前端可先用文件系统扫描或只显示当前 session。
 - `devices --json` 的设备 id 目前是索引字符串,跨重启不保证稳定;保存配置时更稳的是保存用户可识别名称和最近选择。
+
+### Native HAL / Virtual Mic Boundary
+
+- Native virtual mic is out of scope. Do not design install, create, driver health, or driver update flows for an in-project virtual microphone.
+- Native HAL means platform audio I/O replacement for `cpal`: Windows WASAPI capture/loopback/QPC/MMCSS/device recovery, or macOS CoreAudio AUHAL/Process Tap/mach time.
+- GUI MVP should not surface native HAL as a user-facing mode. Treat it as an internal future optimization only if diagnostics prove `cpal` is the bottleneck.
+- The durable scope note is `docs/architecture/native_hal_scope.md`.
 
 ### Recommended Frontend Adapter Shape
 

@@ -45,7 +45,7 @@ pub trait AudioSource: Send {
     fn stop(&mut self);
 }
 
-/// 音频输出汇:虚拟麦克风(MVP=写进 VB-Cable/BlackHole;产品=原生驱动桥)。
+/// 音频输出汇:写入用户选择的输出设备,通常是 VB-Cable/BlackHole 等外部虚拟设备。
 pub trait AudioSink: Send {
     fn start(&mut self, format: AudioFormat) -> anyhow::Result<()>;
     fn write(&mut self, interleaved: &[f32], frames: u32) -> anyhow::Result<()>;

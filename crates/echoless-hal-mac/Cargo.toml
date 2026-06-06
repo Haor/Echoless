@@ -3,7 +3,7 @@ name = "echoless-hal-mac"
 edition.workspace = true
 version.workspace = true
 license.workspace = true
-description = "macOS HAL 后端(CoreAudio AUHAL + Process Tap + AudioServerPlugin/BlackHole + mach)。骨架阶段为 stub。"
+description = "macOS HAL 后端(CoreAudio AUHAL + Process Tap + mach;不含 AudioServerPlugin 虚拟麦)。骨架阶段为 stub。"
 
 [dependencies]
 anyhow.workspace = true

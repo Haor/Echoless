@@ -14,7 +14,8 @@
 - NVIDIA AFX / RTX AEC 已作为 Windows-only 可选 backend 接入:`doctor` / 本地 runtime install / 离线 WAV / 实时 `nvidia_afx_aec`。
 - Windows 本机 RTX AEC standalone 已完成 45s diagnostics smoke:RTX 5080 Blackwell runtime 可用,USB mic index `4`,reference `system`,output `3`(CABLE Input),`runtime_errors=0`。
 - macOS artifact 可正常构建 AEC3/LocalVQE 路径;RTX AEC 在 macOS 上按设计不可用,GUI/安装器应通过 `echoless nvafx doctor --json` 禁用该 backend。
-- 原生平台 HAL、原生虚拟麦驱动仍是后续阶段;MVP 输出建议接 VB-Cable / BlackHole。
+- 原生虚拟麦驱动明确不做;输出长期依赖 VB-Cable / BlackHole / Virtual Desktop Mic 等外部虚拟设备。
+- 原生平台 HAL 仅保留为后续可选 I/O 优化,当前实时路径继续走 `cpal`;边界见 `docs/architecture/native_hal_scope.md`。
 - 产品默认策略:以 `sonora_aec3` 保真人声为主。LocalVQE 与 RTX AEC 都是独立可选方案,不作为 AEC3 默认后级。
 
 ## crate 结构
@@ -22,8 +23,8 @@
 | crate | 职责 | 状态 |
 |---|---|---|
 | `echoless-hal` | 平台无关 trait(`AudioSource`/`AudioSink`/`MonotonicClock`)+ 类型 + 文件/null 后端 | ✅ |
-| `echoless-hal-win` | Windows HAL(WASAPI/WaveRT/QPC) | stub,实时 MVP 暂走 cpal |
-| `echoless-hal-mac` | macOS HAL(CoreAudio/Process Tap/AudioServerPlugin/mach) | stub,实时 MVP 暂走 cpal |
+| `echoless-hal-win` | Windows HAL(WASAPI loopback/capture/QPC,不含自研虚拟麦驱动) | stub,实时 MVP 暂走 cpal |
+| `echoless-hal-mac` | macOS HAL(CoreAudio/Process Tap/mach,不含 AudioServerPlugin 虚拟麦) | stub,实时 MVP 暂走 cpal |
 | `echoless-processors` | `EchoProcessor` trait + `ProcessorChain` + `sonora_aec3` / `localvqe` / `nvidia_afx_aec` 节点 | ✅ AEC3 可用;LocalVQE 可加载 DLL/dylib + GGUF 推理;RTX AEC Windows 可动态加载 AFX runtime |
 | `echoless-core` | 管线编排 + `PipelineConfig` + `ControlApi` + `run_offline` | ✅ 离线可用;实时 cpal 路径在 CLI |
 | `echoless-cli` | CLI 前端:`processors` / `devices` / `offline` / `run` | ✅ |
@@ -122,4 +123,4 @@ cargo run -p echoless-cli --bin echoless --release -- run --config configs/examp
 3. `echoless-processors/chain.rs` 占位线性 SRC 换成 rubato 有状态 SRC。
 4. 按 `docs/frontend/FRONTEND_ADAPTATION_PLAN.md` 把实时 runtime 适配成 GUI/daemon 可复用控制面,同时保留 CLI 一等入口。
 5. 前端实现交接见 `docs/frontend/FRONTEND_AGENT_HANDOFF.md`。
-6. 原生 WASAPI/CoreAudio/虚拟麦驱动阶段再替换 cpal MVP。
+6. 仅在 `cpal` 实测暴露不可接受的枚举、timestamp、loopback、device recovery 或延迟/抖动问题时,再评估窄范围原生 HAL;不要规划原生虚拟麦驱动。

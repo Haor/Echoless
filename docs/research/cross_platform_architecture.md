@@ -2,6 +2,8 @@
 
 > 本文是面向落地开发的**架构蓝本**,在 `windows_aec_research.md`(真理来源,Windows 调研)之上扩展跨平台设计。
 > 引擎选型/源码证据仍以主文档与 `reference_repos_exploration_report.md` 为准;本文聚焦**如何把核心做成平台无关、把平台差异压到最小**。
+>
+> **2026-06-07 产品决策更新:** 原生虚拟麦克风驱动不再作为路线图目标。本文早期提到的 WaveRT / AudioServerPlugin “产品虚拟麦”保留为历史调研背景,当前实现与 GUI 规划长期使用 VB-Cable / BlackHole / Virtual Desktop Mic 等外部虚拟设备。native HAL 只表示平台音频 I/O 优化层,不等同于虚拟麦;当前边界见 `docs/architecture/native_hal_scope.md`。
 
 ## 0. 目标与基线决策
 
@@ -33,8 +35,7 @@
 | 环形缓冲 | `ringbuf` / `crossbeam` SPSC | 热路径无锁;**不引入 async runtime** |
 | Windows 音频 | **`windows` crate**(WASAPI) | 已在用 |
 | macOS 音频 | `coreaudio-sys` + `coreaudio-rs` + `objc2` + `core-foundation`;Process Tap 手 `extern "C"` | 14.4+ 原生 |
-| 虚拟麦(MVP) | VB-Cable(Win)/ BlackHole(mac),**安装/配置 UX 仿 MicYou** | 省自研驱动(§9.2) |
-| 虚拟麦(产品) | WaveRT(Win)/ AudioServerPlugin(mac) | Phase 4 |
+| 虚拟麦 | VB-Cable(Win)/ BlackHole(mac)/Virtual Desktop Mic 等外部设备 | 当前产品决策:不做自研虚拟麦驱动 |
 | LocalVQE 构建 | `cmake` crate 编 GGML(mac `-DGGML_METAL=ON`) | — |
 | C 库构建 | `cc` crate(可选 speex / C++ AEC3) | — |
 | **前端(当前)** | **CLI:`clap` + TOML 配置 + 终端 metrics** | 先行;直接内嵌 core |
@@ -49,7 +50,7 @@
 
 1. **核心层零 `#[cfg]`。** `echoless-core` / `echoless-engine` / `echoless-neural` 不含任何平台代码;平台分叉只在 `echoless-hal-win` / `echoless-hal-mac`,由 `echoless-app` 按 cfg 装配。
 2. **far-end reference 也是一个 `AudioSource`。** 核心不知道这帧 reference 来自 WASAPI loopback、macOS Process Tap、还是虚拟声卡——只拿到「带时间戳的 far-end 帧」。这一个抽象挡住 90% 平台差异。
-3. **I/O 两条边先用现成虚拟声卡兜底。** Phase 2 两平台都先用 VB-Cable / BlackHole 兜输出(必要时兜输入),把核心 pipeline 一次写成两平台复用;原生 I/O(WaveRT / Process Tap / AudioServerPlugin)留到 Phase 4。
+3. **I/O 两条边用现成虚拟声卡兜底。** 两平台都用 VB-Cable / BlackHole / Virtual Desktop Mic 等外部设备兜输出(必要时兜输入),把核心 pipeline 一次写成两平台复用;原生 HAL 后续只在 capture/loopback/timestamp/recovery 证明必要时窄范围推进,不做自研虚拟麦。
 4. **时间统一为单调纳秒。** 平台各自把 QPC / `mHostTime` 换算成 `u64` ns,核心只认 ns;drift/对齐逻辑跨平台同一套。
 5. **48k 内部处理。** 所有引擎/对齐在 48k 进行;采集若非 48k,在 HAL 边界用 rubato 转;LocalVQE 16k 在其自己的边界内转。
 

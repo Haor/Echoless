@@ -3,7 +3,7 @@ name = "echoless-hal-win"
 edition.workspace = true
 version.workspace = true
 license.workspace = true
-description = "Windows HAL 后端(WASAPI mic/loopback + WaveRT/VB-Cable + QPC)。骨架阶段为 stub。"
+description = "Windows HAL 后端(WASAPI mic/loopback + QPC;不含自研虚拟麦驱动)。骨架阶段为 stub。"
 
 [dependencies]
 anyhow.workspace = true

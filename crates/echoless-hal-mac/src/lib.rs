@@ -4,7 +4,7 @@
 //!
 //! - MicSource         = CoreAudio AUHAL(kAudioUnitSubType_HALOutput,enable input)
 //! - SystemAudioSource = Core Audio Process Tap(`AudioHardwareCreateProcessTap` + aggregate device)
-//! - VirtualMicSink    = MVP 写 BlackHole;产品 AudioServerPlugin(用户态)
+//! - VirtualMicSink    = 写入用户选择的外部虚拟设备,例如 BlackHole
 //! - 时钟 = AudioTimeStamp.mHostTime(mach 时基);实时线程 os_workgroup_join
 //!
 //! 现阶段 start() 报错,标明待实现点。
@@ -59,7 +59,7 @@ impl VirtualMicSink {
 }
 impl AudioSink for VirtualMicSink {
     fn start(&mut self, _format: AudioFormat) -> anyhow::Result<()> {
-        anyhow::bail!("[mac] 虚拟麦输出未实现 (id={}) — MVP 写 BlackHole,见蓝本 §8.2", self.id)
+        anyhow::bail!("[mac] 虚拟设备输出未实现 (id={}) — 当前实时路径走 cpal 写入 BlackHole 等外部设备", self.id)
     }
     fn write(&mut self, _interleaved: &[f32], _frames: u32) -> anyhow::Result<()> {
         Ok(())
