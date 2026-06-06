@@ -87,14 +87,10 @@ jobs:
             --config Release \
             --target localvqe_shared
 
-          regression_cxx_flags="-DLOCALVQE_BUILD"
-          if [[ "${RUNNER_OS}" == "Windows" ]]; then
-            regression_cxx_flags="/DLOCALVQE_BUILD"
-          fi
           cmake -S "${localvqe_src}/ggml" \
             -B "${regression_build}" \
             -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_CXX_FLAGS="${regression_cxx_flags}"
+            -DCMAKE_CXX_FLAGS="-DLOCALVQE_BUILD"
           cmake --build "${regression_build}" \
             --config Release \
             --target test_regression regression-assets
