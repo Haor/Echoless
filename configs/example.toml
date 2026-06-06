@@ -40,3 +40,10 @@ agc = false                  # 保持电平自然,避免双讲时忽大忽小
 # threads = 2                    # CPU 线程数;0/不填 = 上游 auto
 # noise_gate = false             # 保真人声优先;门限过高会吃掉轻声/尾音
 # noise_gate_threshold_dbfs = -60.0
+
+# NVIDIA AFX / RTX AEC 是可选 Windows backend。先运行:
+#   echoless nvafx doctor
+# 当前已接入 runtime discovery/doctor;实时 DLL 调用仍在集成中,配置误用会给出明确错误。
+# [[chain]]
+# kind = "nvidia_afx_aec"
+# runtime_dir = "auto"           # auto = ECHOLESS_NVAFX_RUNTIME_DIR 或 %LOCALAPPDATA%\Echoless\nvafx\2.1.0

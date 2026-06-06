@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 
 pub mod chain;
 pub mod localvqe;
+pub mod nvafx;
 pub mod passthrough;
 pub mod registry;
 pub mod sonora_aec3;

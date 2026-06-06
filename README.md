@@ -11,6 +11,7 @@
 - far reference 可用 `reference_channels = "mono" | "stereo"` 切换;默认 mono,stereo 用于外放 L/R 对比试听。
 - 离线评测:`echoless offline` 仍可用。
 - LocalVQE 已通过动态 C ABI 接入 `localvqe` 处理器;CI 会构建上游 shared library、跑 regression,再跑 Echoless FFI smoke。
+- NVIDIA AFX / RTX AEC 已接入 runtime discovery 与 `echoless nvafx doctor`;实时 DLL 调用仍在集成中。
 - 原生平台 HAL、原生虚拟麦驱动仍是后续阶段;MVP 输出建议接 VB-Cable / BlackHole。
 - 产品默认策略:以 `sonora_aec3` 保真人声为主。LocalVQE 是独立可选方案,不作为 AEC3 默认后级;如果后面还接 NVIDIA Broadcast,本层默认不做 NS/AGC。
 
@@ -21,7 +22,7 @@
 | `echoless-hal` | 平台无关 trait(`AudioSource`/`AudioSink`/`MonotonicClock`)+ 类型 + 文件/null 后端 | ✅ |
 | `echoless-hal-win` | Windows HAL(WASAPI/WaveRT/QPC) | stub,实时 MVP 暂走 cpal |
 | `echoless-hal-mac` | macOS HAL(CoreAudio/Process Tap/AudioServerPlugin/mach) | stub,实时 MVP 暂走 cpal |
-| `echoless-processors` | `EchoProcessor` trait + `ProcessorChain` + `sonora_aec3` / `localvqe` 节点 | ✅ AEC3 可用;LocalVQE 可加载 DLL/dylib + GGUF 推理 |
+| `echoless-processors` | `EchoProcessor` trait + `ProcessorChain` + `sonora_aec3` / `localvqe` / `nvidia_afx_aec` 节点 | ✅ AEC3 可用;LocalVQE 可加载 DLL/dylib + GGUF 推理;RTX AEC 先接 runtime 预检 |
 | `echoless-core` | 管线编排 + `PipelineConfig` + `ControlApi` + `run_offline` | ✅ 离线可用;实时 cpal 路径在 CLI |
 | `echoless-cli` | CLI 前端:`processors` / `devices` / `offline` / `run` | ✅ |
 
@@ -53,6 +54,9 @@ cargo build --release
 # 列出处理器种类
 cargo run -- processors
 
+# 检查 NVIDIA AFX / RTX AEC runtime
+cargo run -- nvafx doctor
+
 # 列出音频设备
 cargo run -- devices
 
@@ -83,8 +87,9 @@ cargo run -p echoless-cli --bin echoless -- offline --mic m.wav --reference r.wa
 
 ## 下一步
 
-1. 用 Windows 外放 + USB mic + VB-Cable 做实机反馈,先调 `tail_ms` 与 reference mono/stereo;`ns_level` 只做低强度对照。
-2. 增加 `eval` 子命令,用 output/input energy ratio 做离线效果量化。
-3. `echoless-processors/chain.rs` 占位线性 SRC 换成 rubato 有状态 SRC。
-4. 把实时 runtime 从 CLI 层进一步抽成 GUI/daemon 可复用控制面。
-5. 原生 WASAPI/CoreAudio/虚拟麦驱动阶段再替换 cpal MVP。
+1. 完成 NVIDIA AFX AEC 离线 harness 与实时 `nvidia_afx_aec` DLL 调用。
+2. 用 Windows 外放 + USB mic + VB-Cable 做实机反馈,先调 `tail_ms` 与 reference mono/stereo;`ns_level` 只做低强度对照。
+3. 增加 `eval` 子命令,用 output/input energy ratio 做离线效果量化。
+4. `echoless-processors/chain.rs` 占位线性 SRC 换成 rubato 有状态 SRC。
+5. 把实时 runtime 从 CLI 层进一步抽成 GUI/daemon 可复用控制面。
+6. 原生 WASAPI/CoreAudio/虚拟麦驱动阶段再替换 cpal MVP。

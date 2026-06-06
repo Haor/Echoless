@@ -82,8 +82,8 @@ staging 目录里的 `manifest.json` 已经按这个 asset 形态生成，包含
 
 建议实现顺序：
 
-1. 增加 `nvafx doctor` 检测和可读错误提示。
-2. 增加 runtime discovery：config、`ECHOLESS_NVAFX_RUNTIME_DIR`、默认 `%LOCALAPPDATA%` 安装根目录。
-3. 增加离线 AEC harness，用 WAV 做确定性对照。
-4. 增加实时 `nvidia_afx_aec` 可选 backend。
-5. 确认再分发条款后，再增加 installer/download 支持。
+1. [x] 增加 `nvafx doctor` 检测和可读错误提示。
+2. [x] 增加 runtime discovery：config、`ECHOLESS_NVAFX_RUNTIME_DIR`、默认 `%LOCALAPPDATA%` 安装根目录。
+3. [ ] 增加离线 AEC harness，用 WAV 做确定性对照。
+4. [ ] 增加实时 `nvidia_afx_aec` 可选 backend。
+5. [ ] 确认再分发条款后，再增加 installer/download 支持。

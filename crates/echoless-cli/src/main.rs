@@ -1,6 +1,6 @@
 //! echoless — 跨平台 reference-based AEC 工具 CLI。
 //!
-//! 当前可用:`processors` / `devices` / `offline` / `run`。
+//! 当前可用:`processors` / `devices` / `offline` / `run` / `nvafx doctor`。
 //! 实时 MVP 走 cpal;主线走经典 AEC3(sonora)保真,LocalVQE 作为独立可选处理器。
 
 #[cfg(not(feature = "realtime"))]
@@ -10,6 +10,7 @@ mod realtime;
 
 use anyhow::{bail, Result};
 use clap::{Args, Parser, Subcommand};
+use std::path::PathBuf;
 
 use echoless_core::{
     apply_reference_channels_to_chain, run_offline, DiagnosticsConfig, PipelineConfig,
@@ -35,6 +36,8 @@ enum Cmd {
     Devices,
     /// 实时运行
     Run(RunArgs),
+    /// NVIDIA AFX / RTX AEC runtime 工具
+    Nvafx(NvafxArgs),
 }
 
 #[derive(Args)]
@@ -112,6 +115,25 @@ struct RunArgs {
     diagnostic_seconds: Option<u32>,
 }
 
+#[derive(Args)]
+struct NvafxArgs {
+    #[command(subcommand)]
+    cmd: NvafxCmd,
+}
+
+#[derive(Subcommand)]
+enum NvafxCmd {
+    /// 检查 RTX AEC runtime、GPU、driver、VC++ runtime 是否可用
+    Doctor(NvafxDoctorArgs),
+}
+
+#[derive(Args)]
+struct NvafxDoctorArgs {
+    /// 覆盖 runtime 根目录;默认读 ECHOLESS_NVAFX_RUNTIME_DIR,再退到 %LOCALAPPDATA%\Echoless\nvafx\2.1.0
+    #[arg(long)]
+    runtime_dir: Option<PathBuf>,
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
@@ -119,6 +141,7 @@ fn main() -> Result<()> {
         Cmd::Processors => cmd_processors(),
         Cmd::Devices => cmd_devices(),
         Cmd::Run(a) => cmd_run(a),
+        Cmd::Nvafx(a) => cmd_nvafx(a),
     }
 }
 
@@ -197,6 +220,71 @@ fn cmd_processors() -> Result<()> {
         println!("  - {k}");
     }
     println!("(在 --chain 或 config 的 [[chain]] 里按 kind 引用;默认建议单开 sonora_aec3,串联仅用于实验)");
+    Ok(())
+}
+
+fn cmd_nvafx(args: NvafxArgs) -> Result<()> {
+    match args.cmd {
+        NvafxCmd::Doctor(a) => cmd_nvafx_doctor(a),
+    }
+}
+
+fn cmd_nvafx_doctor(args: NvafxDoctorArgs) -> Result<()> {
+    let report = echoless_processors::nvafx::doctor_report(args.runtime_dir.as_deref())?;
+
+    println!("NVIDIA AFX / RTX AEC doctor");
+    println!(
+        "SDK {} · runtime file {} · 最低 driver {}",
+        echoless_processors::nvafx::SDK_VERSION,
+        echoless_processors::nvafx::RUNTIME_FILE_VERSION,
+        echoless_processors::nvafx::MIN_DRIVER_VERSION,
+    );
+    println!(
+        "Runtime: {} ({})",
+        report.runtime_dir.display(),
+        report.runtime_dir_source
+    );
+    if report.gpus.is_empty() {
+        println!("GPU:     未检测到 NVIDIA GPU");
+    } else {
+        println!("GPU:");
+        for (index, gpu) in report.gpus.iter().enumerate() {
+            let arch = gpu
+                .arch
+                .map(|arch| arch.as_str().to_string())
+                .unwrap_or_else(|| "unsupported".to_string());
+            println!(
+                "  [{index}] {} · driver {} · compute_cap {} · arch {}",
+                gpu.name, gpu.driver_version, gpu.compute_capability, arch
+            );
+        }
+    }
+    if let Some(asset) = report.expected_model_asset() {
+        println!("Model asset: {asset}");
+    }
+    println!();
+
+    let mut problems = 0usize;
+    for check in &report.checks {
+        if check.status.is_problem() {
+            problems += 1;
+        }
+        println!(
+            "[{}] {} — {}",
+            check.status.label(),
+            check.name,
+            check.detail
+        );
+        if let Some(action) = &check.action {
+            println!("      处理: {action}");
+        }
+    }
+
+    if problems == 0 {
+        println!("\nRTX AEC runtime 预检通过。");
+    } else {
+        println!("\nRTX AEC runtime 预检未通过: {problems} 个问题需要处理。");
+    }
     Ok(())
 }
 
@@ -429,6 +517,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "realtime")]
     fn runtime_options_use_verbose_default_interval() {
         let mut args = run_args();
         args.verbose = true;
@@ -439,6 +528,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "realtime")]
     fn runtime_options_reject_zero_interval() {
         let mut args = run_args();
         args.stats_interval_ms = Some(0);
