@@ -215,6 +215,9 @@ jobs:
           PY
 
           cat > "${smoke_dir}/localvqe-smoke.toml" <<'TOML'
+          mic = "smoke_mic.wav"
+          reference = "smoke_ref.wav"
+          output = "smoke_localvqe_out.wav"
           sample_rate = 48000
           frame_ms = 10
           reference_channels = "mono"
