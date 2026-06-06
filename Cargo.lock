@@ -339,6 +339,7 @@ dependencies = [
  "echoless-hal-mac",
  "echoless-hal-win",
  "echoless-processors",
+ "hound",
  "ringbuf",
  "toml",
 ]

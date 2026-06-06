@@ -54,6 +54,9 @@ The Rust processor stays a normal `EchoProcessor` node:
   `noise_gate`, and `noise_gate_threshold_dbfs` inside the `[[chain]]` node.
 - If `library` is omitted, Echoless tries the current executable directory,
   `./localvqe/`, the current working directory, and `ECHOLESS_LOCALVQE_LIBRARY`.
+- Echoless packages `localvqe-v1.3-4.8M-f32.gguf` by default. Keep
+  `localvqe-v1.2-1.3M-f32.gguf` as the compact fallback when CPU margin is poor
+  or the v1.3 sound is too aggressive for a specific user.
 
 Recommended LocalVQE runtime test chain:
 
@@ -62,14 +65,14 @@ reference_channels = "mono"
 
 [[chain]]
 kind = "localvqe"
-model = "models/localvqe-v1.2-1.3M-f32.gguf"
+model = "models/localvqe-v1.3-4.8M-f32.gguf"
 library = "localvqe.dll" # macOS: "liblocalvqe.dylib"
 threads = 2
 noise_gate = false
 ```
 
-Use v1.2 first for Windows listening tests because it is the small/fast model.
-Use v1.3 after the standalone path is stable.
+Use v1.3 first when testing the current packaged artifact. Compare v1.2 only as
+a lower-cost fallback or if v1.3 produces excessive speech damage.
 
 ## Current Limits
 

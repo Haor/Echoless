@@ -47,6 +47,17 @@ impl ReferenceChannels {
     }
 }
 
+/// Diagnostic capture settings for realtime evidence collection.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct DiagnosticsConfig {
+    /// Directory where timestamped diagnostic sessions are written.
+    #[serde(default)]
+    pub record_dir: Option<String>,
+    /// Optional maximum recording duration. None means record until stop.
+    #[serde(default)]
+    pub max_seconds: Option<u32>,
+}
+
 /// 整条管线配置(设备选择 + 处理链)。TOML/JSON 都映射到它。
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct PipelineConfig {
@@ -62,6 +73,9 @@ pub struct PipelineConfig {
     pub frame_ms: u32,
     #[serde(default = "default_reference_channels")]
     pub reference_channels: ReferenceChannels,
+    /// Optional realtime diagnostic recordings.
+    #[serde(default)]
+    pub diagnostics: DiagnosticsConfig,
     /// 处理链:有序节点;空 = 直通。可单开/串联/组合。
     #[serde(default)]
     pub chain: Vec<NodeConfig>,
@@ -76,6 +90,7 @@ impl Default for PipelineConfig {
             sample_rate: default_sample_rate(),
             frame_ms: default_frame_ms(),
             reference_channels: default_reference_channels(),
+            diagnostics: DiagnosticsConfig::default(),
             chain: Vec::new(),
         }
     }

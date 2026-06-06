@@ -105,9 +105,10 @@ jobs:
           set -euo pipefail
           shared_build="${RUNNER_TEMP}/localvqe-shared-build"
           regression_build="${RUNNER_TEMP}/localvqe-regression-build"
-          model="${regression_build}/bench_assets/localvqe-v1.2-1.3M-f32.gguf"
+          model_name="localvqe-v1.3-4.8M-f32.gguf"
+          model="${regression_build}/bench_assets/${model_name}"
           if [[ ! -f "${model}" ]]; then
-            model="$(find "${regression_build}" -name 'localvqe-v1.2-1.3M-f32.gguf' -print -quit)"
+            model="$(find "${regression_build}" -name "${model_name}" -print -quit)"
           fi
           if [[ -z "${model}" || ! -f "${model}" ]]; then
             echo "LocalVQE smoke model not found under ${regression_build}" >&2
@@ -145,9 +146,10 @@ jobs:
           set -euo pipefail
           shared_build="${RUNNER_TEMP}/localvqe-shared-build"
           regression_build="${RUNNER_TEMP}/localvqe-regression-build"
-          model="${regression_build}/bench_assets/localvqe-v1.2-1.3M-f32.gguf"
+          model_name="localvqe-v1.3-4.8M-f32.gguf"
+          model="${regression_build}/bench_assets/${model_name}"
           if [[ ! -f "${model}" ]]; then
-            model="$(find "${regression_build}" -name 'localvqe-v1.2-1.3M-f32.gguf' -print -quit)"
+            model="$(find "${regression_build}" -name "${model_name}" -print -quit)"
           fi
           if [[ -z "${model}" || ! -f "${model}" ]]; then
             echo "LocalVQE model not found under ${regression_build}" >&2

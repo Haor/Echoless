@@ -11,10 +11,13 @@
 //! 系统声音参考 = output 设备做 loopback(Windows 原生;macOS 需 BlackHole 之类)。
 //! 虚拟麦输出 = 选 VB-Cable / BlackHole 作 output 设备。
 
+use std::fs::{create_dir, create_dir_all, File};
+use std::io::{BufWriter, Write};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -22,10 +25,13 @@ use cpal::{
     Device, DeviceDescription, FromSample, Sample, SampleFormat, SizedSample, Stream,
     SupportedStreamConfig, SupportedStreamConfigRange,
 };
+use hound::{WavSpec, WavWriter};
 use ringbuf::traits::{Consumer, Producer, Split};
 use ringbuf::HeapRb;
 
-use echoless_core::{apply_reference_channels_to_chain, PipelineConfig, ReferenceChannels};
+use echoless_core::{
+    apply_reference_channels_to_chain, DiagnosticsConfig, PipelineConfig, ReferenceChannels,
+};
 use echoless_processors::{chain_from_nodes, ProcessorChain};
 
 #[derive(Clone, Copy)]
@@ -90,6 +96,7 @@ struct ProcessRuntime {
     reference_channels: usize,
     counters: RealtimeCounters,
     stats_interval: Option<Duration>,
+    diagnostic: Option<DiagnosticRecorder>,
 }
 
 pub fn run_with_options(cfg: &PipelineConfig, options: RuntimeOptions) -> Result<()> {
@@ -231,11 +238,18 @@ pub fn run_with_options(cfg: &PipelineConfig, options: RuntimeOptions) -> Result
     apply_reference_channels_to_chain(&mut chain_cfg, cfg.reference_channels);
     let chain = chain_from_nodes(&chain_cfg, sample_rate, reference_channels as u16)?;
     let stats_interval = options.stats_interval_ms.map(Duration::from_millis);
+    let diagnostic = DiagnosticRecorder::new(
+        &cfg.diagnostics,
+        sample_rate,
+        reference_channels as u16,
+        cfg.frame_ms,
+    )?;
     let runtime = ProcessRuntime {
         frame_size,
         reference_channels,
         counters,
         stats_interval,
+        diagnostic,
     };
     let proc = thread::spawn(move || {
         process_loop(
@@ -285,6 +299,7 @@ fn process_loop<M, R, O>(
     let mut far = vec![0.0f32; far_samples_per_frame];
     let mut out = vec![0.0f32; frame_size];
     let mut stats = runtime.stats_interval.map(RealtimeStats::new);
+    let mut diagnostic = runtime.diagnostic;
 
     while running.load(Ordering::SeqCst) {
         if mic_cons.occupied_len() < frame_size {
@@ -311,27 +326,37 @@ fn process_loop<M, R, O>(
         chain.process(&near, &far, &mut out, frame_size as u32);
         let pushed = out_prod.push_slice(&out);
         let output_overruns = out.len().saturating_sub(pushed) as u64;
-
+        let ref_q = render_cons
+            .as_ref()
+            .map(|rc| rc.occupied_len())
+            .unwrap_or(0);
+        let sample = StatsSample {
+            frame_size,
+            near: &near,
+            far: &far,
+            out: &out,
+            mic_q: mic_cons.occupied_len(),
+            ref_q,
+            out_q: out_prod.occupied_len(),
+            mic_input_drops: runtime.counters.mic_input_drops.swap(0, Ordering::Relaxed),
+            ref_input_drops: runtime.counters.ref_input_drops.swap(0, Ordering::Relaxed),
+            stale_drops: stale_drops as u64,
+            ref_underruns: ref_underrun,
+            output_overruns,
+            output_underruns: runtime.counters.output_underruns.swap(0, Ordering::Relaxed),
+        };
+        if let Some(recorder) = diagnostic.as_mut() {
+            match recorder.write_frame(&sample) {
+                Ok(true) => {}
+                Ok(false) => diagnostic = None,
+                Err(err) => {
+                    eprintln!("诊断录制失败,已停用: {err:#}");
+                    diagnostic = None;
+                }
+            }
+        }
         if let Some(stats) = stats.as_mut() {
-            let ref_q = render_cons
-                .as_ref()
-                .map(|rc| rc.occupied_len())
-                .unwrap_or(0);
-            stats.observe(StatsSample {
-                frame_size,
-                near: &near,
-                far: &far,
-                out: &out,
-                mic_q: mic_cons.occupied_len(),
-                ref_q,
-                out_q: out_prod.occupied_len(),
-                mic_input_drops: runtime.counters.mic_input_drops.swap(0, Ordering::Relaxed),
-                ref_input_drops: runtime.counters.ref_input_drops.swap(0, Ordering::Relaxed),
-                stale_drops: stale_drops as u64,
-                ref_underruns: ref_underrun,
-                output_overruns,
-                output_underruns: runtime.counters.output_underruns.swap(0, Ordering::Relaxed),
-            });
+            stats.observe(&sample);
         }
     }
 }
@@ -362,6 +387,206 @@ struct StatsSample<'a> {
     ref_underruns: u64,
     output_overruns: u64,
     output_underruns: u64,
+}
+
+struct DiagnosticRecorder {
+    dir: PathBuf,
+    mic: Option<WavWriter<BufWriter<File>>>,
+    reference: Option<WavWriter<BufWriter<File>>>,
+    out: Option<WavWriter<BufWriter<File>>>,
+    stats: BufWriter<File>,
+    max_frames: Option<u64>,
+    written_frames: u64,
+    frame_index: u64,
+}
+
+impl DiagnosticRecorder {
+    fn new(
+        cfg: &DiagnosticsConfig,
+        sample_rate: u32,
+        reference_channels: u16,
+        frame_ms: u32,
+    ) -> Result<Option<Self>> {
+        let Some(record_dir) = cfg
+            .record_dir
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        else {
+            return Ok(None);
+        };
+        let base = Path::new(record_dir);
+        create_dir_all(base)
+            .with_context(|| format!("创建诊断录制目录失败: {}", base.display()))?;
+        let dir = make_session_dir(base)?;
+        let spec = WavSpec {
+            channels: 1,
+            sample_rate,
+            bits_per_sample: 32,
+            sample_format: hound::SampleFormat::Float,
+        };
+        let ref_spec = WavSpec {
+            channels: reference_channels.max(1),
+            ..spec
+        };
+        let max_frames = cfg
+            .max_seconds
+            .map(|seconds| u64::from(seconds) * u64::from(sample_rate));
+
+        write_diagnostic_metadata(&dir, sample_rate, frame_ms, reference_channels, max_frames)?;
+        let mut stats = BufWriter::new(
+            File::create(dir.join("stats.csv"))
+                .with_context(|| format!("创建诊断 stats.csv 失败: {}", dir.display()))?,
+        );
+        writeln!(
+            stats,
+            "frame_index,frames,mic_dbfs,ref_dbfs,out_dbfs,mic_q,ref_q,out_q,mic_input_drops,ref_input_drops,stale_drops,ref_underruns,output_overruns,output_underruns"
+        )?;
+
+        println!("诊断录制目录: {}", dir.display());
+        Ok(Some(Self {
+            mic: Some(WavWriter::create(dir.join("mic.wav"), spec)?),
+            reference: Some(WavWriter::create(dir.join("ref.wav"), ref_spec)?),
+            out: Some(WavWriter::create(dir.join("out.wav"), spec)?),
+            stats,
+            dir,
+            max_frames,
+            written_frames: 0,
+            frame_index: 0,
+        }))
+    }
+
+    fn write_frame(&mut self, sample: &StatsSample<'_>) -> Result<bool> {
+        if self
+            .max_frames
+            .is_some_and(|max_frames| self.written_frames >= max_frames)
+        {
+            self.finish();
+            return Ok(false);
+        }
+
+        if let Some(writer) = self.mic.as_mut() {
+            for v in sample.near {
+                writer.write_sample(*v)?;
+            }
+        }
+        if let Some(writer) = self.reference.as_mut() {
+            for v in sample.far {
+                writer.write_sample(*v)?;
+            }
+        }
+        if let Some(writer) = self.out.as_mut() {
+            for v in sample.out {
+                writer.write_sample(*v)?;
+            }
+        }
+
+        writeln!(
+            self.stats,
+            "{},{},{:.2},{:.2},{:.2},{},{},{},{},{},{},{},{},{}",
+            self.frame_index,
+            sample.frame_size,
+            rms_dbfs(sum_squares(sample.near), sample.near.len() as u64),
+            rms_dbfs(sum_squares(sample.far), sample.far.len() as u64),
+            rms_dbfs(sum_squares(sample.out), sample.out.len() as u64),
+            sample.mic_q,
+            sample.ref_q,
+            sample.out_q,
+            sample.mic_input_drops,
+            sample.ref_input_drops,
+            sample.stale_drops,
+            sample.ref_underruns,
+            sample.output_overruns,
+            sample.output_underruns,
+        )?;
+        self.frame_index += 1;
+        self.written_frames += sample.frame_size as u64;
+
+        if self
+            .max_frames
+            .is_some_and(|max_frames| self.written_frames >= max_frames)
+        {
+            println!("诊断录制达到上限,已关闭: {}", self.dir.display());
+            self.finish();
+            return Ok(false);
+        }
+        Ok(true)
+    }
+
+    fn finish(&mut self) {
+        if let Some(writer) = self.mic.take() {
+            if let Err(err) = writer.finalize() {
+                eprintln!("写入 mic.wav 尾部失败: {err}");
+            }
+        }
+        if let Some(writer) = self.reference.take() {
+            if let Err(err) = writer.finalize() {
+                eprintln!("写入 ref.wav 尾部失败: {err}");
+            }
+        }
+        if let Some(writer) = self.out.take() {
+            if let Err(err) = writer.finalize() {
+                eprintln!("写入 out.wav 尾部失败: {err}");
+            }
+        }
+        if let Err(err) = self.stats.flush() {
+            eprintln!("刷新诊断 stats.csv 失败: {err}");
+        }
+    }
+}
+
+impl Drop for DiagnosticRecorder {
+    fn drop(&mut self) {
+        self.finish();
+    }
+}
+
+fn make_session_dir(base: &Path) -> Result<PathBuf> {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("系统时间早于 UNIX_EPOCH")?
+        .as_secs();
+    for attempt in 0..1000 {
+        let name = if attempt == 0 {
+            format!("session-{now}")
+        } else {
+            format!("session-{now}-{attempt}")
+        };
+        let dir = base.join(name);
+        match create_dir(&dir) {
+            Ok(()) => return Ok(dir),
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) => {
+                return Err(err)
+                    .with_context(|| format!("创建诊断 session 目录失败: {}", dir.display()));
+            }
+        }
+    }
+    bail!("创建诊断 session 目录失败: {} 下重名过多", base.display())
+}
+
+fn write_diagnostic_metadata(
+    dir: &Path,
+    sample_rate: u32,
+    frame_ms: u32,
+    reference_channels: u16,
+    max_frames: Option<u64>,
+) -> Result<()> {
+    let mut file = BufWriter::new(
+        File::create(dir.join("metadata.txt"))
+            .with_context(|| format!("创建诊断 metadata.txt 失败: {}", dir.display()))?,
+    );
+    writeln!(file, "version={}", env!("CARGO_PKG_VERSION"))?;
+    writeln!(file, "sample_rate={sample_rate}")?;
+    writeln!(file, "frame_ms={frame_ms}")?;
+    writeln!(file, "reference_channels={reference_channels}")?;
+    if let Some(max_frames) = max_frames {
+        writeln!(file, "max_frames={max_frames}")?;
+    } else {
+        writeln!(file, "max_frames=unbounded")?;
+    }
+    file.flush()?;
+    Ok(())
 }
 
 struct RealtimeStats {
@@ -412,7 +637,7 @@ impl RealtimeStats {
         }
     }
 
-    fn observe(&mut self, sample: StatsSample<'_>) {
+    fn observe(&mut self, sample: &StatsSample<'_>) {
         self.total_frames += sample.frame_size as u64;
         self.near_samples += sample.near.len() as u64;
         self.far_samples += sample.far.len() as u64;
@@ -901,5 +1126,57 @@ mod tests {
         let mut stereo = [0.0f32; 2];
         stereo_cons.pop_slice(&mut stereo);
         assert_eq!(stereo, [0.25, -0.75]);
+    }
+
+    #[test]
+    fn diagnostic_recorder_writes_audio_and_stats() -> Result<()> {
+        let base = std::env::temp_dir().join(format!(
+            "echoless-diagnostic-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let cfg = DiagnosticsConfig {
+            record_dir: Some(base.to_string_lossy().to_string()),
+            max_seconds: Some(1),
+        };
+        let mut recorder = DiagnosticRecorder::new(&cfg, 48_000, 2, 10)?.unwrap();
+        let dir = recorder.dir.clone();
+        let near = [0.25f32, -0.25];
+        let far = [0.1f32, -0.1, 0.2, -0.2];
+        let out = [0.0f32, 0.1];
+        let sample = StatsSample {
+            frame_size: near.len(),
+            near: &near,
+            far: &far,
+            out: &out,
+            mic_q: 0,
+            ref_q: 0,
+            out_q: 0,
+            mic_input_drops: 0,
+            ref_input_drops: 0,
+            stale_drops: 0,
+            ref_underruns: 0,
+            output_overruns: 0,
+            output_underruns: 0,
+        };
+
+        assert!(recorder.write_frame(&sample)?);
+        drop(recorder);
+
+        let mic_reader = hound::WavReader::open(dir.join("mic.wav"))?;
+        assert_eq!(mic_reader.spec().channels, 1);
+        assert_eq!(mic_reader.spec().sample_rate, 48_000);
+        let ref_reader = hound::WavReader::open(dir.join("ref.wav"))?;
+        assert_eq!(ref_reader.spec().channels, 2);
+        let stats = std::fs::read_to_string(dir.join("stats.csv"))?;
+        assert_eq!(stats.lines().count(), 2);
+        assert!(dir.join("out.wav").exists());
+        assert!(dir.join("metadata.txt").exists());
+
+        let _ = std::fs::remove_dir_all(base);
+        Ok(())
     }
 }

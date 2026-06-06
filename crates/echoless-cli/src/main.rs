@@ -12,7 +12,8 @@ use anyhow::{bail, Result};
 use clap::{Args, Parser, Subcommand};
 
 use echoless_core::{
-    apply_reference_channels_to_chain, run_offline, PipelineConfig, ReferenceChannels,
+    apply_reference_channels_to_chain, run_offline, DiagnosticsConfig, PipelineConfig,
+    ReferenceChannels,
 };
 use echoless_hal::file::{WavFileSink, WavFileSource};
 use echoless_processors::{registry, NodeConfig};
@@ -103,6 +104,12 @@ struct RunArgs {
     /// 自定义滚动统计间隔(ms);隐含 --verbose
     #[arg(long)]
     stats_interval_ms: Option<u64>,
+    /// 保存实时诊断录音的目录;会在其下创建 timestamp session
+    #[arg(long)]
+    diagnostic_dir: Option<String>,
+    /// 诊断录制秒数上限;不给则录到停止
+    #[arg(long)]
+    diagnostic_seconds: Option<u32>,
 }
 
 fn main() -> Result<()> {
@@ -143,6 +150,7 @@ fn cmd_offline(a: OfflineArgs) -> Result<()> {
         sample_rate: rate,
         frame_ms,
         reference_channels: ReferenceChannels::Mono,
+        diagnostics: DiagnosticsConfig::default(),
         chain,
     };
 
@@ -286,6 +294,18 @@ fn apply_run_overrides(mut cfg: PipelineConfig, a: &RunArgs) -> Result<PipelineC
             toml::Value::Integer(tail_ms.into()),
         )?;
     }
+    if let Some(dir) = &a.diagnostic_dir {
+        if dir.trim().is_empty() {
+            bail!("--diagnostic-dir 不能为空");
+        }
+        cfg.diagnostics.record_dir = Some(dir.clone());
+    }
+    if let Some(seconds) = a.diagnostic_seconds {
+        if seconds == 0 {
+            bail!("--diagnostic-seconds 必须大于 0");
+        }
+        cfg.diagnostics.max_seconds = Some(seconds);
+    }
 
     Ok(cfg)
 }
@@ -336,6 +356,8 @@ mod tests {
             tail_ms: None,
             verbose: false,
             stats_interval_ms: None,
+            diagnostic_dir: None,
+            diagnostic_seconds: None,
         }
     }
 
@@ -375,6 +397,18 @@ mod tests {
     }
 
     #[test]
+    fn run_overrides_apply_diagnostics() {
+        let mut args = run_args();
+        args.diagnostic_dir = Some("diag".into());
+        args.diagnostic_seconds = Some(30);
+
+        let cfg = apply_run_overrides(PipelineConfig::default(), &args).unwrap();
+
+        assert_eq!(cfg.diagnostics.record_dir.as_deref(), Some("diag"));
+        assert_eq!(cfg.diagnostics.max_seconds, Some(30));
+    }
+
+    #[test]
     fn run_overrides_reject_sonora_flags_without_sonora_node() {
         let mut args = run_args();
         args.tail_ms = Some(120);
@@ -382,6 +416,16 @@ mod tests {
         let err = apply_run_overrides(PipelineConfig::default(), &args).unwrap_err();
 
         assert!(err.to_string().contains("sonora_aec3"));
+    }
+
+    #[test]
+    fn run_overrides_reject_zero_diagnostic_seconds() {
+        let mut args = run_args();
+        args.diagnostic_seconds = Some(0);
+
+        let err = apply_run_overrides(PipelineConfig::default(), &args).unwrap_err();
+
+        assert!(err.to_string().contains("大于 0"));
     }
 
     #[test]
