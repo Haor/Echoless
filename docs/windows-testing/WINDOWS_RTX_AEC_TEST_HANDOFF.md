@@ -4,6 +4,104 @@
 
 在 Windows 侧评估 NVIDIA RTX / Maxine Audio Effects SDK 的 AEC 能力，并用 Echoless 新增的诊断录制能力生成同源证据。当前产品主线仍是 `sonora_aec3` 保真优先；RTX AEC 只作为可选 backend / 对照路线评估，不要默认与 AEC3 级联。
 
+## 2026-06-06 Windows 实测更新
+
+本轮已经在 Windows 侧跑通 NVIDIA AFX SDK AEC 离线对照：
+
+- SDK：NVIDIA AFX SDK Windows 2.1.0 / `2026-03-11_NVIDIA_AFX_SDK_Win_v2.1.0.9`
+- GPU：RTX 5080 / Blackwell，driver `596.49`
+- NGC CLI：4.19.0，Windows core SDK resource 访问通过
+- Toolchain：CMake 4.3.3，Visual Studio 2022 Build Tools / MSVC 19.44
+- AEC feature/model：
+  - `features\nvafxaec\bin\nvafxaec.dll`
+  - `features\nvafxaec\models\blackwell\aec_16k.trtpkg`
+  - `features\nvafxaec\models\blackwell\aec_48k.trtpkg`
+- 官方 sample 已从 SDK 2.1 自带 samples 编译成功：
+  - `samples\build\Release\effects_demo.exe`
+
+重要踩坑：
+
+- 不要用旧的 `NVIDIA-Maxine/Maxine-AFX-SDK` v1.3 sample 对 SDK 2.1 runtime/model；会出现 DLL/入口点不匹配。
+- SDK 2.1 的 feature 下载脚本实际参数名是 `--ngc_org` / `--ngc_team`，不是连字符版本。
+- `download_features.ps1` 读取 `NGC_CLI_API_KEY` 或 `NGC_API_KEY`，本轮没有自动读取 `ngc config`。
+- 该脚本会把 NGC API key 打到控制台输出；下载后建议轮换 key，不要提交下载日志。
+- 官方 `effects_demo` 不能读取 Echoless 当前诊断 WAV 的 `WAVE_FORMAT_EXTENSIBLE` 头；需要转成普通 IEEE_FLOAT WAV，样本数据可以不变。
+
+本轮同源离线对照输入：
+
+```text
+diagnostics/aec3-mono-round1/session-1780739447/mic.wav
+diagnostics/aec3-mono-round1/session-1780739447/ref.wav
+```
+
+输出：
+
+```text
+diagnostics/rtx-aec-offline-inputs/echoless-aec3-mono-round1/nvafx_aec_out.wav
+diagnostics/rtx-aec-offline-inputs/echoless-aec3-mono-round1/nvafx_aec_segment_summary.csv
+diagnostics/logs/nvafx-aec-offline-round1.stdout.log
+```
+
+NVIDIA sample 关键日志：
+
+```text
+Input Sample rate: 48000
+Output Sample rate: 48000
+Input Channels: 2
+Output Channels: 1
+Input Samples per frame: 480
+Output Samples per frame: 480
+Processing time: about 1.2-1.3s for 44.9985s audio
+```
+
+分段能量摘要：
+
+| Case | Segment | mic dBFS | ref dBFS | out dBFS | out - mic |
+|---|---:|---:|---:|---:|---:|
+| RTX AEC 48k offline | 0-10s far-only | -47.67 | -33.79 | -62.08 | -14.41 |
+| RTX AEC 48k offline | 10-25s double-talk | -33.37 | -23.89 | -35.84 | -2.48 |
+| RTX AEC 48k offline | 25-35s movement | -33.97 | -21.09 | -37.76 | -3.79 |
+| RTX AEC 48k offline | 35-45s near-only | -40.75 | -30.34 | -42.81 | -2.06 |
+
+当前结论：
+
+- RTX AEC SDK 离线链路已跑通，可进入主观 AB。
+- 仍不能把它列为默认方案；还缺实时 Echoless processor、delay/drift 对齐、GPU 满载稳定性、分发许可确认。
+- 下一步建议先写离线 `nvafx-offline` harness，再进入实时 `nvidia_afx_aec` processor。
+
+## 2026-06-06 Runtime 分发准备
+
+已经准备好 “common runtime zip + per-arch model zip” 的本地 staging：
+
+```text
+C:\Users\haor2\workspace\aec\runtime-packages\dist-rtx-aec-2.1.0-aec48-split
+```
+
+最终 release asset 形态：
+
+- `echoless-rtx-aec-common-runtime-win64-2.1.0.zip`
+- `echoless-rtx-aec-model-win64-2.1.0-turing-aec48.zip`
+- `echoless-rtx-aec-model-win64-2.1.0-ampere-aec48.zip`
+- `echoless-rtx-aec-model-win64-2.1.0-ada-aec48.zip`
+- `echoless-rtx-aec-model-win64-2.1.0-blackwell-aec48.zip`
+- `manifest.json`
+
+每个模型 zip 可直接解压到 runtime 根目录，内部路径为：
+
+```text
+features/nvafxaec/models/<arch>/aec_48k.trtpkg
+```
+
+安装器 / doctor 检测失败时只提示用户安装缺失组件，不要求普通用户安装 SDK：
+
+- 缺 `nvidia-smi` 或 `nvcuda.dll`：安装 NVIDIA graphics driver。
+- driver 低于 `572.61`：更新 NVIDIA graphics driver。
+- 缺 `VCRUNTIME140.dll` / `VCRUNTIME140_1.dll` / `MSVCP140.dll`：安装 Microsoft Visual C++ 2015-2022 Redistributable x64。
+- GPU compute capability 不在 `75`、`80`、`86`、`89`、`100`、`120`：RTX AEC backend 不可用。
+- 缺模型：按 GPU 架构下载对应 model zip 并解压。
+
+详细分发设计见 `docs/research/rtx_aec_runtime_distribution.md`。在确认 NVIDIA AFX SDK / model 再分发许可前，不要公开上传二进制。
+
 ## 当前代码状态
 
 - Echoless 实时链路新增诊断录制：
