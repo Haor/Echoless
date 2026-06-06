@@ -139,7 +139,7 @@ enum NvafxCmd {
 
 #[derive(Args)]
 struct NvafxDoctorArgs {
-    /// 覆盖 runtime 根目录;默认读 ECHOLESS_NVAFX_RUNTIME_DIR,再退到 %LOCALAPPDATA%\Echoless\nvafx\2.1.0
+    /// 覆盖 runtime 根目录;Windows 默认读 ECHOLESS_NVAFX_RUNTIME_DIR,再退到 %LOCALAPPDATA%\Echoless\nvafx\2.1.0
     #[arg(long)]
     runtime_dir: Option<PathBuf>,
     /// 输出 JSON,供 GUI/installer 消费
@@ -177,7 +177,7 @@ struct NvafxInstallArgs {
     /// 当前 GPU 架构对应的 model zip
     #[arg(long)]
     model_zip: PathBuf,
-    /// 覆盖安装根目录;默认 %LOCALAPPDATA%\Echoless\nvafx\2.1.0
+    /// 覆盖安装根目录;Windows 默认 %LOCALAPPDATA%\Echoless\nvafx\2.1.0
     #[arg(long)]
     runtime_dir: Option<PathBuf>,
     /// 覆盖 common zip 期望 SHA256;不填则按官方 asset 名称自动匹配
@@ -367,6 +367,7 @@ fn cmd_nvafx_doctor(args: NvafxDoctorArgs) -> Result<()> {
 }
 
 fn cmd_nvafx_offline(a: NvafxOfflineArgs) -> Result<()> {
+    ensure_nvafx_windows_command("nvafx offline")?;
     if !a.intensity_ratio.is_finite() || a.intensity_ratio < 0.0 {
         bail!("--intensity-ratio 必须是非负有限数");
     }
@@ -434,6 +435,7 @@ fn cmd_nvafx_offline(a: NvafxOfflineArgs) -> Result<()> {
 }
 
 fn cmd_nvafx_install(a: NvafxInstallArgs) -> Result<()> {
+    ensure_nvafx_windows_command("nvafx install")?;
     let (runtime_dir, runtime_dir_source) =
         echoless_processors::nvafx::resolve_runtime_dir(a.runtime_dir.as_deref());
     create_dir_all(&runtime_dir)
@@ -480,6 +482,13 @@ fn cmd_nvafx_install(a: NvafxInstallArgs) -> Result<()> {
     print_nvafx_doctor_report(&report);
     if !report.ok() {
         bail!("runtime 已解压,但 doctor 仍未通过");
+    }
+    Ok(())
+}
+
+fn ensure_nvafx_windows_command(command: &str) -> Result<()> {
+    if !cfg!(windows) {
+        bail!("{command} 目前只支持 Windows x64; macOS artifact 只能用于 AEC3/LocalVQE 路径");
     }
     Ok(())
 }

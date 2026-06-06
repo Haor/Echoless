@@ -6,7 +6,7 @@
 
 ## 2026-06-06 Windows 实测更新
 
-本轮已经在 Windows 侧跑通 NVIDIA AFX SDK AEC 离线对照：
+本轮已经在 Windows 侧跑通 NVIDIA AFX SDK AEC 离线对照，并完成 Echoless RTX AEC standalone 实时 smoke：
 
 - SDK：NVIDIA AFX SDK Windows 2.1.0 / `2026-03-11_NVIDIA_AFX_SDK_Win_v2.1.0.9`
 - GPU：RTX 5080 / Blackwell，driver `596.49`
@@ -18,6 +18,12 @@
   - `features\nvafxaec\models\blackwell\aec_48k.trtpkg`
 - 官方 sample 已从 SDK 2.1 自带 samples 编译成功：
   - `samples\build\Release\effects_demo.exe`
+- Echoless 实时 RTX AEC:
+  - mic: USB mic index `4`
+  - reference: `system`
+  - output: index `3` / CABLE Input
+  - `--diagnostic-seconds 45` 录制成功
+  - `stats.csv` / runtime stats: `runtime_errors=0`
 
 重要踩坑：
 
@@ -66,8 +72,8 @@ Processing time: about 1.2-1.3s for 44.9985s audio
 当前结论：
 
 - RTX AEC SDK 离线链路已跑通，可进入主观 AB。
-- 仍不能把它列为默认方案；还缺长时间实时稳定性、delay/drift 对齐、GPU 满载稳定性、分发许可确认。
-- Echoless 已接入 `nvidia_afx_aec` 可选 backend；下一步直接测 Echoless 自己的离线/实时 RTX 路径。
+- Echoless `nvidia_afx_aec` 离线 / 实时路径已跑通；当前把它保留为 Windows RTX 用户的独立可选 backend。
+- 仍不能把它列为默认方案；还缺更长时间实时稳定性、delay/drift 对齐、GPU 满载稳定性、主观 AB、分发许可确认。
 
 ## 2026-06-06 Runtime 分发准备
 
@@ -124,28 +130,31 @@ features/nvafxaec/models/<arch>/aec_48k.trtpkg
   - `models/localvqe-v1.3-4.8M-f32.gguf`
   - v1.2 仍只作为低 CPU 或 v1.3 过激时的 fallback。
 
-## 当前 GitHub Actions artifact
+## 已验证 GitHub Actions artifact 基线
 
 - Repo: `Haor/echoless`
-- Run: `27058593366`
-- URL: <https://github.com/Haor/echoless/actions/runs/27058593366>
-- Subtree commit: `81c3f810d23e4d655f31f2bbbc5046bb691b58cc`
+- Run: `27064782614`
+- URL: <https://github.com/Haor/echoless/actions/runs/27064782614>
+- Code commit: `b3e4b32f5abdc84c33e5a20ce16febad6f78ded2`
+- Branch follow-up: `0bc71a6ecd8889617f96e8190dde4c5858c1c265` 只补充实时诊断停止行为说明。
 - Status: success
 - Artifact:
-  - `echoless-windows-X64`
-  - `echoless-macos-ARM64`
+  - `echoless-windows-X64` / 21,811,400 bytes
+  - `echoless-macos-ARM64` / 19,402,204 bytes
+
+注意：`.github/workflows/build.yml` 只在 `main` push 自动跑；`nvafx-full-integration` 分支需要手动 `workflow_dispatch` 才会生成分支 artifact。
 
 ## Windows 侧应拿到的文件
 
-除 GitHub Actions artifact 外，建议同时提供 `research/` 下全部 4 个文件，因为它们体积不大且互补：
+除 GitHub Actions artifact 外，建议同时提供 `docs/research/` 下全部 4 个文件，因为它们体积不大且互补：
 
-1. `research/windows_aec_research.md`
+1. `docs/research/windows_aec_research.md`
    - 主调研文档，先看这里。包含 NVIDIA Maxine AEC、AEC3、LocalVQE、验证矩阵、风险清单。
-2. `research/reference_repos_exploration_report.md`
+2. `docs/research/reference_repos_exploration_report.md`
    - 源码级核实报告。用于确认 LocalVQE C API、Maxine API 形态、虚拟麦路线和参考仓库证据。
-3. `research/sonora_aec3_internal_map.md`
+3. `docs/research/sonora_aec3_internal_map.md`
    - AEC3 / sonora 当前可调能力、delay、stereo far reference、tail、NS/AGC 风险。
-4. `research/cross_platform_architecture.md`
+4. `docs/research/cross_platform_architecture.md`
    - HAL/Core/Processor/CLI/GUI 分层蓝本。Windows agent 如果要判断 RTX backend 应该挂在哪里，需要读这个。
 
 最低集合是 1 + 2 + 3；如果 Windows agent 会改架构或 GUI 配置面，把 4 也必须带上。
@@ -288,7 +297,7 @@ noise_gate = false
 本机从 repo 根目录直接复制这一行：
 
 ```powershell
-$env:ECHOLESS_NVAFX_RUNTIME_DIR='C:\Users\haor2\workspace\aec\runtime-packages\echoless-rtx-aec-runtime-win64-blackwell-2.1.0-aec48'; .\target\release\echoless.exe run --config .\configs\example.toml --mic 3 --reference system --output "CABLE Input" --processor nvidia_afx_aec --reference-channels mono --diagnostic-dir .\diagnostics\rtx-aec-realtime --diagnostic-seconds 45 --verbose
+$env:ECHOLESS_NVAFX_RUNTIME_DIR='C:\Users\haor2\workspace\aec\runtime-packages\echoless-rtx-aec-runtime-win64-blackwell-2.1.0-aec48'; .\target\release\echoless.exe run --config .\configs\example.toml --mic 4 --reference system --output 3 --processor nvidia_afx_aec --reference-channels mono --diagnostic-dir .\diagnostics\rtx-aec-realtime --diagnostic-seconds 45 --verbose
 ```
 
 `--diagnostic-seconds 45` 只会让诊断录制在 45 秒后 finalize；实时程序会继续运行，看到录制文件写完后按 Ctrl+C 停止。
@@ -312,6 +321,13 @@ RTX AEC 不要与 AEC3 串联后直接下结论。先做：
 - AEC3 mono
 - AEC3 stereo
 - RTX AEC standalone
+
+## macOS / 跨平台边界
+
+- macOS artifact 只用于验证 AEC3、LocalVQE、配置解析、CLI/GUI 基础路径。
+- NVIDIA AFX / RTX AEC backend 目前是 Windows x64 only；macOS 不应尝试安装 RTX runtime 或运行 `nvafx offline/install`。
+- `echoless nvafx doctor --json` 可以作为 GUI/安装器的统一能力探针；macOS 上应看到 `ok=false`，并包含 `platform=unsupported` 检查项。
+- GUI 默认 backend 仍应是 `sonora_aec3`；RTX AEC 只在 doctor 通过的 Windows RTX 机器上显示为可选 backend。
 
 ## 结果回传格式
 

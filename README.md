@@ -12,6 +12,8 @@
 - 离线评测:`echoless offline` 仍可用。
 - LocalVQE 已通过动态 C ABI 接入 `localvqe` 处理器;CI 会构建上游 shared library、跑 regression,再跑 Echoless FFI smoke。
 - NVIDIA AFX / RTX AEC 已作为 Windows-only 可选 backend 接入:`doctor` / 本地 runtime install / 离线 WAV / 实时 `nvidia_afx_aec`。
+- Windows 本机 RTX AEC standalone 已完成 45s diagnostics smoke:RTX 5080 Blackwell runtime 可用,USB mic index `4`,reference `system`,output `3`(CABLE Input),`runtime_errors=0`。
+- macOS artifact 可正常构建 AEC3/LocalVQE 路径;RTX AEC 在 macOS 上按设计不可用,GUI/安装器应通过 `echoless nvafx doctor --json` 禁用该 backend。
 - 原生平台 HAL、原生虚拟麦驱动仍是后续阶段;MVP 输出建议接 VB-Cable / BlackHole。
 - 产品默认策略:以 `sonora_aec3` 保真人声为主。LocalVQE 与 RTX AEC 都是独立可选方案,不作为 AEC3 默认后级。
 
@@ -101,11 +103,16 @@ cargo run -p echoless-cli --bin echoless --release -- run --config configs/examp
 5. 用上一步的 shared library + GGUF 跑 Echoless `localvqe_ffi_smoke`。
 6. 生成 release artifact:`echoless-windows-*` / `echoless-macos-*`,并打包 LocalVQE runtime 与当前 v1.3 模型。
 
+已核对的 RTX AEC 集成构建基线:
+
+- GitHub Actions run `27064782614`:Windows/macOS success。
+- 代码 commit `b3e4b32f5abdc84c33e5a20ce16febad6f78ded2`;后续 `0bc71a6` 是诊断停止行为说明。
+- Artifacts:`echoless-windows-X64`(约 20.8 MiB) / `echoless-macos-ARM64`(约 18.5 MiB)。
+
 ## 下一步
 
-1. 用 Windows 外放 + USB mic + VB-Cable 做 RTX AEC standalone 实时 diagnostics,确认 GPU 满载和长时间稳定性。
-2. 确认 NVIDIA AFX runtime/model 再分发许可后,再开放远程下载/公开 release asset。
-3. 增加 `eval` 子命令,用 output/input energy ratio 做离线效果量化。
-4. `echoless-processors/chain.rs` 占位线性 SRC 换成 rubato 有状态 SRC。
-5. 把实时 runtime 从 CLI 层进一步抽成 GUI/daemon 可复用控制面。
-6. 原生 WASAPI/CoreAudio/虚拟麦驱动阶段再替换 cpal MVP。
+1. 确认 NVIDIA AFX runtime/model 再分发许可后,再开放远程下载/公开 release asset。
+2. 增加 `eval` 子命令,用 output/input energy ratio 做离线效果量化。
+3. `echoless-processors/chain.rs` 占位线性 SRC 换成 rubato 有状态 SRC。
+4. 把实时 runtime 从 CLI 层进一步抽成 GUI/daemon 可复用控制面。
+5. 原生 WASAPI/CoreAudio/虚拟麦驱动阶段再替换 cpal MVP。

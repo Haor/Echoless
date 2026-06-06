@@ -4,6 +4,13 @@
 
 本文记录可选 NVIDIA AFX AEC backend 的 runtime 分发方案。Runtime 二进制不进入 git；确认 NVIDIA AFX SDK 和 model 再分发条款之前，不要公开上传这些二进制。
 
+## 当前验证状态
+
+- RTX AEC backend 已接入 `doctor` / 本地 zip `install` / 离线 WAV / 实时 `nvidia_afx_aec`。
+- GitHub Actions run `27064782614` 已通过 Windows/macOS，artifact 为 `echoless-windows-X64` 与 `echoless-macos-ARM64`。
+- Windows 本机 RTX 5080 Blackwell smoke 已通过：USB mic index `4`、reference `system`、output index `3`(CABLE Input)、45s diagnostics 成功、`runtime_errors=0`。
+- 产品默认仍是 `sonora_aec3`；RTX AEC 是 Windows RTX 用户可选 backend，不与 AEC3 默认级联。
+
 ## 包形态
 
 采用一个 Windows x64 通用 runtime zip，加每个 GPU 架构一个 model zip。
@@ -88,9 +95,15 @@ staging 目录里的 `manifest.json` 已经按这个 asset 形态生成，包含
 
 消费 prepared runtime 的机器不需要安装 CUDA Toolkit、TensorRT SDK、NVIDIA AFX SDK 或 NGC CLI。
 
+跨平台边界：
+
+- `nvafx doctor --json` 保留跨平台可运行，用作 GUI/安装器能力探针。
+- macOS / Linux 上 `doctor` 应返回 `ok=false` 并报告 `platform=unsupported`；GUI 应据此隐藏或禁用 RTX AEC。
+- `nvafx install`、`nvafx offline`、实时 `nvidia_afx_aec` 只支持 Windows x64。
+
 ## 集成备注
 
-先从 Windows 侧集成，因为真实 runtime 验证需要 RTX GPU 和 AFX Windows DLL 加载行为。Mac 侧可以先准备 config/schema 和 build stub，但不能验证 backend。
+先从 Windows 侧集成，因为真实 runtime 验证需要 RTX GPU 和 AFX Windows DLL 加载行为。Mac 侧只验证跨平台构建、`doctor --json` 的不可用状态、AEC3/LocalVQE 路径；不能验证 RTX backend 音频效果。
 
 建议实现顺序：
 
