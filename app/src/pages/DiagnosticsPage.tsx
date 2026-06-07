@@ -1,8 +1,55 @@
+import { open } from "@tauri-apps/plugin-dialog";
+import type { Health } from "../App";
+import { openPath } from "../api";
 import { useI18n } from "../i18n";
+import { Field } from "../components/Controls";
+import { Toggle } from "../components/Toggle";
 
-// 占位:诊断页(下一步接 --diagnostic-dir/seconds 录制 + 健康计数)。
-export function DiagnosticsPage() {
+interface Props {
+  rec: boolean;
+  seconds: number | null;
+  diagDir: string;
+  running: boolean;
+  health: Health;
+  onRec: (v: boolean) => void;
+  onSeconds: (v: number | null) => void;
+  onDir: (v: string) => void;
+}
+
+export function DiagnosticsPage({
+  rec,
+  seconds,
+  diagDir,
+  running,
+  health,
+  onRec,
+  onSeconds,
+  onDir,
+}: Props) {
   const { t } = useI18n();
+  const active = rec && running;
+
+  async function pickDir() {
+    try {
+      const sel = await open({
+        directory: true,
+        defaultPath: diagDir || undefined,
+      });
+      if (typeof sel === "string") onDir(sel);
+    } catch {
+      /* cancelled */
+    }
+  }
+
+  const counters: { label: string; value: number | string; warn: boolean }[] = [
+    { label: "input drops", value: health.input_drops, warn: health.input_drops > 0 },
+    { label: "ref underruns", value: health.ref_underruns, warn: health.ref_underruns > 0 },
+    { label: "output underruns", value: health.output_underruns, warn: health.output_underruns > 0 },
+    { label: "stale drops", value: health.stale_drops, warn: health.stale_drops > 0 },
+    { label: "runtime errors", value: health.runtime_errors, warn: health.runtime_errors > 0 },
+    { label: "diverged", value: health.diverged ? "YES" : "NO", warn: health.diverged },
+  ];
+
   return (
     <div className="page">
       <div className="kick">
@@ -14,16 +61,77 @@ export function DiagnosticsPage() {
         {t("diagNote")}
       </div>
       <hr className="hair" />
-      <div className="psec">// {t("secRecord")}</div>
-      <div className="pnote">
-        [ REC ] dir · seconds → session · mic.wav / ref.wav / out.wav /
-        stats.csv
+
+      <div className="asec">// {t("secRecord")}</div>
+      <div className="acols">
+        <div className="arow">
+          <span className="alabel">{t("record")}</span>
+          <span className="aval">
+            <Toggle on={rec} onToggle={() => onRec(!rec)} />
+          </span>
+        </div>
+        <div className="arow">
+          <span className="alabel">{t("maxSeconds")}</span>
+          <span className="aval">
+            <Field
+              value={seconds}
+              numeric
+              placeholder={t("unlimited")}
+              onCommit={(v) => onSeconds(v as number | null)}
+            />
+          </span>
+        </div>
       </div>
-      <div className="psec">// {t("secHealth")}</div>
-      <div className="pnote">
-        input_drops · ref/output_underruns · stale_drops · diverged
+
+      <div className="drow">
+        <span className="dk">{t("recordDir")}</span>
+        <span className="dpick" onClick={pickDir} title={diagDir}>
+          {diagDir || t("choose")}
+        </span>
+        <button className="dopen" onClick={() => openPath(diagDir)}>
+          {t("openFolder")} <span className="mk">&raquo;</span>
+        </button>
       </div>
-      <div className="pscaffold">{t("comingSoon")}</div>
+      <div className="drow">
+        <span className="dk">SESSION</span>
+        {active && health.session_dir ? (
+          <>
+            <span className="dpath live">{health.session_dir}</span>
+            <button
+              className="dopen"
+              onClick={() => openPath(health.session_dir!)}
+            >
+              {t("openFolder")} <span className="mk">&raquo;</span>
+            </button>
+          </>
+        ) : (
+          <span className="dpath">
+            {active ? t("recording") : rec ? t("notRunning") : "—"}
+          </span>
+        )}
+      </div>
+
+      <div className="asec">// {t("secHealth")}</div>
+      <div className={`acols ${running ? "" : "dim-soft"}`}>
+        {counters.map((c) => (
+          <div className="arow" key={c.label}>
+            <span className="alabel">{c.label}</span>
+            <span className={`aval dval ${c.warn ? "warn" : ""}`}>
+              {c.value}
+            </span>
+          </div>
+        ))}
+      </div>
+      {health.backend_error && (
+        <div className="drow">
+          <span className="dk" style={{ color: "var(--warn)" }}>
+            ERROR
+          </span>
+          <span className="dpath" style={{ color: "var(--warn)" }}>
+            {health.backend_error}
+          </span>
+        </div>
+      )}
     </div>
   );
 }

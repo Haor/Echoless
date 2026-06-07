@@ -3,21 +3,27 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import type { UnlistenFn } from "@tauri-apps/api/event";
 import {
   buildConfigToml,
+  defaultDiagDir,
   doctorAudio,
   getPlatform,
   listDevices,
   listProcessors,
+  nvafxDoctor,
+  nvafxDownloadInstall,
+  nvafxInstall,
   onRunEvent,
   onRunExit,
   startRun,
   stopRun,
   validateConfig,
+  type DiagnosticsCfg,
   type PipelineCfg,
 } from "./api";
 import type {
   AudioDevice,
   DeviceList,
   DoctorAudio,
+  NvafxDoctor,
   Platform,
   Processor,
 } from "./types";
@@ -35,8 +41,12 @@ import {
 import { FooterBars, Scope, type Telemetry } from "./components/Scope";
 import { Dropdown } from "./components/Dropdown";
 import { ScrambleText } from "./components/ScrambleText";
+import { SlideSwitch } from "./components/SlideSwitch";
 import { AdvancedPage } from "./pages/AdvancedPage";
 import { DiagnosticsPage } from "./pages/DiagnosticsPage";
+import { EnginePage } from "./pages/EnginePage";
+import { RtxSetupPage } from "./pages/RtxSetupPage";
+import { simNvafxDoctor, type RtxState } from "./nvafx";
 
 const appWindow = getCurrentWindow();
 
@@ -87,6 +97,27 @@ interface Live {
   healthy: boolean;
 }
 
+export interface Health {
+  input_drops: number;
+  ref_underruns: number;
+  output_underruns: number;
+  stale_drops: number;
+  runtime_errors: number;
+  diverged: boolean;
+  session_dir: string | null;
+  backend_error: string | null;
+}
+const ZERO_HEALTH: Health = {
+  input_drops: 0,
+  ref_underruns: 0,
+  output_underruns: 0,
+  stale_drops: 0,
+  runtime_errors: 0,
+  diverged: false,
+  session_dir: null,
+  backend_error: null,
+};
+
 export default function App() {
   const [platform, setPlatform] = useState<Platform>("macos");
   const [devices, setDevices] = useState<DeviceList | null>(null);
@@ -104,10 +135,12 @@ export default function App() {
   const [powerOn, setPowerOn] = useState(false); // 用户开关意图(UI 显示/动画只看这个)
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
-  const [view, setView] = useState<"overview" | "advanced" | "diagnostics">(
-    "overview",
-  );
+  const [view, setView] = useState<
+    "overview" | "engine" | "advanced" | "diagnostics" | "rtxsetup"
+  >("overview");
   const [doctor, setDoctor] = useState<DoctorAudio | null>(null);
+  const [nvafx, setNvafx] = useState<NvafxDoctor | null>(null);
+  const [nvafxBusy, setNvafxBusy] = useState(false); // RTX runtime 安装中
   // reference:可用源由 devices.reference_sources 提供;mac system 无 loopback → 默认退 none。
   const [reference, setReference] = useState("system");
   const [live, setLive] = useState<Live>({
@@ -117,6 +150,15 @@ export default function App() {
     lat: null,
     healthy: true,
   });
+  const [health, setHealth] = useState<Health>(ZERO_HEALTH);
+  // 开发态:页面内按 ~ 切换,临时解开 NVAFX 平台/doctor 门槛,用于走通前端流程。
+  const [dev, setDev] = useState(false);
+  // 开发态下用模拟 doctor 走 RTX 安装流程(mac 上也能逐屏过)。
+  const [devRtxState, setDevRtxState] = useState<RtxState>("runtime_not_installed");
+  // 诊断录制
+  const [rec, setRec] = useState(false);
+  const [diagSeconds, setDiagSeconds] = useState<number | null>(null);
+  const [diagDir, setDiagDir] = useState("");
 
   const telRef = useRef<Telemetry>({ mic: -120, ref: -120, out: -120, on: false });
   const runningRef = useRef(running);
@@ -127,7 +169,19 @@ export default function App() {
   pipelineRef.current = pipeline;
   const paramsRef = useRef(params);
   paramsRef.current = params;
+  const recRef = useRef(rec);
+  recRef.current = rec;
+  const diagSecondsRef = useRef(diagSeconds);
+  diagSecondsRef.current = diagSeconds;
+  const diagDirRef = useRef(diagDir);
+  diagDirRef.current = diagDir;
   const { t } = useI18n();
+
+  function diagCfg(): DiagnosticsCfg | null {
+    return recRef.current && diagDirRef.current
+      ? { record_dir: diagDirRef.current, max_seconds: diagSecondsRef.current }
+      : null;
+  }
 
   // 平台 + 设备/处理器枚举 + 事件订阅
   useEffect(() => {
@@ -139,6 +193,8 @@ export default function App() {
       .then((m) => setProcessors(m.processors))
       .catch((e) => setErr(String(e)));
     doctorAudio().then(setDoctor).catch(() => {});
+    nvafxDoctor().then(setNvafx).catch(() => {});
+    defaultDiagDir().then(setDiagDir).catch(() => {});
 
     const uns: UnlistenFn[] = [];
     (async () => {
@@ -147,6 +203,13 @@ export default function App() {
           if (ev.type === "started") {
             telRef.current.on = true;
             setRunning(true);
+            // 录制时立即拿到 session 目录(不必等第一条 status)。
+            if (ev.diagnostics_session_dir) {
+              setHealth((h) => ({
+                ...h,
+                session_dir: ev.diagnostics_session_dir ?? null,
+              }));
+            }
             return;
           }
           // status
@@ -166,6 +229,16 @@ export default function App() {
             lat: s.estimated_user_latency_ms,
             healthy:
               !s.diverged && s.runtime_errors === 0 && !s.last_backend_error,
+          });
+          setHealth({
+            input_drops: s.input_drops ?? 0,
+            ref_underruns: s.ref_underruns ?? 0,
+            output_underruns: s.output_underruns ?? 0,
+            stale_drops: s.stale_drops ?? 0,
+            runtime_errors: s.runtime_errors ?? 0,
+            diverged: Boolean(s.diverged),
+            session_dir: s.diagnostics_session_dir ?? null,
+            backend_error: s.last_backend_error ?? null,
           });
         }),
       );
@@ -203,6 +276,19 @@ export default function App() {
     return () => window.removeEventListener("keydown", onTab);
   }, []);
 
+  // 开发态快捷键:按 ~ 切换(在输入框里则正常输入,不触发)。
+  useEffect(() => {
+    const onTilde = (e: KeyboardEvent) => {
+      if (e.key !== "~") return;
+      const el = document.activeElement;
+      if (el && /^(INPUT|TEXTAREA)$/.test(el.tagName)) return;
+      e.preventDefault();
+      setDev((d) => !d);
+    };
+    window.addEventListener("keydown", onTilde);
+    return () => window.removeEventListener("keydown", onTilde);
+  }, []);
+
   function refreshDevices() {
     listDevices()
       .then((d) => {
@@ -220,6 +306,60 @@ export default function App() {
       .catch((e) => setErr(String(e)));
   }
 
+  function recheckNvafx(runtimeDir?: string) {
+    if (dev) return; // dev 模拟:状态由 dev 切换条控制
+    nvafxDoctor(runtimeDir).then(setNvafx).catch(() => {});
+  }
+
+  // RTX runtime 安装:解压 common + 架构 model,回传安装后 doctor 报告。
+  // dev 模拟:不调后端,延迟后置 ready,以便走通"安装中 → 就绪"。
+  function installNvafx(commonZip: string, modelZip: string) {
+    if (dev) {
+      setNvafxBusy(true);
+      window.setTimeout(() => {
+        setDevRtxState("ready");
+        setNvafxBusy(false);
+      }, 900);
+      return;
+    }
+    const runtimeDir = (paramsRef.current.runtime_dir as string) || undefined;
+    setNvafxBusy(true);
+    setErr(null);
+    nvafxInstall({ commonZip, modelZip, runtimeDir })
+      .then(setNvafx)
+      .catch((e) => setErr(String(e)))
+      .finally(() => setNvafxBusy(false));
+  }
+
+  // 从公共 GitHub release 下载并安装(按 GPU 架构自动选模型)。dev 下模拟。
+  function downloadInstallNvafx() {
+    if (dev) {
+      setNvafxBusy(true);
+      window.setTimeout(() => {
+        setDevRtxState("ready");
+        setNvafxBusy(false);
+      }, 1200);
+      return;
+    }
+    const runtimeDir = (paramsRef.current.runtime_dir as string) || undefined;
+    setNvafxBusy(true);
+    setErr(null);
+    nvafxDownloadInstall({ runtimeDir })
+      .then(setNvafx)
+      .catch((e) => setErr(String(e)))
+      .finally(() => setNvafxBusy(false));
+  }
+
+  // 引擎就绪判定:AEC3 永远就绪;LocalVQE 需模型;NVAFX 需平台支持 + doctor 通过。
+  // 开发态(dev)临时解开 NVAFX 的平台/doctor 门槛,用于走通前端流程。
+  function engineReady(k: string): boolean {
+    const proc = processors.find((p) => p.kind === k);
+    if (proc && !proc.platforms.includes(platform) && !dev) return false;
+    if (k === "localvqe") return Boolean(params.model);
+    if (k === "nvidia_afx_aec") return dev || Boolean(nvafx?.ok);
+    return true;
+  }
+
   type Override = Partial<{
     mic: string;
     output: string;
@@ -227,6 +367,7 @@ export default function App() {
     kind: string;
     pipeline: PipelineCfg;
     params: Record<string, unknown>;
+    diagnostics: DiagnosticsCfg | null;
   }>;
 
   function currentToml(over?: Override) {
@@ -237,12 +378,15 @@ export default function App() {
       kind: over?.kind ?? kind,
       pipeline: over?.pipeline ?? pipelineRef.current,
       params: over?.params ?? paramsRef.current,
+      diagnostics:
+        over && "diagnostics" in over ? over.diagnostics : diagCfg(),
     });
   }
 
   async function start() {
     setBusy(true);
     setErr(null);
+    setHealth(ZERO_HEALTH);
     try {
       const toml = currentToml();
       const v = await validateConfig(toml);
@@ -279,8 +423,16 @@ export default function App() {
 
   async function togglePower() {
     if (busy) return;
-    if (powerOn) await stop();
-    else await start();
+    if (powerOn) {
+      await stop();
+      return;
+    }
+    // 引擎未就绪(无模型 / doctor 未过)→ 先去 Engine 配置,避免启动即失败。
+    if (!engineReady(kind)) {
+      setView("engine");
+      return;
+    }
+    await start();
   }
 
   // 运行中改配置 → 重启 runtime 应用新值(后端契约要求)。
@@ -332,6 +484,32 @@ export default function App() {
     setPipeline(npl);
     applyChange({ pipeline: npl });
   }
+  // 诊断录制开关 / 时长。
+  function setRecording(on: boolean) {
+    setRec(on);
+    const dg =
+      on && diagDirRef.current
+        ? { record_dir: diagDirRef.current, max_seconds: diagSecondsRef.current }
+        : null;
+    applyChange({ diagnostics: dg });
+  }
+  function setRecSeconds(v: number | null) {
+    setDiagSeconds(v);
+    const dg =
+      recRef.current && diagDirRef.current
+        ? { record_dir: diagDirRef.current, max_seconds: v }
+        : null;
+    applyChange({ diagnostics: dg });
+  }
+  function setRecDir(v: string) {
+    setDiagDir(v);
+    diagDirRef.current = v;
+    const dg =
+      recRef.current && v
+        ? { record_dir: v, max_seconds: diagSecondsRef.current }
+        : null;
+    applyChange({ diagnostics: dg });
+  }
 
   const refOptions = (devices?.reference_sources ?? [])
     .filter((r) => r.available)
@@ -350,6 +528,11 @@ export default function App() {
   const off = !powerOn;
   const stopped = off;
   const unstable = powerOn && !live.healthy;
+  // 诚实状态:没有有效参考(reference=none 或 ref 信号静默)时,AEC 无消回声依据
+  // → 不显示绿色 "REMOVING ECHO",而是琥珀 "NO REFERENCE"。
+  const hasReference =
+    reference !== "none" && !(live.ref !== null && live.ref <= -100);
+  const noRef = powerOn && !unstable && !hasReference;
   const ns = Boolean(params.ns);
   // 降噪是 AEC3 管线独有(其它 backend 无 ns 参数)→ 不支持时置灰。
   const nsSupported = Boolean(
@@ -371,14 +554,25 @@ export default function App() {
     ? t("echoStopped")
     : unstable
       ? t("unstable")
-      : t("removingEcho");
-  const boxClass = stopped ? "box stopped" : unstable ? "box warn" : "box";
+      : noRef
+        ? t("noReference")
+        : t("removingEcho");
+  const boxClass =
+    stopped ? "box stopped" : unstable || noRef ? "box warn" : "box";
   const viewTitle =
     view === "overview"
       ? t("overview")
-      : view === "advanced"
-        ? t("advanced")
-        : t("diagnostics");
+      : view === "engine"
+        ? t("engine")
+        : view === "rtxsetup"
+          ? t("rtxSetup")
+          : view === "advanced"
+            ? t("advanced")
+            : t("diagnostics");
+  // 当前引擎是否就绪(未就绪时 overview 提示去 Engine 配置)。
+  const activeReady = engineReady(kind);
+  // dev:用模拟 doctor 驱动 Engine 卡片 + RTX 向导,让 mac 也能逐屏走流程。
+  const nvafxView = dev ? simNvafxDoctor(devRtxState) : nvafx;
 
   const dash = (v: number | null, d = 1) =>
     v === null ? "—" : v.toFixed(d);
@@ -392,6 +586,7 @@ export default function App() {
           <ScrambleText text={viewTitle} />
         </span>
         <span className="hatch" />
+        {dev && <span className="devtag">DEV</span>}
         <span className="uid">{modelName(kind)}</span>
         {!isMac && (
           <span className="caption">
@@ -422,16 +617,7 @@ export default function App() {
         </div>
         <div className="hero">
           <div className="word">ECHOLESS</div>
-          {/* 物理滑动开关:主体方块在条纹轨道里左右滑动 + 标签 scramble */}
-          <button
-            className={`power ${off ? "off" : "on"}`}
-            disabled={busy}
-            onClick={togglePower}
-          >
-            <span className="slider">
-              <ScrambleText text={off ? "OFF" : "ON"} trigger={powerOn} />
-            </span>
-          </button>
+          <SlideSwitch on={powerOn} onToggle={togglePower} disabled={busy} />
         </div>
         <div className="status">
           <span className={boxClass}>
@@ -442,7 +628,17 @@ export default function App() {
           <span className="m">
             {t("latency")} <b>{dash(live.lat, 0)}</b> {t("ms")}
           </span>
-          <span className="m">{unstable ? t("checkSetup") : t("stable")}</span>
+          {!activeReady ? (
+            <span
+              className="m setup"
+              onClick={() => setView("engine")}
+              style={{ color: "var(--warn)", cursor: "default" }}
+            >
+              {t("engSetupHint")} <span className="mk">&raquo;</span>
+            </span>
+          ) : (
+            <span className="m">{unstable ? t("checkSetup") : t("stable")}</span>
+          )}
         </div>
 
         <hr className="hair" />
@@ -481,16 +677,25 @@ export default function App() {
               {MODELS.map((m) => {
                 const proc = processors.find((p) => p.kind === m.kind);
                 const supported =
-                  !proc || proc.platforms.includes(platform);
+                  !proc || proc.platforms.includes(platform) || dev;
                 const exp = proc?.experimental;
+                const rdy = engineReady(m.kind);
                 return (
                   <button
                     key={m.kind}
                     className={`b ${kind === m.kind ? "active" : ""} ${
                       exp ? "exp" : ""
-                    }`}
+                    } ${supported && !rdy ? "unready" : ""}`}
                     disabled={!supported}
-                    onClick={() => changeKind(m.kind)}
+                    onClick={() => {
+                      // 未就绪(LocalVQE 无模型 / NVAFX doctor 未过):跳 Engine 配置,不生成非法配置。
+                      if (!rdy) {
+                        setKind(m.kind);
+                        setView("engine");
+                      } else {
+                        changeKind(m.kind);
+                      }
+                    }}
                   >
                     {m.label}
                   </button>
@@ -618,6 +823,37 @@ export default function App() {
         </div>
         </>
         )}
+        {view === "engine" && (
+          <EnginePage
+            processors={processors}
+            platform={platform}
+            kind={kind}
+            params={params}
+            doctor={nvafxView}
+            dev={dev}
+            onSelect={changeKind}
+            onParam={setParam}
+            onRecheck={recheckNvafx}
+            onSetup={() => setView("rtxsetup")}
+          />
+        )}
+        {view === "rtxsetup" && (
+          <RtxSetupPage
+            doctor={nvafxView}
+            busy={nvafxBusy}
+            dev={dev}
+            devState={devRtxState}
+            onDevState={setDevRtxState}
+            onBack={() => setView("engine")}
+            onRecheck={recheckNvafx}
+            onInstall={installNvafx}
+            onDownloadInstall={downloadInstallNvafx}
+            onUse={() => {
+              changeKind("nvidia_afx_aec");
+              setView("overview");
+            }}
+          />
+        )}
         {view === "advanced" && (
           <AdvancedPage
             processors={processors}
@@ -628,13 +864,31 @@ export default function App() {
             onParam={setParam}
           />
         )}
-        {view === "diagnostics" && <DiagnosticsPage />}
+        {view === "diagnostics" && (
+          <DiagnosticsPage
+            rec={rec}
+            seconds={diagSeconds}
+            diagDir={diagDir}
+            running={powerOn}
+            health={health}
+            onRec={setRecording}
+            onSeconds={setRecSeconds}
+            onDir={setRecDir}
+          />
+        )}
       </main>
 
       {/* ---- footer ---- */}
       <footer className="fbar">
         {view === "overview" ? (
           <>
+            <button
+              className="link"
+              style={linkStyle}
+              onClick={() => setView("engine")}
+            >
+              {t("engine")} <span className="mk">&gt;&gt;&gt;</span>
+            </button>
             <button
               className="link"
               style={linkStyle}
@@ -654,9 +908,10 @@ export default function App() {
           <button
             className="link"
             style={linkStyle}
-            onClick={() => setView("overview")}
+            onClick={() => setView(view === "rtxsetup" ? "engine" : "overview")}
           >
-            <span className="mk">&lt;&lt;&lt;</span> {t("backToOverview")}
+            <span className="mk">&lt;&lt;&lt;</span>{" "}
+            {view === "rtxsetup" ? t("engine") : t("backToOverview")}
           </button>
         )}
         <span className="sp" />

@@ -1,8 +1,8 @@
-import { useEffect, useState } from "react";
 import type { ParamSpec, Processor } from "../types";
 import type { PipelineCfg } from "../api";
 import { useI18n, type Lang } from "../i18n";
 import { Hint } from "../components/Hint";
+import { Field, SegButtons } from "../components/Controls";
 
 interface Props {
   processors: Processor[];
@@ -67,70 +67,6 @@ function backendLabel(kind: string, proc?: Processor): string {
   return proc?.label ?? kind;
 }
 
-// number / string / path 输入:本地编辑,blur 或 Enter 提交。空 = null(auto,生成 TOML 时省略)。
-function Field({
-  value,
-  numeric,
-  placeholder,
-  onCommit,
-}: {
-  value: unknown;
-  numeric: boolean;
-  placeholder: string;
-  onCommit: (v: unknown) => void;
-}) {
-  const [txt, setTxt] = useState(value == null ? "" : String(value));
-  useEffect(() => setTxt(value == null ? "" : String(value)), [value]);
-  const commit = () => {
-    const s = txt.trim();
-    if (s === "") return onCommit(null);
-    if (numeric) {
-      const n = Number(s);
-      return onCommit(Number.isFinite(n) ? n : null);
-    }
-    onCommit(s);
-  };
-  return (
-    <input
-      className="afield"
-      value={txt}
-      placeholder={placeholder}
-      inputMode={numeric ? "decimal" : "text"}
-      spellCheck={false}
-      onChange={(e) => setTxt(e.target.value)}
-      onBlur={commit}
-      onKeyDown={(e) => {
-        if (e.key === "Enter") (e.target as HTMLInputElement).blur();
-      }}
-    />
-  );
-}
-
-// 选项少 → 一排按钮(不做下拉)。
-function SegButtons<T extends string>({
-  value,
-  options,
-  onChange,
-}: {
-  value: T;
-  options: { value: T; label: string }[];
-  onChange: (v: T) => void;
-}) {
-  return (
-    <div className="segg">
-      {options.map((o) => (
-        <button
-          key={o.value}
-          className={`b ${o.value === value ? "active" : ""}`}
-          onClick={() => onChange(o.value)}
-        >
-          {o.label}
-        </button>
-      ))}
-    </div>
-  );
-}
-
 export function AdvancedPage({
   processors,
   kind,
@@ -143,8 +79,13 @@ export function AdvancedPage({
   const proc = processors.find((p) => p.kind === kind);
   const desc = (k: string) => DESC[k]?.[lang];
 
+  const reqMet = (spec: ParamSpec) =>
+    !spec.requires ||
+    Object.entries(spec.requires).every(([rk, rv]) => params[rk] === rv);
+
+  // 隐藏未满足 requires 的参数(如 ns 关闭时的 ns_level),而非置灰。
   const backendParams = Object.entries(proc?.params ?? {}).filter(
-    ([k]) => k !== "reference_channels" && k !== "ns",
+    ([k, spec]) => k !== "reference_channels" && k !== "ns" && reqMet(spec),
   );
 
   const control = (key: string, spec: ParamSpec) => {
@@ -180,20 +121,14 @@ export function AdvancedPage({
     );
   };
 
-  const arow = (key: string, label: string, spec: ParamSpec) => {
-    const reqOk =
-      !spec.requires ||
-      Object.entries(spec.requires).every(([rk, rv]) => params[rk] === rv);
-    const d = desc(key);
-    return (
-      <div className={`arow ${reqOk ? "" : "dim"}`} key={key}>
-        <Hint text={d}>
-          <span className="alabel">{label}</span>
-        </Hint>
-        <span className="aval">{control(key, spec)}</span>
-      </div>
-    );
-  };
+  const arow = (key: string, label: string, spec: ParamSpec) => (
+    <div className="arow" key={key}>
+      <Hint text={desc(key)}>
+        <span className="alabel">{label}</span>
+      </Hint>
+      <span className="aval">{control(key, spec)}</span>
+    </div>
+  );
 
   return (
     <div className="page">

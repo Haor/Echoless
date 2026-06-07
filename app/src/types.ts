@@ -123,6 +123,7 @@ export interface StartedEvent {
   sample_rate: number;
   frame_ms: number;
   reference_channels: string;
+  diagnostics_session_dir?: string | null;
 }
 
 export type RunEvent = RuntimeStatus | StartedEvent;
@@ -147,4 +148,32 @@ export interface DoctorAudio {
   permission_state: "granted" | "denied" | "undetermined";
   hint?: string;
   reference_sources: ReferenceSource[];
+}
+
+// ---- nvafx doctor --json(RTX AEC 引擎就绪探针) ----
+export type GpuArch = "turing" | "ampere" | "ada" | "blackwell";
+export type CheckStatus = "ok" | "warning" | "missing" | "unsupported";
+
+export interface NvafxGpu {
+  name: string;
+  driver_version: string;
+  compute_capability: string;
+  arch: GpuArch | null;
+}
+export interface NvafxCheck {
+  name: string;
+  status: CheckStatus;
+  detail: string;
+  action: string | null;
+}
+export interface NvafxReport {
+  runtime_dir: string;
+  runtime_dir_source: string;
+  gpus: NvafxGpu[];
+  selected_arch: GpuArch | null;
+  checks: NvafxCheck[];
+}
+export interface NvafxDoctor {
+  ok: boolean;
+  report: NvafxReport;
 }

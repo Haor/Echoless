@@ -49,8 +49,10 @@
 html,
 body,
 #root {
+  width: 100%;
   height: 100%;
   margin: 0;
+  overflow: hidden;
 }
 body {
   font-family: var(--mono);
@@ -64,13 +66,20 @@ body {
 }
 
 .window {
-  width: 100vw;
-  height: 100vh;
+  width: 100%;
+  height: 100%;
   background: var(--bg);
   display: grid;
   grid-template-rows: 40px 1fr 30px;
   position: relative;
   overflow: hidden;
+}
+/* grid 子项默认 min-width:auto 会被内部 nowrap 长文本撑爆、溢出窗口。
+   钳到 0,使子项被窗口宽度约束;内部行再各自收缩(见下),保证拖拽不外溢。 */
+.window > .tbar,
+.window > .content,
+.window > .fbar {
+  min-width: 0;
 }
 /* Windows/Linux 自绘边框(无原生装饰);macOS 边框交给 OS。 */
 .window.win {
@@ -115,8 +124,19 @@ body {
 .tbar > .appicon,
 .tbar > .screen,
 .tbar > .hatch,
+.tbar > .devtag,
 .tbar > .uid {
   pointer-events: none;
+}
+/* 开发态标识(按 ~ 切换):解开 NVAFX 平台/doctor 门槛 */
+.devtag {
+  flex: none;
+  color: var(--ink);
+  background: var(--warn);
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 1.5px;
+  padding: 2px 6px;
 }
 /* macOS:左侧给系统红绿灯让位(OS 绘制,约 70px)。 */
 .window.mac .tbar {
@@ -180,6 +200,7 @@ body {
   display: flex;
   flex-direction: column;
   min-height: 0;
+  min-width: 0;
 }
 
 /* 次级页(Advanced / Diagnostics)— 固定布局(内容一屏放下,不滚动) */
@@ -187,6 +208,7 @@ body {
   display: flex;
   flex-direction: column;
   min-height: 0;
+  min-width: 0;
   /* visible 以免裁掉自绘 tooltip;布局已保证一屏放下,不会出滚动条 */
   overflow: visible;
 }
@@ -231,6 +253,7 @@ body {
   align-items: center;
   height: 42px;
   gap: 12px;
+  min-width: 0;
 }
 .arow.dim {
   opacity: 0.4;
@@ -270,6 +293,109 @@ body {
 .afield::placeholder {
   color: var(--t-faint);
 }
+.afield.wide {
+  width: 340px;
+}
+
+/* Diagnostics:路径行 / 健康计数 */
+.drow {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  height: 34px;
+}
+.dim-soft {
+  opacity: 0.45;
+}
+/* 极简方形滑块开关 */
+.toggle {
+  position: relative;
+  width: 46px;
+  height: 22px;
+  padding: 0;
+  border: 1px solid var(--line);
+  background: var(--line-soft);
+}
+.toggle .knob {
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 16px;
+  height: 16px;
+  background: var(--t-mut);
+  transition:
+    transform 0.22s cubic-bezier(0.45, 0, 0.2, 1),
+    background-color 0.22s;
+}
+.toggle.on {
+  border-color: var(--live);
+  background: var(--live-ghost);
+}
+.toggle.on .knob {
+  transform: translateX(24px);
+  background: var(--live);
+}
+.dopen {
+  background: transparent;
+  border: none;
+  color: var(--t-soft);
+  font: inherit;
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: 1.4px;
+  text-transform: uppercase;
+}
+.dopen:hover {
+  color: var(--t);
+}
+.dopen .mk {
+  color: var(--t-faint);
+  letter-spacing: -1px;
+}
+.drow .dk {
+  width: 110px;
+  flex: none;
+  color: var(--t-faint);
+  font-size: 10px;
+  letter-spacing: 1.5px;
+  text-transform: uppercase;
+}
+.drow .dpath {
+  color: var(--t-soft);
+  font-size: 12px;
+  letter-spacing: 0.3px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+  user-select: text;
+  -webkit-user-select: text;
+}
+.drow .dpath.live {
+  color: var(--live);
+}
+/* 可点击的目录文本(无框)→ 打开文件夹选择器 */
+.drow .dpick {
+  color: var(--t);
+  font-size: 13px;
+  letter-spacing: 0.3px;
+  max-width: 360px;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.drow .dpick:hover {
+  color: var(--t-strong);
+}
+.aval.dval {
+  font-size: 14px;
+  color: var(--t);
+  font-variant-numeric: tabular-nums;
+}
+.aval.dval.warn {
+  color: var(--warn);
+}
 .page .psec {
   color: var(--t-faint);
   font-size: 10px;
@@ -288,6 +414,448 @@ body {
   font-size: 10px;
   letter-spacing: 1.5px;
   text-transform: uppercase;
+}
+
+/* Engine:引擎规格牌(ECHO/VOICE 双计量条)+ NVAFX doctor 就绪清单 */
+.ecards {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 14px;
+  margin-top: 14px;
+}
+.ecard {
+  background: var(--raised);
+  border: 1px solid var(--line);
+  padding: 12px 14px;
+  font-family: var(--mono);
+  color: var(--t);
+  min-width: 0;
+  overflow: hidden;
+}
+.ecard.wide {
+  margin-top: 14px;
+}
+.ecard:not(.na):not(.active):hover {
+  border-color: var(--t-faint);
+}
+.ecard.active {
+  border-color: var(--live);
+  background: var(--live-ghost);
+}
+.ecard.na {
+  opacity: 0.5;
+}
+.ecard .eh {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+}
+.ecard .en {
+  font-family: var(--disp);
+  font-weight: 700;
+  font-size: 18px;
+  letter-spacing: 1px;
+  color: var(--t-strong);
+}
+.ecard .en .sub {
+  color: var(--t-mut);
+  font-size: 11px;
+  font-style: normal;
+  font-weight: 400;
+  letter-spacing: 1px;
+}
+.ecard .etag {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 10px;
+  letter-spacing: 1.5px;
+  color: var(--live);
+  white-space: nowrap;
+}
+.ecard .etag.warn {
+  color: var(--warn);
+}
+.ecard .etag.na {
+  color: var(--t-faint);
+}
+.ecard .etag .dot {
+  width: 6px;
+  height: 6px;
+  background: currentColor;
+  border-radius: 50% !important;
+}
+.ecard .etier {
+  color: var(--t-faint);
+  font-size: 10px;
+  letter-spacing: 2px;
+  text-transform: uppercase;
+  margin: 3px 0 11px;
+}
+.emeter {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  height: 22px;
+}
+.emeter .el {
+  width: 46px;
+  color: var(--t-faint);
+  font-size: 9px;
+  letter-spacing: 1.5px;
+}
+.emeter .ebar {
+  display: flex;
+  gap: 3px;
+}
+.emeter .ebar i {
+  width: 9px;
+  height: 10px;
+  background: var(--t-dim);
+}
+.emeter .ebar i.on {
+  background: var(--t-soft);
+}
+.ecard.active .emeter .ebar i.on {
+  background: var(--live);
+}
+.espec {
+  margin-top: 10px;
+  color: var(--t-soft);
+  font-size: 11px;
+  letter-spacing: 0.5px;
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+.espec .sep {
+  color: var(--t-faint);
+}
+.espec.os {
+  margin-top: 3px;
+  color: var(--t-mut);
+  font-size: 10px;
+  letter-spacing: 1px;
+}
+.ecard .ewrap {
+  display: flex;
+  gap: 28px;
+}
+.ecard .ecol {
+  flex: 1;
+  min-width: 0;
+}
+.ecard .ecol.nvcol {
+  flex: 1.35;
+  border-left: 1px solid var(--line-soft);
+  padding-left: 22px;
+}
+.epair {
+  margin-top: 11px;
+  color: var(--warn);
+  font-size: 11px;
+  letter-spacing: 0.4px;
+}
+.epair .mk {
+  color: var(--t-faint);
+  letter-spacing: -1px;
+}
+.nvgpu {
+  color: var(--t);
+  font-size: 12px;
+  margin-bottom: 7px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.nvgpu i {
+  color: var(--t-mut);
+  font-style: normal;
+  font-size: 11px;
+}
+.echks {
+  max-height: 96px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.echk {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 10px;
+  min-width: 0;
+}
+.echk .cpill {
+  width: 70px;
+  flex: none;
+  text-align: center;
+  padding: 1px 0;
+  border: 1px solid var(--line);
+  color: var(--t-mut);
+  font-size: 8px;
+  letter-spacing: 1px;
+  text-transform: uppercase;
+}
+.echk .cpill.ok {
+  color: var(--live);
+  border-color: var(--live);
+}
+.echk .cpill.warning,
+.echk .cpill.missing,
+.echk .cpill.unsupported {
+  color: var(--warn);
+  border-color: var(--warn);
+}
+.echk .cname {
+  width: 130px;
+  flex: none;
+  color: var(--t-soft);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.echk .cdetail {
+  color: var(--t-mut);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+}
+.cdetail.na {
+  color: var(--t-faint);
+}
+.cdetail.warn {
+  color: var(--warn);
+}
+.drow.nvrt {
+  margin-top: 9px;
+  height: auto;
+}
+.setupbtn {
+  background: var(--live-ghost);
+  border: 1px solid var(--live);
+  color: var(--live);
+  font: inherit;
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: 1.4px;
+  text-transform: uppercase;
+  padding: 3px 10px;
+  margin-left: 4px;
+}
+.setupbtn:hover {
+  background: rgba(105, 216, 109, 0.18);
+}
+.setupbtn .mk {
+  color: var(--t-faint);
+  letter-spacing: -1px;
+}
+
+/* RTX Setup 向导:dev 状态切换条 */
+.devbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  margin-top: 10px;
+}
+.devbar .dvk {
+  color: var(--warn);
+  font-size: 9px;
+  letter-spacing: 1.5px;
+  text-transform: uppercase;
+  margin-right: 6px;
+}
+.devbar .dvb {
+  background: transparent;
+  border: 1px solid var(--line);
+  color: var(--t-mut);
+  font: inherit;
+  font-family: var(--mono);
+  font-size: 9px;
+  letter-spacing: 0.5px;
+  text-transform: uppercase;
+  padding: 2px 7px;
+}
+.devbar .dvb:hover {
+  border-color: var(--t-faint);
+  color: var(--t-soft);
+}
+.devbar .dvb.on {
+  border-color: var(--warn);
+  color: var(--ink);
+  background: var(--warn);
+}
+
+/* RTX Setup 向导(接管式面板) */
+/* 收紧纵向间距:dev 条换行也要放进锁定的 600 高度内 */
+.wz .asec {
+  margin: 9px 0 4px;
+}
+.wz hr.hair {
+  margin: 9px 0 2px;
+}
+.wz .wzsys {
+  display: flex;
+  flex-direction: column;
+}
+.wz .wzsys .drow {
+  height: 25px;
+}
+.wz .wzsys .dpath {
+  color: var(--t);
+}
+.wz .okmk {
+  color: var(--live);
+  font-style: normal;
+}
+.wz .warnmk {
+  color: var(--warn);
+  font-style: normal;
+}
+.wzladder {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px 16px;
+  margin-bottom: 2px;
+}
+.wznode {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 11px;
+  letter-spacing: 1px;
+  text-transform: uppercase;
+  color: var(--t-faint);
+}
+.wznode .d {
+  width: 8px;
+  height: 8px;
+  background: var(--t-dim);
+}
+.wznode.ok {
+  color: var(--t-soft);
+}
+.wznode.ok .d {
+  background: var(--live);
+}
+.wznode.active {
+  color: var(--warn);
+}
+.wznode.active .d {
+  background: var(--warn);
+  border-radius: 50% !important;
+}
+.wznode.fail {
+  color: var(--warn);
+}
+.wznode.fail .d {
+  background: var(--warn);
+}
+.wznode.pending {
+  color: var(--t-dim);
+}
+.wzcard {
+  border: 1px solid var(--line);
+  background: var(--raised);
+  padding: 11px 14px;
+  margin-top: 2px;
+}
+.wzcard .wzh {
+  color: var(--t-strong);
+  font-family: var(--disp);
+  font-weight: 700;
+  font-size: 15px;
+  letter-spacing: 0.5px;
+}
+.wzcard .wzh.warn {
+  color: var(--warn);
+}
+.wzcard .wzh.ok {
+  color: var(--live);
+}
+.wzcard .wznote {
+  color: var(--t-mut);
+  font-size: 11px;
+  letter-spacing: 0.3px;
+  line-height: 1.5;
+  margin-top: 6px;
+}
+.wzsrc {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin: 8px 0 2px;
+}
+.wzsrc .wlbl {
+  color: var(--t-faint);
+  font-size: 10px;
+  letter-spacing: 1.5px;
+  text-transform: uppercase;
+}
+.wzcard .drow {
+  height: 27px;
+}
+.wzcard .drow .wv {
+  color: var(--t-soft);
+  font-size: 12px;
+  letter-spacing: 0.3px;
+}
+.wzgo {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  margin-top: 9px;
+}
+.wzbtn {
+  background: var(--t-strong);
+  border: 1px solid var(--t-strong);
+  color: var(--ink);
+  font: inherit;
+  font-family: var(--mono);
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 1.5px;
+  text-transform: uppercase;
+  padding: 7px 16px;
+}
+.wzbtn:hover:not(:disabled) {
+  background: #fff;
+}
+.wzbtn:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+.wzbtn.ok {
+  background: var(--live);
+  border-color: var(--live);
+}
+.wzbtn .mk {
+  color: var(--ink);
+  letter-spacing: -1px;
+  opacity: 0.6;
+}
+.wzbusy {
+  color: var(--warn);
+  font-size: 12px;
+  letter-spacing: 1px;
+  text-transform: uppercase;
+}
+.wzassets {
+  margin-top: 8px;
+  color: var(--t-mut);
+  font-size: 11px;
+  line-height: 1.7;
+}
+.wzassets .dk {
+  width: auto;
+  margin-right: 6px;
+}
+.wzassets .sz {
+  color: var(--t-faint);
 }
 
 /* hero */
@@ -368,6 +936,19 @@ body {
 }
 .power:disabled {
   opacity: 0.55;
+}
+/* 小号变体(Diagnostics 录制开关) */
+.power.sm {
+  width: 110px;
+  height: 30px;
+}
+.power.sm .slider {
+  width: 74px;
+  font-size: 13px;
+  letter-spacing: 2px;
+}
+.power.sm.on .slider {
+  transform: translateX(33px);
 }
 
 /* status(boxed + 绿) */
@@ -466,6 +1047,7 @@ hr.hair {
   gap: 9px;
   color: var(--t);
   font-size: 15px;
+  min-width: 0;
 }
 .row .v .dn {
   color: var(--t-mut);
@@ -591,6 +1173,7 @@ hr.hair {
   font-size: 10px;
   letter-spacing: 1.2px;
   text-transform: uppercase;
+  min-width: 0;
 }
 .row .meta b {
   color: var(--t-soft);
@@ -675,6 +1258,7 @@ hr.hair {
 .scope {
   display: flex;
   align-items: stretch;
+  min-width: 0;
 }
 .near {
   flex: 1.04;
@@ -684,6 +1268,7 @@ hr.hair {
   gap: 6px;
   padding-right: 22px;
   border-right: 1px solid var(--line);
+  min-width: 0;
 }
 .gap {
   width: 48px;
@@ -699,12 +1284,14 @@ hr.hair {
   display: flex;
   align-items: center;
   padding-left: 22px;
+  min-width: 0;
 }
 .trace {
   display: flex;
   align-items: center;
   gap: 11px;
   height: 30px;
+  min-width: 0;
 }
 .far .trace {
   height: 66px;
@@ -772,6 +1359,10 @@ hr.hair {
 }
 .fbar .stamp {
   color: var(--t-faint);
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .fbar .bg {
   display: flex;

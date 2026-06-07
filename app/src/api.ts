@@ -4,6 +4,7 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type {
   DeviceList,
   DoctorAudio,
+  NvafxDoctor,
   Platform,
   ProcessorManifest,
   RunEvent,
@@ -24,6 +25,44 @@ export function listProcessors(): Promise<ProcessorManifest> {
 
 export function doctorAudio(): Promise<DoctorAudio> {
   return invoke<DoctorAudio>("doctor_audio");
+}
+
+export function nvafxDoctor(runtimeDir?: string): Promise<NvafxDoctor> {
+  return invoke<NvafxDoctor>("nvafx_doctor", { runtimeDir: runtimeDir ?? null });
+}
+
+// RTX AEC runtime 安装:解压 common + 按架构 model zip,回传安装后的 doctor 报告。
+export function nvafxInstall(p: {
+  commonZip: string;
+  modelZip: string;
+  runtimeDir?: string;
+}): Promise<NvafxDoctor> {
+  return invoke<NvafxDoctor>("nvafx_install", {
+    commonZip: p.commonZip,
+    modelZip: p.modelZip,
+    runtimeDir: p.runtimeDir ?? null,
+  });
+}
+
+// 从公共 GitHub release 下载 + 安装(后端按 GPU 架构自动选模型)。回传安装后 doctor。
+export function nvafxDownloadInstall(p: {
+  runtimeDir?: string;
+}): Promise<NvafxDoctor> {
+  return invoke<NvafxDoctor>("nvafx_download_install", {
+    runtimeDir: p.runtimeDir ?? null,
+  });
+}
+
+export function openUrl(url: string): Promise<void> {
+  return invoke<void>("open_url", { url });
+}
+
+export function defaultDiagDir(): Promise<string> {
+  return invoke<string>("default_diag_dir");
+}
+
+export function openPath(path: string): Promise<void> {
+  return invoke<void>("open_path", { path });
 }
 
 export function validateConfig(tomlText: string): Promise<ValidateResult> {
@@ -58,6 +97,10 @@ export interface PipelineCfg {
   frame_ms: number;
   reference_channels: "mono" | "stereo";
 }
+export interface DiagnosticsCfg {
+  record_dir: string;
+  max_seconds: number | null;
+}
 export interface ConfigChoice {
   mic: string; // selector / stable_id / "default"
   output: string;
@@ -65,6 +108,7 @@ export interface ConfigChoice {
   kind: string; // backend kind
   pipeline: PipelineCfg;
   params: Record<string, unknown>; // chain[0] 参数(不含 reference_channels)
+  diagnostics?: DiagnosticsCfg | null; // 开启录制时写入 [diagnostics]
 }
 
 function tomlString(v: string): string {
@@ -87,9 +131,15 @@ export function buildConfigToml(c: ConfigChoice): string {
     `frame_ms = ${c.pipeline.frame_ms}`,
     `reference_channels = ${tomlString(c.pipeline.reference_channels)}`,
     ``,
-    `[[chain]]`,
-    `kind = ${tomlString(c.kind)}`,
   ];
+  if (c.diagnostics) {
+    lines.push(`[diagnostics]`);
+    lines.push(`record_dir = ${tomlString(c.diagnostics.record_dir)}`);
+    if (c.diagnostics.max_seconds != null)
+      lines.push(`max_seconds = ${c.diagnostics.max_seconds}`);
+    lines.push(``);
+  }
+  lines.push(`[[chain]]`, `kind = ${tomlString(c.kind)}`);
   for (const [k, raw] of Object.entries(c.params)) {
     if (k === "reference_channels") continue; // 顶层管线项,不重复
     const val = tomlValue(raw);

@@ -68,6 +68,112 @@ fn doctor_audio() -> Result<Value, String> {
     run_json(&["doctor", "audio", "--json"])
 }
 
+/// NVIDIA AFX / RTX AEC 引擎就绪探针。
+/// 返回 { ok, report: { runtime_dir, runtime_dir_source, gpus[], selected_arch, checks[] } }。
+/// macOS/Linux 上后端会返回 ok=false + platform unsupported 检查项(诚实降级)。
+#[tauri::command]
+fn nvafx_doctor(runtime_dir: Option<String>) -> Result<Value, String> {
+    let mut args: Vec<&str> = vec!["nvafx", "doctor", "--json"];
+    if let Some(dir) = runtime_dir.as_deref() {
+        if !dir.is_empty() {
+            args.push("--runtime-dir");
+            args.push(dir);
+        }
+    }
+    run_json(&args)
+}
+
+/// NVAFX runtime 安装:校验+解压 common zip 与按架构选的 model zip,然后回传安装后的 doctor 报告。
+/// 实际只在 Windows 生效(CLI `nvafx install` 在非 Windows 会 bail);mac/Linux 上返回 Err。
+#[tauri::command]
+fn nvafx_install(
+    common_zip: String,
+    model_zip: String,
+    runtime_dir: Option<String>,
+) -> Result<Value, String> {
+    let rdir = runtime_dir.filter(|d| !d.is_empty());
+    let mut args: Vec<&str> = vec![
+        "nvafx",
+        "install",
+        "--common-zip",
+        &common_zip,
+        "--model-zip",
+        &model_zip,
+    ];
+    if let Some(dir) = rdir.as_deref() {
+        args.push("--runtime-dir");
+        args.push(dir);
+    }
+    let out = Command::new(echoless_bin())
+        .args(&args)
+        .output()
+        .map_err(|e| format!("spawn echoless failed: {e}"))?;
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr);
+        return Err(format!("nvafx install 失败: {err}"));
+    }
+    // 安装后用 doctor --json 验证,回传报告供前端重算状态。
+    let mut dargs: Vec<&str> = vec!["nvafx", "doctor", "--json"];
+    if let Some(dir) = rdir.as_deref() {
+        dargs.push("--runtime-dir");
+        dargs.push(dir);
+    }
+    run_json(&dargs)
+}
+
+/// 从公共 GitHub release 下载 common+架构 model zip,然后安装并回传 doctor。
+/// TODO(backend/Codex):接公共 release 下载器(按 nvafx doctor 的 selected_arch 选 model
+/// asset,校验 SHA256,落盘后调 `nvafx install`)。公共仓库上线前先返回明确错误。
+#[tauri::command]
+fn nvafx_download_install(_runtime_dir: Option<String>) -> Result<Value, String> {
+    Err("RTX 下载安装器尚未接入(等公共 release 上线);当前请用 Local zip。".into())
+}
+
+/// 在系统默认浏览器打开外部链接(驱动 / VC++ 下载页)。
+#[tauri::command]
+fn open_url(url: String) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    let (prog, args): (&str, Vec<&str>) = ("open", vec![&url]);
+    #[cfg(target_os = "windows")]
+    let (prog, args): (&str, Vec<&str>) = ("cmd", vec!["/C", "start", "", &url]);
+    #[cfg(target_os = "linux")]
+    let (prog, args): (&str, Vec<&str>) = ("xdg-open", vec![&url]);
+    Command::new(prog)
+        .args(&args)
+        .spawn()
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// 诊断录制默认目录(绝对路径,session-* 会写在其下)。
+#[tauri::command]
+fn default_diag_dir() -> String {
+    std::env::temp_dir()
+        .join("echoless-diagnostics")
+        .to_string_lossy()
+        .to_string()
+}
+
+/// 在系统文件管理器里打开目录(不存在则先创建)。
+#[tauri::command]
+fn open_path(path: String) -> Result<(), String> {
+    let p = std::path::Path::new(&path);
+    if !p.exists() {
+        std::fs::create_dir_all(p).map_err(|e| e.to_string())?;
+    }
+    #[cfg(target_os = "macos")]
+    let prog = "open";
+    #[cfg(target_os = "windows")]
+    let prog = "explorer";
+    #[cfg(target_os = "linux")]
+    let prog = "xdg-open";
+    Command::new(prog)
+        .arg(&path)
+        .spawn()
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 #[tauri::command]
 fn validate_config(toml_text: String) -> Result<Value, String> {
     let path = std::env::temp_dir().join("echoless-validate.toml");
@@ -152,22 +258,32 @@ fn stop_run(state: State<RunState>) -> Result<(), String> {
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_decorum::init())
+        .plugin(tauri_plugin_dialog::init())
         .manage(RunState(Mutex::new(None)))
         .invoke_handler(tauri::generate_handler![
             get_platform,
             list_devices,
             list_processors,
             doctor_audio,
+            nvafx_doctor,
+            nvafx_install,
+            nvafx_download_install,
+            open_url,
+            default_diag_dir,
+            open_path,
             validate_config,
             start_run,
             stop_run
         ])
         .setup(|app| {
+            // 一屏控制电器:纵向布局固定 → 锁死窗口高度(min==max=600),
+            // 仅保留宽度在 900..1480 区间内可调。避免拉高时底部出现空洞。
             let mut builder =
                 WebviewWindowBuilder::new(app, "main", WebviewUrl::App("index.html".into()))
                     .title("Echoless")
-                    .inner_size(980.0, 600.0)
-                    .min_inner_size(900.0, 560.0)
+                    .inner_size(1000.0, 600.0)
+                    .min_inner_size(900.0, 600.0)
+                    .max_inner_size(1480.0, 600.0)
                     .resizable(true)
                     .visible(true);
 
