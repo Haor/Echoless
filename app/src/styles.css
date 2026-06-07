@@ -41,6 +41,11 @@
   box-sizing: border-box;
   border-radius: 0 !important;
 }
+/* 桌面 app:不显示键盘 Tab 焦点框 */
+:focus,
+:focus-visible {
+  outline: none !important;
+}
 html,
 body,
 #root {
@@ -175,6 +180,114 @@ body {
   display: flex;
   flex-direction: column;
   min-height: 0;
+}
+
+/* 次级页(Advanced / Diagnostics)— 固定布局(内容一屏放下,不滚动) */
+.page {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  /* visible 以免裁掉自绘 tooltip;布局已保证一屏放下,不会出滚动条 */
+  overflow: visible;
+}
+
+/* 自绘悬浮提示(单色直角,匹配主题) */
+.hint {
+  position: relative;
+  display: inline-flex;
+}
+.hint-pop {
+  position: absolute;
+  top: calc(100% + 6px);
+  left: 0;
+  z-index: 80;
+  background: var(--raised);
+  border: 1px solid var(--line);
+  color: var(--t-soft);
+  font-size: 11px;
+  letter-spacing: 0.3px;
+  line-height: 1.5;
+  padding: 7px 10px;
+  width: max-content;
+  max-width: 260px;
+  box-shadow: 0 10px 28px rgba(0, 0, 0, 0.55);
+  pointer-events: none;
+}
+/* Advanced:// 分区 + 2 列固定网格 */
+.asec {
+  color: var(--t-faint);
+  font-size: 10px;
+  letter-spacing: 2px;
+  text-transform: uppercase;
+  margin: 16px 0 6px;
+}
+.acols {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  column-gap: 40px;
+}
+.arow {
+  display: flex;
+  align-items: center;
+  height: 42px;
+  gap: 12px;
+}
+.arow.dim {
+  opacity: 0.4;
+  pointer-events: none;
+}
+.arow .alabel {
+  color: var(--t-soft);
+  font-size: 12px;
+  letter-spacing: 0.5px;
+  white-space: nowrap;
+}
+/* 带说明的 label:悬浮一会出原生 tooltip(无下划线、不变问号光标) */
+.arow .aval {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+}
+/* 不支持的段(如非 AEC3 的降噪)置灰 */
+.segg.dim {
+  opacity: 0.4;
+  pointer-events: none;
+}
+.afield {
+  background: transparent;
+  border: 1px solid var(--line);
+  color: var(--t);
+  font: inherit;
+  font-family: var(--mono);
+  font-size: 14px;
+  padding: 4px 8px;
+  width: 120px;
+}
+.afield:focus {
+  outline: none;
+  border-color: var(--t-faint);
+}
+.afield::placeholder {
+  color: var(--t-faint);
+}
+.page .psec {
+  color: var(--t-faint);
+  font-size: 10px;
+  letter-spacing: 2px;
+  text-transform: uppercase;
+  margin: 18px 0 8px;
+}
+.page .pnote {
+  color: var(--t-mut);
+  font-size: 12px;
+  letter-spacing: 0.4px;
+}
+.page .pscaffold {
+  margin-top: auto;
+  color: var(--t-faint);
+  font-size: 10px;
+  letter-spacing: 1.5px;
+  text-transform: uppercase;
 }
 
 /* hero */

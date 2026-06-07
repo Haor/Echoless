@@ -12,6 +12,7 @@ import {
   startRun,
   stopRun,
   validateConfig,
+  type PipelineCfg,
 } from "./api";
 import type {
   AudioDevice,
@@ -20,6 +21,7 @@ import type {
   Platform,
   Processor,
 } from "./types";
+import { useI18n } from "./i18n";
 import {
   AppIcon,
   CapClose,
@@ -33,6 +35,8 @@ import {
 import { FooterBars, Scope, type Telemetry } from "./components/Scope";
 import { Dropdown } from "./components/Dropdown";
 import { ScrambleText } from "./components/ScrambleText";
+import { AdvancedPage } from "./pages/AdvancedPage";
+import { DiagnosticsPage } from "./pages/DiagnosticsPage";
 
 const appWindow = getCurrentWindow();
 
@@ -59,6 +63,22 @@ function modelName(kind: string): string {
   return MODELS.find((m) => m.kind === kind)?.label ?? kind.toUpperCase();
 }
 
+// 由 manifest 推导某 backend 的 chain 参数默认值(reference_channels 归到 pipeline)。
+function defaultParams(proc: Processor | undefined): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  if (!proc) return out;
+  for (const [k, spec] of Object.entries(proc.params)) {
+    if (k === "reference_channels") continue;
+    out[k] =
+      spec.default !== undefined
+        ? spec.default
+        : spec.type === "bool"
+          ? false
+          : null;
+  }
+  return out;
+}
+
 interface Live {
   mic: number | null;
   ref: number | null;
@@ -74,11 +94,19 @@ export default function App() {
   const [selInput, setSelInput] = useState("default");
   const [selOutput, setSelOutput] = useState("default");
   const [kind, setKind] = useState("sonora_aec3");
-  const [ns, setNs] = useState(false);
+  const [pipeline, setPipeline] = useState<PipelineCfg>({
+    sample_rate: 48000,
+    frame_ms: 10,
+    reference_channels: "mono",
+  });
+  const [params, setParams] = useState<Record<string, unknown>>({});
   const [running, setRunning] = useState(false); // 进程是否存活(含 restart 抖动)
   const [powerOn, setPowerOn] = useState(false); // 用户开关意图(UI 显示/动画只看这个)
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
+  const [view, setView] = useState<"overview" | "advanced" | "diagnostics">(
+    "overview",
+  );
   const [doctor, setDoctor] = useState<DoctorAudio | null>(null);
   // reference:可用源由 devices.reference_sources 提供;mac system 无 loopback → 默认退 none。
   const [reference, setReference] = useState("system");
@@ -95,6 +123,11 @@ export default function App() {
   runningRef.current = running;
   const powerOnRef = useRef(powerOn);
   powerOnRef.current = powerOn;
+  const pipelineRef = useRef(pipeline);
+  pipelineRef.current = pipeline;
+  const paramsRef = useRef(params);
+  paramsRef.current = params;
+  const { t } = useI18n();
 
   // 平台 + 设备/处理器枚举 + 事件订阅
   useEffect(() => {
@@ -146,6 +179,30 @@ export default function App() {
     return () => uns.forEach((u) => u());
   }, []);
 
+  // Esc 始终有意义:在次级页按 Esc 返回 Overview。
+  useEffect(() => {
+    if (view === "overview") return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setView("overview");
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [view]);
+
+  // backend 切换 / manifest 加载 → 用该 backend 的 manifest 默认重置 chain 参数。
+  useEffect(() => {
+    setParams(defaultParams(processors.find((p) => p.kind === kind)));
+  }, [processors, kind]);
+
+  // 桌面 app:禁用 Tab 键焦点移动(避免按钮出现键盘选中框)。
+  useEffect(() => {
+    const onTab = (e: KeyboardEvent) => {
+      if (e.key === "Tab") e.preventDefault();
+    };
+    window.addEventListener("keydown", onTab);
+    return () => window.removeEventListener("keydown", onTab);
+  }, []);
+
   function refreshDevices() {
     listDevices()
       .then((d) => {
@@ -168,7 +225,8 @@ export default function App() {
     output: string;
     reference: string;
     kind: string;
-    ns: boolean;
+    pipeline: PipelineCfg;
+    params: Record<string, unknown>;
   }>;
 
   function currentToml(over?: Override) {
@@ -177,7 +235,8 @@ export default function App() {
       output: over?.output ?? selOutput,
       reference: over?.reference ?? reference,
       kind: over?.kind ?? kind,
-      ns: over?.ns ?? ns,
+      pipeline: over?.pipeline ?? pipelineRef.current,
+      params: over?.params ?? paramsRef.current,
     });
   }
 
@@ -254,6 +313,26 @@ export default function App() {
     }
   }
 
+  // 切 backend:用新 backend 的 manifest 默认重置参数并重启。
+  function changeKind(k: string) {
+    const np = defaultParams(processors.find((p) => p.kind === k));
+    setKind(k);
+    setParams(np);
+    applyChange({ kind: k, params: np });
+  }
+  // 改单个 chain 参数(NOISE / Advanced)。
+  function setParam(key: string, val: unknown) {
+    const np = { ...paramsRef.current, [key]: val };
+    setParams(np);
+    applyChange({ params: np });
+  }
+  // 改管线项(Advanced:sample_rate / frame_ms / reference_channels)。
+  function changePipeline(patch: Partial<PipelineCfg>) {
+    const npl = { ...pipelineRef.current, ...patch };
+    setPipeline(npl);
+    applyChange({ pipeline: npl });
+  }
+
   const refOptions = (devices?.reference_sources ?? [])
     .filter((r) => r.available)
     .map((r) => ({
@@ -271,13 +350,35 @@ export default function App() {
   const off = !powerOn;
   const stopped = off;
   const unstable = powerOn && !live.healthy;
+  const ns = Boolean(params.ns);
+  // 降噪是 AEC3 管线独有(其它 backend 无 ns 参数)→ 不支持时置灰。
+  const nsSupported = Boolean(
+    processors.find((p) => p.kind === kind)?.params?.ns,
+  );
+  // 通话 app 里要选的"麦克风"名:由所选输出设备名推导(CABLE Input→CABLE Output;其余同名)。
+  const outDev = devices?.outputs.find((d) => d.stable_id === selOutput);
+  const cableName = outDev
+    ? /cable input/i.test(outDev.name)
+      ? outDev.name.replace(/input/i, "Output")
+      : outDev.name
+    : "CABLE Output";
+  // footer 规格徽章随 pipeline 实时变。
+  const stamp = `${pipeline.reference_channels.toUpperCase()} · ${
+    pipeline.sample_rate / 1000
+  }K · ${pipeline.frame_ms}MS`;
 
   const statusText = stopped
-    ? "ECHO STOPPED"
+    ? t("echoStopped")
     : unstable
-      ? "UNSTABLE"
-      : "REMOVING ECHO";
+      ? t("unstable")
+      : t("removingEcho");
   const boxClass = stopped ? "box stopped" : unstable ? "box warn" : "box";
+  const viewTitle =
+    view === "overview"
+      ? t("overview")
+      : view === "advanced"
+        ? t("advanced")
+        : t("diagnostics");
 
   const dash = (v: number | null, d = 1) =>
     v === null ? "—" : v.toFixed(d);
@@ -287,7 +388,9 @@ export default function App() {
       {/* ---- titlebar ---- */}
       <header className="tbar" data-tauri-drag-region>
         <AppIcon />
-        <span className="screen">Overview</span>
+        <span className="screen">
+          <ScrambleText text={viewTitle} />
+        </span>
         <span className="hatch" />
         <span className="uid">{modelName(kind)}</span>
         {!isMac && (
@@ -307,13 +410,15 @@ export default function App() {
 
       {/* ---- content ---- */}
       <main className="content">
+        {view === "overview" && (
+        <>
         <div className="kick">
           <span className="d">
             <i />
             <i />
             <i />
           </span>{" "}
-          Acoustic Echo Cancellation · Local
+          {t("kicker")}
         </div>
         <div className="hero">
           <div className="word">ECHOLESS</div>
@@ -335,9 +440,9 @@ export default function App() {
             <ScrambleText text={statusText} />
           </span>
           <span className="m">
-            LATENCY <b>{dash(live.lat, 0)}</b> MS
+            {t("latency")} <b>{dash(live.lat, 0)}</b> {t("ms")}
           </span>
-          <span className="m">{unstable ? "CHECK SETUP" : "STABLE"}</span>
+          <span className="m">{unstable ? t("checkSetup") : t("stable")}</span>
         </div>
 
         <hr className="hair" />
@@ -346,7 +451,7 @@ export default function App() {
         <div className="rows">
           <div className="row">
             <span className="bul">•</span>
-            <span className="k">Input</span>
+            <span className="k">{t("input")}</span>
             <span className="co">:</span>
             <span className="v">
               <Dropdown
@@ -362,7 +467,7 @@ export default function App() {
               />
             </span>
             <span className="sp" />
-            <span className="meta">Microphone · Near-end</span>
+            <span className="meta">{t("micNearEnd")}</span>
             <span className="ico">
               <IcoInput />
             </span>
@@ -370,7 +475,7 @@ export default function App() {
 
           <div className="row">
             <span className="bul">•</span>
-            <span className="k">Model</span>
+            <span className="k">{t("model")}</span>
             <span className="co">:</span>
             <div className="segg" id="models">
               {MODELS.map((m) => {
@@ -385,10 +490,7 @@ export default function App() {
                       exp ? "exp" : ""
                     }`}
                     disabled={!supported}
-                    onClick={() => {
-                      setKind(m.kind);
-                      applyChange({ kind: m.kind });
-                    }}
+                    onClick={() => changeKind(m.kind)}
                   >
                     {m.label}
                   </button>
@@ -397,7 +499,7 @@ export default function App() {
             </div>
             <span className="sp" />
             <span className="meta">
-              Reference{" "}
+              {t("reference")}{" "}
               <Dropdown
                 compact
                 align="right"
@@ -417,7 +519,7 @@ export default function App() {
 
           <div className="row">
             <span className="bul">•</span>
-            <span className="k">Output</span>
+            <span className="k">{t("output")}</span>
             <span className="co">:</span>
             <span className="v">
               <Dropdown
@@ -435,13 +537,13 @@ export default function App() {
             <span className="sp" />
             {doctor && !doctor.virtual_output_detected ? (
               <span className="meta" style={{ color: "var(--warn)" }}>
-                <span className="mk">!!!</span> install{" "}
-                <b>{doctor.recommended_driver}</b> virtual cable
+                <span className="mk">!!!</span> {t("installCable")}:{" "}
+                <b>{doctor.recommended_driver}</b>
               </span>
             ) : (
               <span className="meta">
                 <span className="mk">&gt;&gt;&gt;</span> in app pick{" "}
-                <b>CABLE Output</b> as mic
+                <b>{cableName}</b> as mic
               </span>
             )}
             <span className="ico">
@@ -451,30 +553,26 @@ export default function App() {
 
           <div className="row">
             <span className="bul">•</span>
-            <span className="k">Noise</span>
+            <span className="k">{t("noise")}</span>
             <span className="co">:</span>
-            <div className="segg" id="ns">
+            <div className={`segg ${nsSupported ? "" : "dim"}`} id="ns">
               <button
                 className={`b ${ns ? "active" : ""}`}
-                onClick={() => {
-                  setNs(true);
-                  applyChange({ ns: true });
-                }}
+                onClick={() => setParam("ns", true)}
               >
                 ON
               </button>
               <button
                 className={`b ${!ns ? "active" : ""}`}
-                onClick={() => {
-                  setNs(false);
-                  applyChange({ ns: false });
-                }}
+                onClick={() => setParam("ns", false)}
               >
                 OFF
               </button>
             </div>
             <span className="sp" />
-            <span className="meta">Reduce background noise</span>
+            <span className="meta">
+              {nsSupported ? t("reduceNoise") : "AEC3 only"}
+            </span>
             <span className="ico">
               <IcoNoise />
             </span>
@@ -486,10 +584,8 @@ export default function App() {
         {/* ---- signal:三路示波 ---- */}
         <div className="sig">
           <div className="h">
-            <span className="t">// Signal</span>
-            <span className="v">
-              Near-end <b>Mic + Ref</b> &raquo; Clean <b>Output</b>
-            </span>
+            <span className="t">// {t("signal")}</span>
+            <span className="v">{t("sigFlow")}</span>
           </div>
           <div className="scope">
             <div className="near">
@@ -520,23 +616,56 @@ export default function App() {
             </div>
           </div>
         </div>
+        </>
+        )}
+        {view === "advanced" && (
+          <AdvancedPage
+            processors={processors}
+            kind={kind}
+            pipeline={pipeline}
+            params={params}
+            onPipeline={changePipeline}
+            onParam={setParam}
+          />
+        )}
+        {view === "diagnostics" && <DiagnosticsPage />}
       </main>
 
       {/* ---- footer ---- */}
       <footer className="fbar">
-        <button className="link" style={linkStyle}>
-          Advanced <span className="mk">&gt;&gt;&gt;</span>
-        </button>
-        <button className="link" style={linkStyle}>
-          Diagnostics <span className="mk">&gt;&gt;&gt;</span>
-        </button>
+        {view === "overview" ? (
+          <>
+            <button
+              className="link"
+              style={linkStyle}
+              onClick={() => setView("advanced")}
+            >
+              {t("advanced")} <span className="mk">&gt;&gt;&gt;</span>
+            </button>
+            <button
+              className="link"
+              style={linkStyle}
+              onClick={() => setView("diagnostics")}
+            >
+              {t("diagnostics")} <span className="mk">&gt;&gt;&gt;</span>
+            </button>
+          </>
+        ) : (
+          <button
+            className="link"
+            style={linkStyle}
+            onClick={() => setView("overview")}
+          >
+            <span className="mk">&lt;&lt;&lt;</span> {t("backToOverview")}
+          </button>
+        )}
         <span className="sp" />
         {err ? (
           <span className="stamp" style={{ color: "var(--warn)" }} title={err}>
             {err.length > 48 ? err.slice(0, 48) + "…" : err}
           </span>
         ) : (
-          <span className="stamp">MONO · 48K · 10MS</span>
+          <span className="stamp">{stamp}</span>
         )}
         <FooterBars telRef={telRef} />
       </footer>

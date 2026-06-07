@@ -53,17 +53,29 @@ export function onRunLog(cb: (line: string) => void): Promise<UnlistenFn> {
 }
 
 // ---- 配置生成:把 UI 选择拼成后端 PipelineConfig(TOML) ----
+export interface PipelineCfg {
+  sample_rate: number;
+  frame_ms: number;
+  reference_channels: "mono" | "stereo";
+}
 export interface ConfigChoice {
-  mic: string; // selector / "default"
-  output: string; // selector / "default"
-  reference: string; // "system" | "none" | "input:N" | ...
+  mic: string; // selector / stable_id / "default"
+  output: string;
+  reference: string; // "system" | "none" | "input:<stable_id>" | ...
   kind: string; // backend kind
-  ns: boolean;
-  referenceChannels?: "mono" | "stereo";
+  pipeline: PipelineCfg;
+  params: Record<string, unknown>; // chain[0] 参数(不含 reference_channels)
 }
 
 function tomlString(v: string): string {
   return `"${v.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
+}
+
+function tomlValue(v: unknown): string | null {
+  if (v === null || v === undefined || v === "") return null;
+  if (typeof v === "boolean") return v ? "true" : "false";
+  if (typeof v === "number") return Number.isFinite(v) ? String(v) : null;
+  return tomlString(String(v));
 }
 
 export function buildConfigToml(c: ConfigChoice): string {
@@ -71,17 +83,17 @@ export function buildConfigToml(c: ConfigChoice): string {
     `mic = ${tomlString(c.mic)}`,
     `reference = ${tomlString(c.reference)}`,
     `output = ${tomlString(c.output)}`,
-    `sample_rate = 48000`,
-    `frame_ms = 10`,
-    `reference_channels = ${tomlString(c.referenceChannels ?? "mono")}`,
+    `sample_rate = ${c.pipeline.sample_rate}`,
+    `frame_ms = ${c.pipeline.frame_ms}`,
+    `reference_channels = ${tomlString(c.pipeline.reference_channels)}`,
     ``,
     `[[chain]]`,
     `kind = ${tomlString(c.kind)}`,
   ];
-  // sonora_aec3 才有 ns/agc;其它 backend 暂走默认。
-  if (c.kind === "sonora_aec3") {
-    lines.push(`ns = ${c.ns ? "true" : "false"}`);
-    lines.push(`agc = false`);
+  for (const [k, raw] of Object.entries(c.params)) {
+    if (k === "reference_channels") continue; // 顶层管线项,不重复
+    const val = tomlValue(raw);
+    if (val !== null) lines.push(`${k} = ${val}`);
   }
   return lines.join("\n") + "\n";
 }
