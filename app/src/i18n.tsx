@@ -53,6 +53,10 @@ const D: Record<string, { en: string; zh: string }> = {
     en: "first run will request system audio permission",
     zh: "首次运行将请求系统音频权限",
   },
+  sysAudioRequest: {
+    en: "request system audio permission",
+    zh: "请求系统音频权限",
+  },
   // 系统音频参考(Process Tap)要求全局采样率 = 48k(与引擎无关)。
   sysRefRate: {
     en: "System Audio ref needs 48k sample rate",
@@ -80,6 +84,16 @@ const D: Record<string, { en: string; zh: string }> = {
   engRecheck: { en: "recheck", zh: "重检" },
   engPickModel: { en: "pick .gguf model…", zh: "选择 .gguf 模型…" },
   engModelReq: { en: "model required", zh: "需要模型文件" },
+  // LocalVQE 模型列表
+  lvqeDefault: { en: "DEFAULT", zh: "默认" },
+  lvqeDownload: { en: "download", zh: "下载" },
+  lvqeDownloading: { en: "downloading…", zh: "下载中…" },
+  lvqeUse: { en: "use", zh: "使用" },
+  lvqeInUse: { en: "in use", zh: "使用中" },
+  lvqeCustom: { en: "pick local .gguf…", zh: "选本地 .gguf…" },
+  lvqeGet: { en: "GET", zh: "下载" },
+  lvqeOpenDir: { en: "open model folder", zh: "打开模型目录" },
+  lvqeSource: { en: "official repo", zh: "官方 repo" },
   engSetupHint: { en: "set up in Engine", zh: "去 Engine 配置" },
   engSetupRtx: { en: "set up RTX", zh: "配置 RTX" },
 

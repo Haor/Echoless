@@ -30,6 +30,9 @@
   --live: #69d86d;
   --live-ghost: rgba(105, 216, 109, 0.1);
   --warn: #d8b45a;
+  /* 待机色:运行正常但当前无参考信号(非告警,冷色与绿/黄/灰区分) */
+  --idle: #5b9bd8;
+  --idle-ghost: rgba(91, 155, 216, 0.08);
   --ink: #08090b;
   --hatch: rgba(215, 216, 221, 0.26);
   --mono: "JetBrains Mono", "Geist Mono", "IBM Plex Mono", "Cascadia Mono",
@@ -212,6 +215,25 @@ body {
   /* visible 以免裁掉自绘 tooltip;布局已保证一屏放下,不会出滚动条 */
   overflow: visible;
 }
+/* 引擎页内容随 dev/NVAFX 报告而变高:矮/窄窗口下允许纵向滚动,
+   保证 NVAFX「配置 RTX」等底部操作永远可达(不被窗口裁掉) */
+.page.engine {
+  flex: 1 1 auto;
+  overflow-y: auto;
+  overflow-x: hidden;
+}
+/* kick/分隔线下的卡片区:在剩余空间内垂直居中,上下留白相等;
+   safe 保证内容超高时退回顶对齐(配合滚动,顶部不被裁) */
+.enbody {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  justify-content: safe center;
+}
+.enbody > .ecards {
+  margin-top: 0;
+}
 
 /* 自绘悬浮提示(单色直角,匹配主题) */
 .hint {
@@ -344,6 +366,7 @@ body {
   font-size: 10px;
   letter-spacing: 1.4px;
   text-transform: uppercase;
+  white-space: nowrap;
 }
 .dopen:hover {
   color: var(--t);
@@ -385,6 +408,162 @@ body {
 }
 .recbadge.warn {
   color: var(--warn);
+}
+/* 设备重采样提示(输入行 meta):设备原生率 → 管线率 */
+.rsmp {
+  color: var(--t-faint);
+  letter-spacing: 0.5px;
+}
+
+/* LocalVQE 模型清单(卡片内右栏 checklist,常驻、紧凑、抗窄窗重叠):绿=已有,黄=未下载 */
+/* 右栏与左栏 meters 等高对齐:ewrap 拉伸两栏,模型行高对齐 meter 行,footer 钉底对齐 OS 行 */
+.lvwide .ewrap {
+  gap: 14px;
+  margin-top: 2px;
+  align-items: stretch;
+}
+/* 左栏(meters)按内容收窄,右栏(模型)吃掉剩余空间且可被窗口压缩 */
+.lvwide .ecol:first-child {
+  flex: 0 1 auto;
+}
+.ecard .ecol.lvcol {
+  flex: 1 1 0;
+  min-width: 0; /* 关键:允许右栏随窗口收缩,内部再各自钳制,杜绝重叠 */
+  border-left: 1px solid var(--line-soft);
+  padding-left: 14px;
+  display: flex;
+  flex-direction: column;
+}
+.lvmods {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+.lvmod {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  min-width: 0;
+  height: 26px; /* 对齐左栏 meter 行(.emeter) */
+  text-align: left;
+  background: transparent;
+  border: 1px solid transparent;
+  padding: 0 3px;
+  font: inherit;
+  font-family: var(--mono);
+  cursor: pointer;
+}
+.lvmod:hover:not(:disabled) {
+  background: var(--raised);
+}
+.lvmod:disabled {
+  cursor: default;
+}
+.lvbox {
+  width: 42px;
+  flex: none;
+  text-align: center;
+  padding: 1px 0;
+  border: 1px solid var(--t-faint);
+  color: var(--t-mut);
+  font-size: 8px;
+  letter-spacing: 1px;
+}
+.lvbox.ok {
+  color: var(--live);
+  border-color: var(--live);
+}
+.lvbox.miss {
+  color: var(--warn);
+  border-color: var(--warn);
+}
+/* 版本号 / DEFAULT 徽标:flex:none 不参与压缩,永不被裁(选中=绿字 + ✓ 盒子,无背景条) */
+.lvver {
+  flex: none;
+  font-family: var(--disp);
+  font-weight: 700;
+  font-size: 12px;
+  letter-spacing: 0.5px;
+  color: var(--t-strong);
+  white-space: nowrap;
+}
+.lvmod.on .lvver {
+  color: var(--live);
+}
+.lvdef {
+  flex: none;
+  font-style: normal;
+  font-family: var(--mono);
+  font-weight: 400;
+  font-size: 7px;
+  letter-spacing: 1px;
+  color: var(--ink);
+  background: var(--t-mut);
+  padding: 1px 4px;
+}
+.lvmod.on .lvdef {
+  background: var(--live);
+}
+/* 弹性占位:把大小推到右侧成列对齐;窄窗时它先收缩到 0,大小由卡片边界兜底 */
+.lvsp {
+  flex: 1 1 0;
+  min-width: 0;
+}
+/* 大小列:参数 + 大小拆成定宽单元 → 三行列对齐(统一宽度);整块可收缩裁切,窄窗不溢出 */
+.lvms {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 3px;
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--t-mut);
+  font-size: 10px;
+  letter-spacing: 0.3px;
+  white-space: nowrap;
+}
+.lvms .lvp {
+  flex: none;
+  width: 26px;
+  text-align: right;
+}
+.lvms .lvsep {
+  flex: none;
+  color: var(--t-faint);
+}
+.lvms .lvz {
+  flex: none;
+  width: 42px;
+  text-align: right;
+}
+/* footer:钉到右栏底部(对齐左栏 OS 行),只剩「打开模型目录」一项 */
+.lvtools {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 4px;
+  margin-top: auto;
+  min-width: 0;
+}
+.lvtools .dopen {
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.lvsrc {
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--t-faint);
+  font-size: 10px;
+  letter-spacing: 0.3px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.lvsrc:hover {
+  color: var(--t-soft);
 }
 /* 可点击的目录文本(无框)→ 打开文件夹选择器 */
 .drow .dpick {
@@ -434,6 +613,7 @@ body {
   grid-template-columns: 1fr 1fr;
   gap: 14px;
   margin-top: 14px;
+  align-items: stretch; /* AEC3 与 LocalVQE 等高对齐 */
 }
 .ecard {
   background: var(--raised);
@@ -509,7 +689,7 @@ body {
   display: flex;
   align-items: center;
   gap: 10px;
-  height: 22px;
+  height: 26px;
 }
 .emeter .el {
   width: 46px;
@@ -554,6 +734,11 @@ body {
   display: flex;
   gap: 28px;
 }
+/* NVAFX 左栏比右栏矮:整组(meters/规格/Win/pair)垂直居中,
+   使数值条落在卡片中部 → 与 AEC3/LocalVQE 的「数值条≈卡片中线」视觉锚点一致 */
+.ecard.wide .ewrap {
+  align-items: center;
+}
 .ecard .ecol {
   flex: 1;
   min-width: 0;
@@ -568,6 +753,11 @@ body {
   color: var(--warn);
   font-size: 11px;
   letter-spacing: 0.4px;
+  /* 窄窗拖拽时不换行,过窄则省略号截断 */
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 100%;
 }
 .epair .mk {
   color: var(--t-faint);
@@ -647,6 +837,8 @@ body {
   height: auto;
 }
 .setupbtn {
+  flex: none;
+  white-space: nowrap;
   background: var(--live-ghost);
   border: 1px solid var(--live);
   color: var(--live);
@@ -1041,6 +1233,7 @@ body {
 .status .box {
   display: flex;
   align-items: center;
+  justify-content: center; /* 居中:中文短文本不再左对齐留白 */
   gap: 9px;
   border: 1px solid var(--live);
   color: var(--live);
@@ -1050,10 +1243,16 @@ body {
   min-width: 150px;
   white-space: nowrap;
 }
+/* 四态语义色:工作中=绿(默认 .box) / 已停止=灰(关) / 无参考=蓝(待机) / 不稳定=黄(告警) */
 .status .box.stopped {
-  border-color: var(--warn);
-  color: var(--warn);
+  border-color: var(--t-mut);
+  color: var(--t-mut);
   background: transparent;
+}
+.status .box.idle {
+  border-color: var(--idle);
+  color: var(--idle);
+  background: var(--idle-ghost);
 }
 .status .box.warn {
   border-color: var(--warn);
@@ -1069,7 +1268,22 @@ body {
 .status .box .sq.dot {
   border-radius: 50% !important;
 }
-.status .box.stopped .sq,
+.status .box.stopped .sq {
+  background: var(--t-mut);
+}
+.status .box.idle .sq {
+  background: var(--idle);
+}
+/* 无参考(待机)用三角形符号,与停止(方块)/工作(圆点)区分 */
+.status .box .sq.tri {
+  width: 0;
+  height: 0;
+  background: transparent !important;
+  border-left: 5px solid transparent;
+  border-right: 5px solid transparent;
+  border-bottom: 9px solid var(--idle);
+  border-radius: 0 !important;
+}
 .status .box.warn .sq {
   background: var(--warn);
 }
@@ -1367,11 +1581,11 @@ hr.hair {
   display: flex;
   align-items: center;
   gap: 11px;
-  height: 30px;
+  height: 56px;
   min-width: 0;
 }
 .far .trace {
-  height: 66px;
+  height: 118px;
   flex: 1;
 }
 .trace .lb {

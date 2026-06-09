@@ -1,3 +1,4 @@
+import { useEffect, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import type {
   NvafxCheck,
@@ -5,8 +6,26 @@ import type {
   Platform,
   Processor,
 } from "../types";
-import { openPath } from "../api";
+import {
+  downloadLocalvqeModel,
+  localvqeAssets,
+  openPath,
+  type LocalvqeAssets,
+} from "../api";
 import { useI18n } from "../i18n";
+
+// LocalVQE 官方模型(HF repo)。default=随 app 打包的默认模型。
+const LVQE_MODELS: {
+  file: string;
+  ver: string;
+  params: string;
+  size: string;
+  def?: boolean;
+}[] = [
+  { file: "localvqe-v1.3-4.8M-f32.gguf", ver: "v1.3", params: "4.8M", size: "~18 MB", def: true },
+  { file: "localvqe-v1.2-1.3M-f32.gguf", ver: "v1.2", params: "1.3M", size: "~5 MB" },
+  { file: "localvqe-v1.1-1.3M-f32.gguf", ver: "v1.1", params: "1.3M", size: "~5 MB" },
+];
 
 // 引擎能力画像(前端描述性数据,非配置 contract)。
 //   echo  = 消回声强度    voice = 人声干净度(neural 优势)
@@ -26,21 +45,21 @@ const PROFILES: Profile[] = [
     kind: "sonora_aec3",
     name: "AEC3",
     tier: { en: "DEFAULT", zh: "默认" },
-    echo: 8,
+    echo: 9,
     voice: 6,
     cost: "CPU · light",
     sr: "48k / 16k",
-    os: "Win · mac · Linux",
+    os: "Win · mac",
   },
   {
     kind: "localvqe",
     name: "LOCALVQE",
     tier: { en: "EXPERIMENTAL", zh: "试验" },
-    echo: 5,
-    voice: 5,
+    echo: 8,
+    voice: 6,
     cost: "CPU · neural",
     sr: "16k only",
-    os: "Win · mac · Linux",
+    os: "Win · mac",
   },
   {
     kind: "nvidia_afx_aec",
@@ -50,7 +69,7 @@ const PROFILES: Profile[] = [
     voice: 10,
     cost: "GPU · Tensor Core",
     sr: "16k / 48k",
-    os: "Windows · RTX",
+    os: "Win · only",
   },
 ];
 
@@ -76,6 +95,8 @@ interface Props {
   dev: boolean;
   onSelect: (kind: string) => void;
   onParam: (key: string, val: unknown) => void;
+  onPickModel: (path: string) => void;
+  localvqeModel: string | null;
   onRecheck: (runtimeDir?: string) => void;
   onSetup: () => void;
 }
@@ -89,10 +110,33 @@ export function EnginePage({
   dev,
   onSelect,
   onParam,
+  onPickModel,
+  localvqeModel,
   onRecheck,
   onSetup,
 }: Props) {
   const { t, lang } = useI18n();
+
+  // LocalVQE 可用模型(下载目录 + 打包资源);选中 localvqe 时拉取。
+  const [lvAssets, setLvAssets] = useState<LocalvqeAssets | null>(null);
+  const [lvDl, setLvDl] = useState<string | null>(null);
+  const [lvErr, setLvErr] = useState<string | null>(null);
+  useEffect(() => {
+    localvqeAssets().then(setLvAssets).catch(() => {});
+  }, []);
+  async function downloadModel(file: string) {
+    setLvDl(file);
+    setLvErr(null);
+    try {
+      const path = await downloadLocalvqeModel(file);
+      onPickModel(path);
+      setLvAssets(await localvqeAssets());
+    } catch (e) {
+      setLvErr(String(e));
+    } finally {
+      setLvDl(null);
+    }
+  }
 
   const proc = (k: string) => processors.find((p) => p.kind === k);
   // 开发态(dev)临时解开 NVAFX 平台/doctor 门槛,用于走通前端流程。
@@ -101,22 +145,11 @@ export function EnginePage({
   // 就绪判定:AEC3 永远就绪;LocalVQE 需模型;NVAFX 需 doctor 通过(dev 跳过)。
   const ready = (k: string): boolean => {
     if (!supported(k)) return false;
-    if (k === "localvqe") return Boolean(params.model);
+    if (k === "localvqe") return Boolean(localvqeModel);
     if (k === "nvidia_afx_aec") return dev || Boolean(doctor?.ok);
     return true;
   };
 
-  async function pickModel() {
-    try {
-      const sel = await open({
-        directory: false,
-        filters: [{ name: "GGUF", extensions: ["gguf"] }],
-      });
-      if (typeof sel === "string") onParam("model", sel);
-    } catch {
-      /* cancelled */
-    }
-  }
   async function pickRuntime() {
     try {
       const sel = await open({ directory: true });
@@ -129,10 +162,59 @@ export function EnginePage({
     }
   }
 
+  // LocalVQE 模型清单(卡片内,checklist 盒子风格):绿=已下载可用,黄=未下载可点下载。
+  // 点模型 = 选 LocalVQE 引擎 + 设该模型(onPickModel 原子处理),清单常驻不展开。
+  const localvqeModels = () => (
+    <div className="lvmods">
+      {LVQE_MODELS.map((m) => {
+        const found = lvAssets?.models.find((x) => x.filename === m.file);
+        const selected = !!found && localvqeModel === found.path;
+        const downloading = lvDl === m.file;
+        const box = downloading ? "···" : selected ? "✓" : found ? "OK" : t("lvqeGet");
+        return (
+          <button
+            key={m.file}
+            className={`lvmod ${selected ? "on" : found ? "have" : "miss"}`}
+            disabled={downloading}
+            onClick={(e) => {
+              e.stopPropagation();
+              found ? onPickModel(found.path) : downloadModel(m.file);
+            }}
+            title={found ? found.path : `${t("lvqeDownload")} · ${m.file}`}
+          >
+            <span className={`lvbox ${found ? "ok" : "miss"}`}>{box}</span>
+            <span className="lvver">{m.ver}</span>
+            {m.def && <i className="lvdef">{t("lvqeDefault")}</i>}
+            <span className="lvsp" />
+            <span className="lvms">
+              <span className="lvp">{m.params}</span>
+              <span className="lvsep">·</span>
+              <span className="lvz">{m.size}</span>
+            </span>
+          </button>
+        );
+      })}
+      <div className="lvtools">
+        <button
+          className="dopen"
+          onClick={(e) => {
+            e.stopPropagation();
+            if (lvAssets) openPath(lvAssets.models_dir);
+          }}
+          title={lvAssets?.models_dir}
+        >
+          {t("lvqeOpenDir")} <span className="mk">↗</span>
+        </button>
+      </div>
+      {lvErr && <div className="cdetail warn">{lvErr}</div>}
+    </div>
+  );
+
   const card = (p: Profile) => {
     const sup = supported(p.kind);
     const active = kind === p.kind;
     const rdy = ready(p.kind);
+    const isLvqe = p.kind === "localvqe";
     const status = !sup
       ? "UNAVAILABLE"
       : rdy
@@ -140,9 +222,23 @@ export function EnginePage({
           ? t("active")
           : t("rdyReady")
         : t("rdySetup");
+    const meters = (
+      <>
+        <Meter label="ECHO" n={p.echo} />
+        <Meter label="VOICE" n={p.voice} />
+        <div className="espec">
+          <span>{p.cost}</span>
+          <span className="sep">·</span>
+          <span>{p.sr}</span>
+        </div>
+        <div className="espec os">{p.os}</div>
+      </>
+    );
     return (
       <div
-        className={`ecard ${active ? "active" : ""} ${sup ? "" : "na"}`}
+        className={`ecard ${active ? "active" : ""} ${sup ? "" : "na"} ${
+          isLvqe ? "lvwide" : ""
+        }`}
         onClick={() => sup && onSelect(p.kind)}
       >
         <div className="eh">
@@ -152,14 +248,14 @@ export function EnginePage({
           </span>
         </div>
         <div className="etier">{p.tier[lang]}</div>
-        <Meter label="ECHO" n={p.echo} />
-        <Meter label="VOICE" n={p.voice} />
-        <div className="espec">
-          <span>{p.cost}</span>
-          <span className="sep">·</span>
-          <span>{p.sr}</span>
-        </div>
-        <div className="espec os">{p.os}</div>
+        {isLvqe ? (
+          <div className="ewrap">
+            <div className="ecol">{meters}</div>
+            <div className="ecol nvcol lvcol">{localvqeModels()}</div>
+          </div>
+        ) : (
+          meters
+        )}
       </div>
     );
   };
@@ -182,7 +278,7 @@ export function EnginePage({
   );
 
   return (
-    <div className="page">
+    <div className="page engine">
       <div className="kick">
         <span className="d">
           <i />
@@ -193,6 +289,8 @@ export function EnginePage({
       </div>
       <hr className="hair" />
 
+      {/* 卡片区在 kick/分隔线之下的剩余空间里垂直居中(上下留白相等) */}
+      <div className="enbody">
       <div className="ecards">
         {card(PROFILES[0])}
         {card(PROFILES[1])}
@@ -234,6 +332,7 @@ export function EnginePage({
               <span className="sep">·</span>
               <span>{PROFILES[2].sr}</span>
             </div>
+            <div className="espec os">{PROFILES[2].os}</div>
             <div className="epair">
               <span className="mk">»</span> {t("engPair")}
             </div>
@@ -300,26 +399,8 @@ export function EnginePage({
           </div>
         </div>
       </div>
+      </div>
 
-      {/* LocalVQE 选中时:模型路径(required)。 */}
-      {kind === "localvqe" && (
-        <div className="drow">
-          <span className="dk">MODEL</span>
-          <span className="dpick" onClick={pickModel} title={String(params.model ?? "")}>
-            {(params.model as string) || t("engPickModel")}
-          </span>
-          {params.model ? (
-            <button
-              className="dopen"
-              onClick={() => openPath(String(params.model))}
-            >
-              {t("openFolder")} <span className="mk">&raquo;</span>
-            </button>
-          ) : (
-            <span className="cdetail warn">{t("engModelReq")}</span>
-          )}
-        </div>
-      )}
     </div>
   );
 }

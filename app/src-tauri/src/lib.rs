@@ -4,10 +4,11 @@
 //   - run 的 --status-json 以 JSONL 流式解析,经事件推给前端
 //
 // 契约真理源:echoless/docs/frontend/*.md + CLI 实测。
-use std::io::{BufRead, BufReader};
-use std::path::PathBuf;
+use std::io::{BufRead, BufReader, Write};
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use serde_json::Value;
 use tauri::{
@@ -16,8 +17,15 @@ use tauri::{
 #[cfg(target_os = "macos")]
 use tauri_plugin_decorum::WebviewWindowExt;
 
+/// 运行中的 echoless run 子进程 + 它专属的「正在被主动停止」标记。
+/// 每个子进程独立持有 stopping flag,其 stdout reader 退出时据此判断本次退出是
+/// 主动停/重启(intentional)还是子进程自己崩了(crash),供前端区分。
+struct RunChild {
+    child: Child,
+    stopping: Arc<AtomicBool>,
+}
 /// 当前运行中的 echoless run 子进程(同一时刻最多一个)。
-struct RunState(Mutex<Option<Child>>);
+struct RunState(Mutex<Option<RunChild>>);
 
 /// 解析 echoless 二进制路径:
 ///   1. 环境变量 ECHOLESS_BIN(打包后由 sidecar 资源注入)
@@ -32,9 +40,50 @@ fn echoless_bin() -> PathBuf {
     p
 }
 
+fn process_tap_helper_bin() -> Option<PathBuf> {
+    if let Ok(p) = std::env::var("ECHOLESS_PROCESS_TAP_HELPER") {
+        let path = PathBuf::from(p);
+        if path.is_file() {
+            return Some(path);
+        }
+    }
+
+    let cli = echoless_bin();
+    if let Some(dir) = cli.parent() {
+        for name in ["echoless-process-tap-poc", "echoless-process-tap"] {
+            let candidate = dir.join(name);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR")); // .../echoless/app/src-tauri
+    for base in manifest.ancestors() {
+        let candidate = base
+            .join("tools")
+            .join("macos-process-tap-poc")
+            .join(".build")
+            .join("echoless-process-tap-poc");
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+
+    None
+}
+
+fn echoless_command() -> Command {
+    let mut command = Command::new(echoless_bin());
+    if let Some(helper) = process_tap_helper_bin() {
+        command.env("ECHOLESS_PROCESS_TAP_HELPER", helper);
+    }
+    command
+}
+
 /// 跑一次性 JSON 子命令(devices / processors / config validate),返回解析后的 JSON。
 fn run_json(args: &[&str]) -> Result<Value, String> {
-    let out = Command::new(echoless_bin())
+    let out = echoless_command()
         .args(args)
         .output()
         .map_err(|e| format!("spawn echoless failed: {e}"))?;
@@ -66,6 +115,104 @@ fn list_processors() -> Result<Value, String> {
 #[tauri::command]
 fn doctor_audio() -> Result<Value, String> {
     run_json(&["doctor", "audio", "--json"])
+}
+
+/// 用户点击「请求系统音频权限」时调用:跑一次极短 Process Tap probe 触发 macOS 授权弹窗,
+/// 回传 system_audio_permission + system_audio_permission_probe。普通 doctor 不会触发弹窗。
+#[tauri::command]
+fn request_system_audio() -> Result<Value, String> {
+    run_json(&["doctor", "audio", "--request-system-audio", "--json"])
+}
+
+// ---- LocalVQE 模型管理(打包默认模型 + 从官方 HF repo 下载选择) ----
+const LOCALVQE_HF_BASE: &str = "https://huggingface.co/LocalAI-io/LocalVQE/resolve/main/";
+
+/// 下载模型的本地目录:<app_local_data>/localvqe/models(自动创建)。
+fn localvqe_models_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    let base = app
+        .path()
+        .app_local_data_dir()
+        .map_err(|e| e.to_string())?;
+    let dir = base.join("localvqe").join("models");
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    // 目录说明:用户手动放入的 .gguf 与应用内下载的模型都落在这里,引擎页自动检测。
+    let readme = dir.join("README.txt");
+    if !readme.exists() {
+        let _ = std::fs::write(
+            &readme,
+            "LocalVQE models\n\
+             ===============\n\n\
+             Put LocalVQE .gguf models in this folder. Models downloaded from\n\
+             within Echoless also land here. Any .gguf found here is detected\n\
+             automatically and can be selected on the Engine page.\n\n\
+             Official models: https://huggingface.co/LocalAI-io/LocalVQE\n",
+        );
+    }
+    Ok(dir)
+}
+
+fn collect_gguf(dir: &Path, source: &str, out: &mut Vec<Value>) {
+    if let Ok(rd) = std::fs::read_dir(dir) {
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.extension().and_then(|s| s.to_str()) != Some("gguf") {
+                continue;
+            }
+            if let Some(name) = p.file_name().and_then(|s| s.to_str()) {
+                if out.iter().any(|m| m["filename"] == name) {
+                    continue; // 下载目录优先,避免与打包资源重名重复
+                }
+                out.push(serde_json::json!({
+                    "filename": name,
+                    "path": p.to_string_lossy(),
+                    "source": source,
+                }));
+            }
+        }
+    }
+}
+
+/// 列出可用 LocalVQE 模型(下载目录 + 打包资源里的 .gguf),供引擎页选择。
+#[tauri::command]
+fn localvqe_assets(app: tauri::AppHandle) -> Result<Value, String> {
+    let dir = localvqe_models_dir(&app)?;
+    let mut models: Vec<Value> = vec![];
+    collect_gguf(&dir, "downloaded", &mut models);
+    if let Ok(res) = app
+        .path()
+        .resolve("resources/localvqe/models", tauri::path::BaseDirectory::Resource)
+    {
+        collect_gguf(&res, "bundled", &mut models);
+    }
+    Ok(serde_json::json!({
+        "models_dir": dir.to_string_lossy(),
+        "models": models,
+    }))
+}
+
+/// 从官方 HF repo 下载指定模型到本地目录,回传完整路径。用 curl(免新增依赖)。
+#[tauri::command]
+fn download_localvqe_model(app: tauri::AppHandle, filename: String) -> Result<String, String> {
+    // 限定已知模型名,防止任意写入 / 路径穿越。
+    if !filename.ends_with(".gguf") || filename.contains('/') || filename.contains("..") {
+        return Err("bad filename".into());
+    }
+    let dir = localvqe_models_dir(&app)?;
+    let dest = dir.join(&filename);
+    let tmp = dir.join(format!("{filename}.part"));
+    let url = format!("{LOCALVQE_HF_BASE}{filename}");
+    let status = Command::new("curl")
+        .args(["-fL", "--retry", "2", "-o"])
+        .arg(&tmp)
+        .arg(&url)
+        .status()
+        .map_err(|e| format!("curl 启动失败: {e}"))?;
+    if !status.success() {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("下载失败({url})"));
+    }
+    std::fs::rename(&tmp, &dest).map_err(|e| e.to_string())?;
+    Ok(dest.to_string_lossy().to_string())
 }
 
 /// NVIDIA AFX / RTX AEC 引擎就绪探针。
@@ -104,7 +251,7 @@ fn nvafx_install(
         args.push("--runtime-dir");
         args.push(dir);
     }
-    let out = Command::new(echoless_bin())
+    let out = echoless_command()
         .args(&args)
         .output()
         .map_err(|e| format!("spawn echoless failed: {e}"))?;
@@ -133,7 +280,7 @@ fn nvafx_download_install(runtime_dir: Option<String>) -> Result<Value, String> 
         args.push("--runtime-dir");
         args.push(dir);
     }
-    let out = Command::new(echoless_bin())
+    let out = echoless_command()
         .args(&args)
         .output()
         .map_err(|e| format!("spawn echoless failed: {e}"))?;
@@ -142,8 +289,7 @@ fn nvafx_download_install(runtime_dir: Option<String>) -> Result<Value, String> 
         return Err(format!("nvafx download-install 失败: {err}"));
     }
     let stdout = String::from_utf8_lossy(&out.stdout);
-    serde_json::from_str(&stdout)
-        .map_err(|e| format!("parse json failed: {e}; raw: {stdout}"))
+    serde_json::from_str(&stdout).map_err(|e| format!("parse json failed: {e}; raw: {stdout}"))
 }
 
 /// 在系统默认浏览器打开外部链接(驱动 / VC++ 下载页)。
@@ -212,14 +358,19 @@ fn start_run(
     stats_interval_ms: Option<u32>,
 ) -> Result<(), String> {
     let mut guard = state.0.lock().unwrap();
-    if guard.is_some() {
-        return Err("already running".into());
+    // 幂等启动:若有残留子进程(并发重启 / 上次崩溃遗留),先标记 intentional 再杀掉,
+    // 避免 "already running" 卡死。其 reader 退出会被判定为 intentional,不报崩溃。
+    if let Some(mut prev) = guard.take() {
+        prev.stopping.store(true, Ordering::SeqCst);
+        let _ = prev.child.kill();
+        let _ = prev.child.wait();
     }
     let path = std::env::temp_dir().join("echoless-run.toml");
     std::fs::write(&path, toml_text).map_err(|e| e.to_string())?;
     let interval = stats_interval_ms.unwrap_or(80).to_string();
 
-    let mut child = Command::new(echoless_bin())
+    let mut command = echoless_command();
+    let mut child = command
         .args([
             "run",
             "--config",
@@ -228,14 +379,19 @@ fn start_run(
             "--stats-interval-ms",
             &interval,
         ])
+        .stdin(Stdio::piped()) // 录制就地控制:start/stop_diagnostics 经 stdin JSONL 下发
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| format!("spawn echoless run failed: {e}"))?;
 
+    // 本子进程专属的 stopping flag:被主动停/重启时置 true。
+    let stopping = Arc::new(AtomicBool::new(false));
+
     // stdout = JSONL status events
     let stdout = child.stdout.take().ok_or("no stdout")?;
     let app_out = app.clone();
+    let stop_reader = stopping.clone();
     std::thread::spawn(move || {
         for line in BufReader::new(stdout).lines().flatten() {
             if line.trim().is_empty() {
@@ -245,7 +401,12 @@ fn start_run(
                 let _ = app_out.emit("echoless://status", v);
             }
         }
-        let _ = app_out.emit("echoless://exit", ());
+        // 退出归因:intentional=主动停/重启(本 flag 已被置 true);否则=子进程自己退出(崩溃)。
+        let intentional = stop_reader.load(Ordering::SeqCst);
+        let _ = app_out.emit(
+            "echoless://exit",
+            serde_json::json!({ "intentional": intentional }),
+        );
     });
 
     // stderr = 人类日志
@@ -257,16 +418,32 @@ fn start_run(
         }
     });
 
-    *guard = Some(child);
+    *guard = Some(RunChild { child, stopping });
+    Ok(())
+}
+
+/// 向运行中的 echoless run 子进程 stdin 写一行 JSON 控制命令
+/// (start_diagnostics / stop_diagnostics)。就地起停录制,不重启音频管线。
+#[tauri::command]
+fn send_run_control(state: State<RunState>, line: String) -> Result<(), String> {
+    let mut guard = state.0.lock().unwrap();
+    let rc = guard.as_mut().ok_or("not running")?;
+    let stdin = rc.child.stdin.as_mut().ok_or("no stdin")?;
+    stdin
+        .write_all(line.as_bytes())
+        .map_err(|e| e.to_string())?;
+    stdin.write_all(b"\n").map_err(|e| e.to_string())?;
+    stdin.flush().map_err(|e| e.to_string())?;
     Ok(())
 }
 
 #[tauri::command]
 fn stop_run(state: State<RunState>) -> Result<(), String> {
     let mut guard = state.0.lock().unwrap();
-    if let Some(mut child) = guard.take() {
-        let _ = child.kill();
-        let _ = child.wait();
+    if let Some(mut rc) = guard.take() {
+        rc.stopping.store(true, Ordering::SeqCst); // 主动停 → 其 reader 退出判为 intentional
+        let _ = rc.child.kill();
+        let _ = rc.child.wait();
     }
     Ok(())
 }
@@ -282,6 +459,9 @@ pub fn run() {
             list_devices,
             list_processors,
             doctor_audio,
+            request_system_audio,
+            localvqe_assets,
+            download_localvqe_model,
             nvafx_doctor,
             nvafx_install,
             nvafx_download_install,
@@ -290,17 +470,17 @@ pub fn run() {
             open_path,
             validate_config,
             start_run,
+            send_run_control,
             stop_run
         ])
         .setup(|app| {
-            // 一屏控制电器:纵向布局固定 → 锁死窗口高度(min==max=600),
-            // 仅保留宽度在 900..1480 区间内可调。避免拉高时底部出现空洞。
+            // 默认打开基线 1040×640(布局按此定稿);可缩放,设合理 min/max 防止过小/过大破版。
             let mut builder =
                 WebviewWindowBuilder::new(app, "main", WebviewUrl::App("index.html".into()))
                     .title("Echoless")
-                    .inner_size(1000.0, 600.0)
-                    .min_inner_size(900.0, 600.0)
-                    .max_inner_size(1480.0, 600.0)
+                    .inner_size(1040.0, 640.0)
+                    .min_inner_size(960.0, 600.0)
+                    .max_inner_size(1600.0, 1100.0)
                     .resizable(true)
                     .visible(true);
 
@@ -336,8 +516,9 @@ pub fn run() {
                     let taken = state.0.lock().ok().and_then(|mut g| g.take());
                     taken
                 };
-                if let Some(mut child) = child_opt {
-                    let _ = child.kill();
+                if let Some(mut rc) = child_opt {
+                    rc.stopping.store(true, Ordering::SeqCst);
+                    let _ = rc.child.kill();
                 }
             }
         })

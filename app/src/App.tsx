@@ -13,12 +13,15 @@ import {
   nvafxInstall,
   onRunEvent,
   onRunExit,
+  onRunLog,
   openPath,
   openUrl,
+  requestSystemAudio,
+  startDiagnostics,
   startRun,
+  stopDiagnostics,
   stopRun,
   validateConfig,
-  type DiagnosticsCfg,
   type PipelineCfg,
 } from "./api";
 import type {
@@ -179,12 +182,21 @@ export default function App() {
   const [devMicState, setDevMicState] = useState<MicState>("missing");
   // 开发态下按 ` 把整机平台模拟成 Windows,用于在 mac 上预览 win 全流程。
   const [devWin, setDevWin] = useState(false);
+  // 设备 I/O 重采样态(started 事件给出;设备原生率 ≠ 管线率时后端会重采样)。
+  const [io, setIo] = useState<{
+    mic: boolean;
+    micRate: number | null;
+  } | null>(null);
   // 诊断录制
   const [rec, setRec] = useState(false);
   const [diagSeconds, setDiagSeconds] = useState<number | null>(null);
   const [diagDir, setDiagDir] = useState("");
 
   const telRef = useRef<Telemetry>({ mic: -120, ref: -120, out: -120, on: false });
+  // 当前 run 实际生效的参考源(由 started 给出),供 status 判断是否 Process Tap。
+  const refSourceRef = useRef<string | null>(null);
+  // 子进程最近一条 stderr 日志(用于在非预期退出时报错)。
+  const lastLogRef = useRef<string>("");
   const runningRef = useRef(running);
   runningRef.current = running;
   const powerOnRef = useRef(powerOn);
@@ -193,6 +205,8 @@ export default function App() {
   pipelineRef.current = pipeline;
   const paramsRef = useRef(params);
   paramsRef.current = params;
+  // 记住每个引擎的参数(如 LocalVQE 选的模型),切换引擎再切回来不丢。
+  const paramsByKind = useRef<Record<string, Record<string, unknown>>>({});
   const recRef = useRef(rec);
   recRef.current = rec;
   const diagSecondsRef = useRef(diagSeconds);
@@ -201,10 +215,13 @@ export default function App() {
   diagDirRef.current = diagDir;
   const { t } = useI18n();
 
-  function diagCfg(): DiagnosticsCfg | null {
-    return recRef.current && diagDirRef.current
-      ? { record_dir: diagDirRef.current, max_seconds: diagSecondsRef.current }
-      : null;
+  // 录制就地起停命令(运行中改录制态用 stdin,不重启 run)。
+  function startDiag() {
+    if (diagDirRef.current) {
+      startDiagnostics(diagDirRef.current, diagSecondsRef.current).catch((e) =>
+        setErr(String(e)),
+      );
+    }
   }
 
   // 平台 + 设备/处理器枚举 + 事件订阅
@@ -227,15 +244,30 @@ export default function App() {
           if (ev.type === "started") {
             telRef.current.on = true;
             setRunning(true);
-            // 录制时立即拿到 session 目录(不必等第一条 status)。
-            if (ev.diagnostics_session_dir) {
-              const dir = ev.diagnostics_session_dir;
-              setHealth((h) => ({ ...h, session_dir: dir }));
-            }
+            refSourceRef.current = ev.reference_source ?? null;
+            setIo({
+              mic: Boolean(ev.io_resampling?.mic),
+              micRate: ev.mic_device_sample_rate ?? null,
+            });
+            // run 已起;若录制开关为开,就地下发 start_diagnostics(power-on-with-rec /
+            // 改设置重启 后的统一入口)。session 目录随后由 diagnostics_started 给出。
+            if (recRef.current && diagDirRef.current) startDiag();
+            return;
+          }
+          // 录制已就地启动:拿到 session 目录。
+          if (ev.type === "diagnostics_started") {
+            setHealth((h) => ({ ...h, session_dir: ev.session_dir }));
+            return;
+          }
+          if (ev.type === "diagnostics_stopping") {
+            return; // 等 diagnostics_done 收尾
+          }
+          if (ev.type === "control_error") {
+            setErr(`${ev.cmd}: ${ev.message}`);
             return;
           }
           // 诊断录制收尾:writer 已 finalize 文件。仅「录满 max_seconds」时
-          // 自动关开关 + 打开会话目录;run_exit / error(手动停或改设置触发)不弹目录。
+          // 自动关开关 + 打开会话目录;stopped / run_exit / error 不弹目录。
           if (ev.type === "diagnostics_done") {
             if (ev.reason === "max_seconds") {
               recRef.current = false;
@@ -246,6 +278,18 @@ export default function App() {
           }
           // status
           const s = ev;
+          // Process Tap 参考收到真实信号 = 系统音频录制权限确已授予 →
+          // 把 doctor 的 system_audio_permission 修正为 granted,清掉「请求权限」提示。
+          if (
+            refSourceRef.current === "macos_process_tap" &&
+            (s.ref_dbfs ?? -120) > -90
+          ) {
+            setDoctor((d) =>
+              d && d.system_audio_permission !== "granted"
+                ? { ...d, system_audio_permission: "granted" }
+                : d,
+            );
+          }
           const tel = telRef.current;
           tel.mic = s.mic_dbfs;
           tel.ref = s.ref_dbfs;
@@ -279,9 +323,27 @@ export default function App() {
         }),
       );
       uns.push(
-        await onRunExit(() => {
+        await onRunExit((ev) => {
           telRef.current.on = false;
           setRunning(false);
+          setIo(null);
+          refSourceRef.current = null;
+          // 后端按子进程标记:intentional=主动停/重启 → 正常,不报错。
+          if (ev.intentional) return;
+          // 非预期退出(子进程自己挂了,如设备不支持采样率)→ 如实反映失败 + 报错。
+          // 稍等让 stderr 末行(真正的错误原因)到达,再显示。
+          if (powerOnRef.current) {
+            window.setTimeout(() => {
+              if (!powerOnRef.current) return;
+              setPowerOn(false);
+              setErr(lastLogRef.current || "运行已停止:子进程意外退出");
+            }, 150);
+          }
+        }),
+      );
+      uns.push(
+        await onRunLog((line) => {
+          if (line.trim()) lastLogRef.current = line;
         }),
       );
     })();
@@ -298,9 +360,13 @@ export default function App() {
     return () => window.removeEventListener("keydown", onKey);
   }, [view]);
 
-  // backend 切换 / manifest 加载 → 用该 backend 的 manifest 默认重置 chain 参数。
+  // backend 切换 / manifest 加载 → 优先恢复该引擎上次的参数(保住 LocalVQE 选的模型),
+  // 否则用 manifest 默认值。
   useEffect(() => {
-    setParams(defaultParams(processors.find((p) => p.kind === kind)));
+    setParams(
+      paramsByKind.current[kind] ??
+        defaultParams(processors.find((p) => p.kind === kind)),
+    );
   }, [processors, kind]);
 
   // 桌面 app:禁用 Tab 键焦点移动(避免按钮出现键盘选中框)。
@@ -366,6 +432,14 @@ export default function App() {
     doctorAudio().then(setDoctor).catch(() => {});
   }
 
+  // 用户主动请求系统音频录制权限:触发一次 Process Tap probe(macOS 弹窗),回传更新 doctor。
+  function probeSystemAudio() {
+    setErr(null);
+    requestSystemAudio()
+      .then(setDoctor)
+      .catch((e) => setErr(String(e)));
+  }
+
   // RTX runtime 安装:解压 common + 架构 model,回传安装后 doctor 报告。
   // dev 模拟:不调后端,延迟后置 ready,以便走通"安装中 → 就绪"。
   function installNvafx(commonZip: string, modelZip: string) {
@@ -410,7 +484,12 @@ export default function App() {
   function engineReady(k: string): boolean {
     const proc = processors.find((p) => p.kind === k);
     if (proc && !proc.platforms.includes(platform) && !dev) return false;
-    if (k === "localvqe") return Boolean(params.model);
+    // LocalVQE 是否就绪要看它自己持久化的模型(可能当前激活的是别的引擎),
+    // 否则在 AEC3 激活时点 LocalVQE 会因 params.model 为空而误判未就绪、每次跳引擎页。
+    if (k === "localvqe")
+      return Boolean(
+        k === kind ? params.model : paramsByKind.current["localvqe"]?.model,
+      );
     if (k === "nvidia_afx_aec") return dev || Boolean(nvafx?.ok);
     return true;
   }
@@ -422,7 +501,6 @@ export default function App() {
     kind: string;
     pipeline: PipelineCfg;
     params: Record<string, unknown>;
-    diagnostics: DiagnosticsCfg | null;
   }>;
 
   function currentToml(over?: Override) {
@@ -433,8 +511,8 @@ export default function App() {
       kind: over?.kind ?? kind,
       pipeline: over?.pipeline ?? pipelineRef.current,
       params: over?.params ?? paramsRef.current,
-      diagnostics:
-        over && "diagnostics" in over ? over.diagnostics : diagCfg(),
+      // 录制改由 stdin 就地控制(start/stop_diagnostics),不再写进 toml。
+      diagnostics: null,
     });
   }
 
@@ -442,6 +520,7 @@ export default function App() {
     setBusy(true);
     setErr(null);
     setHealth(ZERO_HEALTH);
+    lastLogRef.current = ""; // 清掉上次的 stderr,避免旧错误误报
     try {
       const toml = currentToml();
       const v = await validateConfig(toml);
@@ -525,9 +604,12 @@ export default function App() {
     }
   }
 
-  // 切 backend:用新 backend 的 manifest 默认重置参数并重启。
+  // 切 backend:优先恢复该引擎上次的参数(保住 LocalVQE 选过的模型),否则用 manifest 默认。
   function changeKind(k: string) {
-    const np = defaultParams(processors.find((p) => p.kind === k));
+    paramsByKind.current[kind] = paramsRef.current; // 存下当前引擎的参数
+    const np =
+      paramsByKind.current[k] ??
+      defaultParams(processors.find((p) => p.kind === k));
     setKind(k);
     setParams(np);
     applyChange({ kind: k, params: np });
@@ -535,8 +617,21 @@ export default function App() {
   // 改单个 chain 参数(NOISE / Advanced)。
   function setParam(key: string, val: unknown) {
     const np = { ...paramsRef.current, [key]: val };
+    paramsByKind.current[kind] = np;
     setParams(np);
     applyChange({ params: np });
+  }
+  // 选 LocalVQE 模型(清单常驻):原子地切到 localvqe 引擎并设 model,避免把 model 写到当前引擎上。
+  function pickLocalvqeModel(path: string) {
+    const base =
+      paramsByKind.current["localvqe"] ??
+      defaultParams(processors.find((p) => p.kind === "localvqe"));
+    const np = { ...base, model: path };
+    paramsByKind.current[kind] = paramsRef.current; // 存下当前引擎
+    paramsByKind.current["localvqe"] = np;
+    setKind("localvqe");
+    setParams(np);
+    applyChange({ kind: "localvqe", params: np });
   }
   // 改管线项(Advanced:sample_rate / frame_ms / reference_channels)。
   function changePipeline(patch: Partial<PipelineCfg>) {
@@ -544,31 +639,26 @@ export default function App() {
     setPipeline(npl);
     applyChange({ pipeline: npl });
   }
-  // 诊断录制开关 / 时长。
+  // 诊断录制开关:运行中 → 经 stdin 就地起停(不重启 run);未运行 → 仅置位,
+  // 等 run 启动后由 started 处理。
   function setRecording(on: boolean) {
     setRec(on);
-    const dg =
-      on && diagDirRef.current
-        ? { record_dir: diagDirRef.current, max_seconds: diagSecondsRef.current }
-        : null;
-    applyChange({ diagnostics: dg });
+    recRef.current = on;
+    if (!powerOnRef.current) return;
+    if (on) startDiag();
+    else stopDiagnostics().catch((e) => setErr(String(e)));
   }
+  // 时长 / 目录:仅更新状态。录制中改动 → 重发 start_diagnostics 让新参数立即生效
+  // (后端先收尾旧 session 再开新的)。
   function setRecSeconds(v: number | null) {
     setDiagSeconds(v);
-    const dg =
-      recRef.current && diagDirRef.current
-        ? { record_dir: diagDirRef.current, max_seconds: v }
-        : null;
-    applyChange({ diagnostics: dg });
+    diagSecondsRef.current = v;
+    if (powerOnRef.current && recRef.current) startDiag();
   }
   function setRecDir(v: string) {
     setDiagDir(v);
     diagDirRef.current = v;
-    const dg =
-      recRef.current && v
-        ? { record_dir: v, max_seconds: diagSecondsRef.current }
-        : null;
-    applyChange({ diagnostics: dg });
+    if (powerOnRef.current && recRef.current) startDiag();
   }
 
   // dev 模拟 Windows 时,系统 render loopback 原生可用 → 注入一个 system 参考源,
@@ -589,18 +679,37 @@ export default function App() {
       : devices?.reference_sources ?? [];
   // dev win 下默认就选 system(否则沿用真实选择)。
   const referenceView = dev && devWin ? "system" : reference;
-  const refOptions = refSources
-    .filter((r) => r.available)
-    .map((r) => ({
+  // reference 概念 = 系统正在播放的声音(输出内容)。只保留有意义的参考源:
+  //   system(Process Tap / loopback)、none、output 设备回环、以及承载系统声的虚拟声卡输入
+  //   (BlackHole / VB-CABLE)。隐藏物理麦克风等(选它们当参考无意义)。
+  const VIRTUAL_REF = /blackhole|vb-?cable|vb-?audio|cable|loopback|stereo\s*mix|soundflower/i;
+  const availRefs = refSources.filter(
+    (r) =>
+      r.available &&
+      (r.kind === "system" ||
+        r.kind === "none" ||
+        r.kind === "output" ||
+        (r.kind === "input" && VIRTUAL_REF.test(r.label))),
+  );
+  // 仅当同名设备同时以 input/output 出现(如 BlackHole 既可作 in 又可作 out)才标方向,
+  // 避免「全是 · in」的冗余噪声。
+  const refLabelKinds = new Map<string, Set<string>>();
+  for (const r of availRefs) {
+    if (r.kind !== "input" && r.kind !== "output") continue;
+    if (!refLabelKinds.has(r.label)) refLabelKinds.set(r.label, new Set());
+    refLabelKinds.get(r.label)!.add(r.kind);
+  }
+  const refOptions = availRefs.map((r) => {
+    const ambiguous =
+      (r.kind === "input" || r.kind === "output") &&
+      (refLabelKinds.get(r.label)?.size ?? 0) > 1;
+    return {
       value: r.selector ?? r.id,
-      // input/output 同名设备(如 BlackHole 2ch)加方向标注以区分
-      label:
-        r.kind === "input"
-          ? `${r.label} · in`
-          : r.kind === "output"
-            ? `${r.label} · out`
-            : r.label,
-    }));
+      label: ambiguous
+        ? `${r.label} · ${r.kind === "input" ? "in" : "out"}`
+        : r.label,
+    };
+  });
 
   // dev 下可把平台模拟成 Windows(按 `),让 mac 也能预览 win 全流程(标题栏/引擎/虚拟麦)。
   const platformView: Platform = dev && devWin ? "windows" : platform;
@@ -640,8 +749,14 @@ export default function App() {
       : noRef
         ? t("noReference")
         : t("removingEcho");
-  const boxClass =
-    stopped ? "box stopped" : unstable || noRef ? "box warn" : "box";
+  // 四态语义色:停止=灰 / 不稳定=黄(告警) / 无参考=蓝(待机,非告警) / 工作中=绿。
+  const boxClass = stopped
+    ? "box stopped"
+    : unstable
+      ? "box warn"
+      : noRef
+        ? "box idle"
+        : "box";
   const viewTitle =
     view === "overview"
       ? t("overview")
@@ -723,7 +838,9 @@ export default function App() {
         <div className="status">
           <span className={boxClass}>
             {/* 运行=圆点 ●,停止=方块 ■ */}
-            <span className={`sq ${powerOn ? "dot" : ""}`} />{" "}
+            <span
+              className={`sq ${powerOn ? "dot" : ""} ${noRef ? "tri" : ""}`}
+            />{" "}
             <ScrambleText text={statusText} />
           </span>
           <span className="m">
@@ -754,8 +871,8 @@ export default function App() {
               {t("sysAudioGrant")} <span className="mk">&raquo;</span>
             </span>
           ) : sysAudioUndet ? (
-            <span className="m" style={{ color: "var(--t-faint)" }}>
-              {t("sysAudioFirstRun")}
+            <span className="m setup" onClick={probeSystemAudio}>
+              {t("sysAudioRequest")} <span className="mk">&raquo;</span>
             </span>
           ) : (
             <span className="m">{unstable ? t("checkSetup") : t("stable")}</span>
@@ -784,7 +901,15 @@ export default function App() {
               />
             </span>
             <span className="sp" />
-            <span className="meta">{t("micNearEnd")}</span>
+            <span className="meta">
+              {t("micNearEnd")}
+              {io?.mic && io.micRate ? (
+                <span className="rsmp">
+                  {" "}
+                  · {io.micRate / 1000}k→{pipeline.sample_rate / 1000}k
+                </span>
+              ) : null}
+            </span>
             <span className="ico">
               <IcoInput />
             </span>
@@ -954,6 +1079,14 @@ export default function App() {
             dev={dev}
             onSelect={changeKind}
             onParam={setParam}
+            onPickModel={pickLocalvqeModel}
+            localvqeModel={
+              (kind === "localvqe"
+                ? (params.model as string | undefined)
+                : (paramsByKind.current["localvqe"]?.model as
+                    | string
+                    | undefined)) ?? null
+            }
             onRecheck={recheckNvafx}
             onSetup={() => setView("rtxsetup")}
           />
@@ -1062,8 +1195,14 @@ export default function App() {
         )}
         <span className="sp" />
         {err ? (
-          <span className="stamp" style={{ color: "var(--warn)" }} title={err}>
-            {err.length > 48 ? err.slice(0, 48) + "…" : err}
+          <span
+            className="stamp err"
+            style={{ color: "var(--warn)", cursor: "pointer" }}
+            title={`${err} · 点击关闭`}
+            onClick={() => setErr(null)}
+          >
+            {err.length > 44 ? err.slice(0, 44) + "…" : err}{" "}
+            <span className="mk">✕</span>
           </span>
         ) : (
           <span className="stamp">{stamp}</span>

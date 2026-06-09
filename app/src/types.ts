@@ -4,6 +4,13 @@
 export type Platform = "windows" | "macos" | "linux";
 
 // ---- devices --json ----
+export interface SupportedSampleRateRange {
+  min: number;
+  max: number;
+  channels: number;
+  sample_format: string;
+}
+
 export interface AudioDevice {
   id: string;
   index: number;
@@ -13,6 +20,7 @@ export interface AudioDevice {
   selector: string; // 设备索引字符串(跨重启不稳)
   stable_id: string; // 跨重启稳定 id(CoreAudio/WASAPI 派生);mic/output 配置优先用它
   default_sample_rate: number;
+  supported_sample_rates?: SupportedSampleRateRange[] | { error: string };
   channels: number;
   sample_format: string;
   config_error: string | null;
@@ -122,15 +130,32 @@ export interface RuntimeStatus {
   out_wave?: number[];
 }
 
-// 诊断录制收尾事件(writer 线程 finalize 后发;reason: max_seconds | run_exit | error)。
+// 诊断录制收尾事件(writer 线程 finalize 后发;手动停为 "stopped")。
 export interface DiagnosticsDoneEvent {
   type: "diagnostics_done";
   session_dir: string;
   frames: number;
   seconds: number;
-  reason: "max_seconds" | "run_exit" | "error" | string;
+  reason: "max_seconds" | "stopped" | "run_exit" | "error" | string;
   drops: number;
   ok: boolean;
+}
+
+// stdin 就地控制录制后的回执事件。
+export interface DiagnosticsStartedEvent {
+  type: "diagnostics_started";
+  session_dir: string;
+  max_seconds: number | null;
+  recording: boolean;
+}
+export interface DiagnosticsStoppingEvent {
+  type: "diagnostics_stopping";
+  session_dir: string;
+}
+export interface ControlErrorEvent {
+  type: "control_error";
+  cmd: string;
+  message: string;
 }
 
 // run --status-json 在音频流启动后先发的一条事件。
@@ -140,12 +165,26 @@ export interface StartedEvent {
   sample_rate: number;
   frame_ms: number;
   reference_channels: string;
+  mic_device_sample_rate?: number | null;
+  output_device_sample_rate?: number | null;
+  reference_device_sample_rate?: number | null;
+  io_resampling?: {
+    mic: boolean;
+    reference: boolean;
+    output: boolean;
+  };
   diagnostics_session_dir?: string | null;
   // 实际生效的参考源:mac Process Tap 时为 "macos_process_tap";其它见后端 status_name。
   reference_source?: string | null;
 }
 
-export type RunEvent = RuntimeStatus | StartedEvent | DiagnosticsDoneEvent;
+export type RunEvent =
+  | RuntimeStatus
+  | StartedEvent
+  | DiagnosticsDoneEvent
+  | DiagnosticsStartedEvent
+  | DiagnosticsStoppingEvent
+  | ControlErrorEvent;
 
 // ---- doctor audio --json(虚拟声卡检测) ----
 export interface DoctorCandidate {

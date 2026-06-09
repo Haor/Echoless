@@ -27,6 +27,29 @@ export function doctorAudio(): Promise<DoctorAudio> {
   return invoke<DoctorAudio>("doctor_audio");
 }
 
+// 用户点击「请求系统音频权限」:触发一次极短 Process Tap probe → macOS 授权弹窗,
+// 回传更新后的 doctor(含 system_audio_permission)。仅用户主动调用。
+export function requestSystemAudio(): Promise<DoctorAudio> {
+  return invoke<DoctorAudio>("request_system_audio");
+}
+
+// LocalVQE 模型:列出可用(下载目录 + 打包资源)、从官方 HF repo 下载。
+export interface LocalvqeModel {
+  filename: string;
+  path: string;
+  source: "downloaded" | "bundled" | string;
+}
+export interface LocalvqeAssets {
+  models_dir: string;
+  models: LocalvqeModel[];
+}
+export function localvqeAssets(): Promise<LocalvqeAssets> {
+  return invoke<LocalvqeAssets>("localvqe_assets");
+}
+export function downloadLocalvqeModel(filename: string): Promise<string> {
+  return invoke<string>("download_localvqe_model", { filename });
+}
+
 export function nvafxDoctor(runtimeDir?: string): Promise<NvafxDoctor> {
   return invoke<NvafxDoctor>("nvafx_doctor", { runtimeDir: runtimeDir ?? null });
 }
@@ -80,12 +103,36 @@ export function stopRun(): Promise<void> {
   return invoke<void>("stop_run");
 }
 
+// 向运行中的子进程 stdin 写一行 JSON 控制命令(就地起停录制,不重启 run)。
+export function sendRunControl(line: string): Promise<void> {
+  return invoke<void>("send_run_control", { line });
+}
+export function startDiagnostics(
+  recordDir: string,
+  maxSeconds: number | null,
+): Promise<void> {
+  return sendRunControl(
+    JSON.stringify({
+      cmd: "start_diagnostics",
+      record_dir: recordDir,
+      max_seconds: maxSeconds,
+    }),
+  );
+}
+export function stopDiagnostics(): Promise<void> {
+  return sendRunControl(JSON.stringify({ cmd: "stop_diagnostics" }));
+}
+
 // 订阅 run 的事件流(started + status 都走这个通道)。返回取消订阅函数。
 export function onRunEvent(cb: (e: RunEvent) => void): Promise<UnlistenFn> {
   return listen<RunEvent>("echoless://status", (e) => cb(e.payload));
 }
-export function onRunExit(cb: () => void): Promise<UnlistenFn> {
-  return listen("echoless://exit", () => cb());
+export function onRunExit(
+  cb: (e: { intentional?: boolean }) => void,
+): Promise<UnlistenFn> {
+  return listen<{ intentional?: boolean }>("echoless://exit", (e) =>
+    cb(e.payload ?? {}),
+  );
 }
 export function onRunLog(cb: (line: string) => void): Promise<UnlistenFn> {
   return listen<string>("echoless://log", (e) => cb(e.payload));
