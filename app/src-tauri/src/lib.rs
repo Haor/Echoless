@@ -4,11 +4,14 @@
 //   - run 的 --status-json 以 JSONL 流式解析,经事件推给前端
 //
 // 契约真理源:echoless/docs/frontend/*.md + CLI 实测。
+use std::fs::OpenOptions;
+use std::io::ErrorKind;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
 use tauri::{
@@ -23,6 +26,7 @@ use tauri_plugin_decorum::WebviewWindowExt;
 struct RunChild {
     child: Child,
     stopping: Arc<AtomicBool>,
+    config_path: PathBuf,
 }
 /// 当前运行中的 echoless run 子进程(同一时刻最多一个)。
 struct RunState(Mutex<Option<RunChild>>);
@@ -56,6 +60,74 @@ fn current_exe_dir() -> Option<PathBuf> {
     std::env::current_exe()
         .ok()
         .and_then(|exe| exe.parent().map(Path::to_path_buf))
+}
+
+fn transient_config_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    let dir = app
+        .path()
+        .app_local_data_dir()
+        .map_err(|e| e.to_string())?
+        .join("runtime-configs");
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    Ok(dir)
+}
+
+fn transient_config_path(dir: &Path, label: &str, attempt: usize) -> PathBuf {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    dir.join(format!(
+        "echoless-{label}-{}-{nanos}-{attempt}.toml",
+        std::process::id()
+    ))
+}
+
+fn write_toml_create_new(path: &Path, toml_text: &str) -> Result<(), String> {
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|e| format!("创建配置文件失败: {}: {e}", path.display()))?;
+    if let Err(err) = file.write_all(toml_text.as_bytes()) {
+        drop(file);
+        cleanup_run_config(path);
+        return Err(format!("写入配置文件失败: {}: {err}", path.display()));
+    }
+    if let Err(err) = file.flush() {
+        drop(file);
+        cleanup_run_config(path);
+        return Err(format!("刷新配置文件失败: {}: {err}", path.display()));
+    }
+    Ok(())
+}
+
+fn write_transient_config_toml(
+    dir: &Path,
+    label: &str,
+    toml_text: &str,
+) -> Result<PathBuf, String> {
+    for attempt in 0..16 {
+        let path = transient_config_path(dir, label, attempt);
+        match write_toml_create_new(&path, toml_text) {
+            Ok(()) => return Ok(path),
+            Err(err) if path.exists() => {
+                if attempt == 15 {
+                    return Err(err);
+                }
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    Err("无法创建唯一配置文件".to_string())
+}
+
+fn cleanup_run_config(path: &Path) {
+    match std::fs::remove_file(path) {
+        Ok(()) => {}
+        Err(err) if err.kind() == ErrorKind::NotFound => {}
+        Err(_) => {}
+    }
 }
 
 /// 解析 echoless CLI 路径。顺序刻意区分 dev / Tauri build / packaged app:
@@ -623,18 +695,15 @@ fn open_path(path: String) -> Result<(), String> {
 
 #[tauri::command]
 fn validate_config(app: tauri::AppHandle, toml_text: String) -> Result<Value, String> {
-    let path = std::env::temp_dir().join("echoless-validate.toml");
-    std::fs::write(&path, toml_text).map_err(|e| e.to_string())?;
-    run_json(
+    let dir = transient_config_dir(&app)?;
+    let path = write_transient_config_toml(&dir, "validate", &toml_text)?;
+    let config_arg = path.to_string_lossy().to_string();
+    let result = run_json(
         Some(&app),
-        &[
-            "config",
-            "validate",
-            "--config",
-            path.to_str().ok_or("bad temp path")?,
-            "--json",
-        ],
-    )
+        &["config", "validate", "--config", &config_arg, "--json"],
+    );
+    cleanup_run_config(&path);
+    result
 }
 
 #[tauri::command]
@@ -651,17 +720,19 @@ fn start_run(
         prev.stopping.store(true, Ordering::SeqCst);
         let _ = prev.child.kill();
         let _ = prev.child.wait();
+        cleanup_run_config(&prev.config_path);
     }
-    let path = std::env::temp_dir().join("echoless-run.toml");
-    std::fs::write(&path, toml_text).map_err(|e| e.to_string())?;
+    let dir = transient_config_dir(&app)?;
+    let path = write_transient_config_toml(&dir, "run", &toml_text)?;
+    let config_arg = path.to_string_lossy().to_string();
     let interval = stats_interval_ms.unwrap_or(80).to_string();
 
     let mut command = echoless_command(Some(&app))?;
-    let mut child = command
+    let child_result = command
         .args([
             "run",
             "--config",
-            path.to_str().ok_or("bad temp path")?,
+            &config_arg,
             "--status-json",
             "--stats-interval-ms",
             &interval,
@@ -669,16 +740,40 @@ fn start_run(
         .stdin(Stdio::piped()) // 录制就地控制:start/stop_diagnostics 经 stdin JSONL 下发
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("spawn echoless run failed: {e}"))?;
+        .spawn();
+    let mut child = match child_result {
+        Ok(child) => child,
+        Err(err) => {
+            cleanup_run_config(&path);
+            return Err(format!("spawn echoless run failed: {err}"));
+        }
+    };
 
     // 本子进程专属的 stopping flag:被主动停/重启时置 true。
     let stopping = Arc::new(AtomicBool::new(false));
 
     // stdout = JSONL status events
-    let stdout = child.stdout.take().ok_or("no stdout")?;
+    let stdout = match child.stdout.take() {
+        Some(stdout) => stdout,
+        None => {
+            let _ = child.kill();
+            let _ = child.wait();
+            cleanup_run_config(&path);
+            return Err("no stdout".to_string());
+        }
+    };
+    let stderr = match child.stderr.take() {
+        Some(stderr) => stderr,
+        None => {
+            let _ = child.kill();
+            let _ = child.wait();
+            cleanup_run_config(&path);
+            return Err("no stderr".to_string());
+        }
+    };
     let app_out = app.clone();
     let stop_reader = stopping.clone();
+    let reader_config_path = path.clone();
     std::thread::spawn(move || {
         for line in BufReader::new(stdout).lines().map_while(Result::ok) {
             if line.trim().is_empty() {
@@ -694,10 +789,10 @@ fn start_run(
             "echoless://exit",
             serde_json::json!({ "intentional": intentional }),
         );
+        cleanup_run_config(&reader_config_path);
     });
 
     // stderr = 人类日志
-    let stderr = child.stderr.take().ok_or("no stderr")?;
     let app_err = app.clone();
     std::thread::spawn(move || {
         for line in BufReader::new(stderr).lines().map_while(Result::ok) {
@@ -705,7 +800,11 @@ fn start_run(
         }
     });
 
-    *guard = Some(RunChild { child, stopping });
+    *guard = Some(RunChild {
+        child,
+        stopping,
+        config_path: path,
+    });
     Ok(())
 }
 
@@ -731,6 +830,7 @@ fn stop_run(state: State<RunState>) -> Result<(), String> {
         rc.stopping.store(true, Ordering::SeqCst); // 主动停 → 其 reader 退出判为 intentional
         let _ = rc.child.kill();
         let _ = rc.child.wait();
+        cleanup_run_config(&rc.config_path);
     }
     Ok(())
 }
@@ -807,6 +907,7 @@ pub fn run() {
                 if let Some(mut rc) = child_opt {
                     rc.stopping.store(true, Ordering::SeqCst);
                     let _ = rc.child.kill();
+                    cleanup_run_config(&rc.config_path);
                 }
             }
         })
@@ -894,5 +995,44 @@ mod tests {
             (prog, args),
             ("xdg-open", vec!["https://example.com".to_string()])
         );
+    }
+
+    #[test]
+    fn config_writer_uses_create_new_and_refuses_existing_path() {
+        let dir = unique_temp_dir("echoless-config-create-new");
+        let path = dir.join("existing.toml");
+        std::fs::write(&path, "old = true").unwrap();
+
+        let err = write_toml_create_new(&path, "new = true").unwrap_err();
+        assert!(err.contains("创建配置文件失败"), "{err}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "old = true");
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn transient_config_writer_creates_unique_files() {
+        let dir = unique_temp_dir("echoless-transient-config");
+        let first = write_transient_config_toml(&dir, "run", "one = true").unwrap();
+        let second = write_transient_config_toml(&dir, "run", "two = true").unwrap();
+
+        assert_ne!(first, second);
+        assert_ne!(
+            first.file_name().and_then(|name| name.to_str()),
+            Some("echoless-run.toml")
+        );
+        assert_ne!(
+            second.file_name().and_then(|name| name.to_str()),
+            Some("echoless-run.toml")
+        );
+        assert_eq!(std::fs::read_to_string(&first).unwrap(), "one = true");
+        assert_eq!(std::fs::read_to_string(&second).unwrap(), "two = true");
+
+        cleanup_run_config(&first);
+        cleanup_run_config(&second);
+        assert!(!first.exists());
+        assert!(!second.exists());
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 }
