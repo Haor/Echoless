@@ -173,6 +173,14 @@ export function setInitialDelayMs(initialDelayMs: number): Promise<void> {
     JSON.stringify({ cmd: "set_initial_delay_ms", initial_delay_ms: initialDelayMs }),
   );
 }
+export function setAec3Ns(ns: boolean, nsLevel: string): Promise<void> {
+  return sendRunControl(
+    JSON.stringify({ cmd: "set_aec3_ns", ns, ns_level: nsLevel }),
+  );
+}
+export function setAec3Agc(agc: boolean): Promise<void> {
+  return sendRunControl(JSON.stringify({ cmd: "set_aec3_agc", agc }));
+}
 
 // 订阅 run 的事件流(started + status 都走这个通道)。返回取消订阅函数。
 export function onRunEvent(cb: (e: RunEvent) => void): Promise<UnlistenFn> {

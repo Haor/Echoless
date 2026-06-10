@@ -17,6 +17,8 @@ import {
   openPath,
   openUrl,
   requestSystemAudio,
+  setAec3Agc,
+  setAec3Ns,
   setInitialDelayMs,
   setNearDelayMs,
   setOutputLevel,
@@ -73,6 +75,8 @@ const REQUIRED_RUN_CONTROLS = [
   "set_output_level",
   "set_near_delay_ms",
   "set_initial_delay_ms",
+  "set_aec3_ns",
+  "set_aec3_agc",
 ];
 
 // 系统设置 › 隐私与安全性(系统音频录制权限在此开启;具体面板随 macOS 版本)。
@@ -280,6 +284,9 @@ export default function App() {
             return;
           }
           if (ev.type === "initial_delay_changed") {
+            return;
+          }
+          if (ev.type === "aec3_ns_changed" || ev.type === "aec3_agc_changed") {
             return;
           }
           // 诊断录制收尾:writer 已 finalize 文件。仅「录满 max_seconds」时
@@ -636,6 +643,28 @@ export default function App() {
           return;
         }
         setInitialDelayMs(delayMs).catch((e) => setErr(String(e)));
+      }
+      return;
+    }
+    if (kind === "sonora_aec3" && (key === "ns" || key === "ns_level")) {
+      if (powerOnRef.current) {
+        if (!hasRunControl("set_aec3_ns")) {
+          reportMissingRunControl("set_aec3_ns");
+          return;
+        }
+        setAec3Ns(Boolean(np.ns), String(np.ns_level ?? "low")).catch((e) =>
+          setErr(String(e)),
+        );
+      }
+      return;
+    }
+    if (kind === "sonora_aec3" && key === "agc") {
+      if (powerOnRef.current) {
+        if (!hasRunControl("set_aec3_agc")) {
+          reportMissingRunControl("set_aec3_agc");
+          return;
+        }
+        setAec3Agc(Boolean(val)).catch((e) => setErr(String(e)));
       }
       return;
     }

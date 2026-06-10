@@ -69,6 +69,9 @@ pub trait EchoProcessor: Send {
     fn io_spec(&self) -> IoSpec;
     fn configure(&mut self, params: &toml::Table) -> anyhow::Result<()>;
     fn set_stream_delay_ms(&mut self, _ms: i32) {}
+    fn set_runtime_param(&mut self, _key: &str, _value: &toml::Value) -> anyhow::Result<bool> {
+        Ok(false)
+    }
     /// `near` / `far` 已由 chain 转到本节点 `io_spec` 域;写 `out`(同域,长度 = frames * near_channels)。
     fn process(&mut self, near: &[f32], far: &[f32], out: &mut [f32], frames: u32);
     fn stats(&self) -> ProcessorStats;

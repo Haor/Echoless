@@ -76,6 +76,21 @@ impl ProcessorChain {
         }
     }
 
+    pub fn set_runtime_param(
+        &mut self,
+        node_name: &str,
+        key: &str,
+        value: &toml::Value,
+    ) -> anyhow::Result<usize> {
+        let mut applied = 0;
+        for node in self.nodes.iter_mut() {
+            if node.name() == node_name && node.set_runtime_param(key, value)? {
+                applied += 1;
+            }
+        }
+        Ok(applied)
+    }
+
     /// near = 原始 mic(base_rate,mono);far = 真实 ref(base_rate,base_far_channels);
     /// out = 链尾(base_rate,mono),长度应 = frames。
     pub fn process(
@@ -435,6 +450,47 @@ mod tests {
         fn reset(&mut self) {}
     }
 
+    struct CaptureParamNode {
+        seen: Arc<Mutex<Vec<(String, toml::Value)>>>,
+    }
+
+    impl EchoProcessor for CaptureParamNode {
+        fn name(&self) -> &'static str {
+            "capture_param"
+        }
+
+        fn io_spec(&self) -> IoSpec {
+            IoSpec {
+                sample_rate: 48_000,
+                near_channels: 1,
+                far_channels: 1,
+                algorithmic_latency_ms: 0.0,
+            }
+        }
+
+        fn configure(&mut self, _params: &toml::Table) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn set_runtime_param(&mut self, key: &str, value: &toml::Value) -> anyhow::Result<bool> {
+            self.seen
+                .lock()
+                .unwrap()
+                .push((key.to_string(), value.clone()));
+            Ok(true)
+        }
+
+        fn process(&mut self, near: &[f32], _far: &[f32], out: &mut [f32], _frames: u32) {
+            copy_or_zero(near, out);
+        }
+
+        fn stats(&self) -> ProcessorStats {
+            ProcessorStats::empty("capture_param")
+        }
+
+        fn reset(&mut self) {}
+    }
+
     #[test]
     fn chain_resamples_through_16k_node_and_preserves_output_length() {
         let mut chain = ProcessorChain::new(48_000, 1);
@@ -551,6 +607,26 @@ mod tests {
         chain.set_stream_delay_ms(0);
 
         assert_eq!(*delays.lock().unwrap(), vec![25, 0]);
+    }
+
+    #[test]
+    fn chain_forwards_runtime_params_to_named_nodes() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let mut chain = ProcessorChain::new(48_000, 1);
+        chain.push(Box::new(CaptureParamNode { seen: seen.clone() }));
+
+        let value = toml::Value::Boolean(true);
+        let applied = chain
+            .set_runtime_param("capture_param", "ns", &value)
+            .unwrap();
+        let missed = chain.set_runtime_param("missing", "ns", &value).unwrap();
+
+        assert_eq!(applied, 1);
+        assert_eq!(missed, 0);
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![("ns".to_string(), toml::Value::Boolean(true))]
+        );
     }
 
     fn capacity_signature(chain: &ProcessorChain) -> Vec<usize> {

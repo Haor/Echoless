@@ -26,6 +26,12 @@ Implemented proof points:
 - It only applies to AEC3; LocalVQE and RTX AEC do not currently expose an internal delay hint.
 - Clearing the field maps to `0ms` at runtime so a previous hint can be removed without restarting.
 
+3. AEC3 `ns` / `ns_level` / `agc`:
+
+- They map to Sonora's top-level APM config and can be applied through `AudioProcessing::apply_config`.
+- They do not reopen devices, change frame geometry, or rebuild the processor chain.
+- `tail_ms`, `delay_num_filters`, and `linear_stable_echo_path` remain restart-required because they are injected into the AEC3 builder-level config.
+
 ## Non-Goals
 
 - Do not hot-switch mic/reference/output devices in this pass. Device changes still require stream rebuilds.
@@ -40,8 +46,12 @@ Implemented proof points:
    - Resize/retune the existing near-delay buffer in the processing thread.
    - Add `{ "cmd": "set_initial_delay_ms", "initial_delay_ms": 0..MAX_INITIAL_DELAY_MS }`.
    - Forward the initial-delay hint to processor nodes through `ProcessorChain::set_stream_delay_ms`.
+   - Add `{ "cmd": "set_aec3_ns", "ns": true|false, "ns_level": "low"|"moderate"|"high"|"veryhigh" }`.
+   - Add `{ "cmd": "set_aec3_agc", "agc": true|false }`.
+   - Forward safe processor-level runtime params through `ProcessorChain::set_runtime_param`.
    - Emit `near_delay_changed` status JSON.
    - Emit `initial_delay_changed` status JSON.
+   - Emit `aec3_ns_changed` and `aec3_agc_changed` status JSON.
    - Expose the control in `SUPPORTED_RUNTIME_CONTROLS`.
 
 2. Frontend:
@@ -49,6 +59,8 @@ Implemented proof points:
    - Treat a pipeline patch containing only `near_delay_ms` as hot-applicable while running.
    - Add `setInitialDelayMs()` API helper.
    - Treat AEC3 `initial_delay_ms` as hot-applicable while running.
+   - Add `setAec3Ns()` and `setAec3Agc()` API helpers.
+   - Treat AEC3 `ns`, `ns_level`, and `agc` as hot-applicable while running.
    - Keep all other pipeline patches on the existing validate + restart path.
 
 3. Documentation/ledger:

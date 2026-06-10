@@ -25,6 +25,11 @@ pub(super) enum RuntimeControlCommand {
     SetOutputLevel(u32),
     SetNearDelayMs(u32),
     SetInitialDelayMs(i32),
+    SetAec3Ns {
+        enabled: bool,
+        level: String,
+    },
+    SetAec3Agc(bool),
 }
 
 pub(super) const SUPPORTED_RUNTIME_CONTROLS: &[&str] = &[
@@ -33,6 +38,8 @@ pub(super) const SUPPORTED_RUNTIME_CONTROLS: &[&str] = &[
     "set_output_level",
     "set_near_delay_ms",
     "set_initial_delay_ms",
+    "set_aec3_ns",
+    "set_aec3_agc",
 ];
 
 #[derive(Debug)]
@@ -131,6 +138,30 @@ fn parse_runtime_control_command(line: &str) -> Result<RuntimeControlCommand> {
                 bail!("set_initial_delay_ms `initial_delay_ms` must be between 0 and {MAX_INITIAL_DELAY_MS}");
             }
             Ok(RuntimeControlCommand::SetInitialDelayMs(delay_ms as i32))
+        }
+        "set_aec3_ns" => {
+            let enabled = value
+                .get("ns")
+                .and_then(Value::as_bool)
+                .context("set_aec3_ns requires boolean field `ns`")?;
+            let level = value
+                .get("ns_level")
+                .and_then(Value::as_str)
+                .context("set_aec3_ns requires string field `ns_level`")?;
+            if !is_valid_ns_level(level) {
+                bail!("set_aec3_ns `ns_level` must be one of: low, moderate, high, veryhigh");
+            }
+            Ok(RuntimeControlCommand::SetAec3Ns {
+                enabled,
+                level: level.to_string(),
+            })
+        }
+        "set_aec3_agc" => {
+            let enabled = value
+                .get("agc")
+                .and_then(Value::as_bool)
+                .context("set_aec3_agc requires boolean field `agc`")?;
+            Ok(RuntimeControlCommand::SetAec3Agc(enabled))
         }
         other => bail!("unknown runtime control command `{other}`"),
     }
@@ -354,11 +385,72 @@ fn handle_runtime_control_command(
                 }),
             );
         }
+        RuntimeControlCommand::SetAec3Ns { enabled, level } => {
+            let ns_value = toml::Value::Boolean(enabled);
+            let level_value = toml::Value::String(level.clone());
+            let result = ctx
+                .chain
+                .set_runtime_param("sonora_aec3", "ns", &ns_value)
+                .and_then(|ns_applied| {
+                    ctx.chain
+                        .set_runtime_param("sonora_aec3", "ns_level", &level_value)
+                        .map(|level_applied| ns_applied + level_applied)
+                });
+            match result {
+                Ok(applied) if applied > 0 => emit_runtime_json(
+                    ctx.status_json,
+                    json!({
+                        "type": "aec3_ns_changed",
+                        "ns": enabled,
+                        "ns_level": level,
+                    }),
+                ),
+                Ok(_) => emit_control_error(
+                    ctx.status_json,
+                    Some("set_aec3_ns"),
+                    "sonora_aec3 is not present in the active chain",
+                ),
+                Err(err) => emit_control_error(
+                    ctx.status_json,
+                    Some("set_aec3_ns"),
+                    format!("failed to update AEC3 NS: {err:#}"),
+                ),
+            }
+        }
+        RuntimeControlCommand::SetAec3Agc(enabled) => {
+            let value = toml::Value::Boolean(enabled);
+            match ctx.chain.set_runtime_param("sonora_aec3", "agc", &value) {
+                Ok(applied) if applied > 0 => emit_runtime_json(
+                    ctx.status_json,
+                    json!({
+                        "type": "aec3_agc_changed",
+                        "agc": enabled,
+                    }),
+                ),
+                Ok(_) => emit_control_error(
+                    ctx.status_json,
+                    Some("set_aec3_agc"),
+                    "sonora_aec3 is not present in the active chain",
+                ),
+                Err(err) => emit_control_error(
+                    ctx.status_json,
+                    Some("set_aec3_agc"),
+                    format!("failed to update AEC3 AGC: {err:#}"),
+                ),
+            }
+        }
     }
 }
 
 pub(super) fn delay_ms_to_samples(ms: u32, sample_rate: u32) -> usize {
     ((u64::from(ms) * u64::from(sample_rate) + 500) / 1000) as usize
+}
+
+fn is_valid_ns_level(level: &str) -> bool {
+    matches!(
+        level.to_ascii_lowercase().as_str(),
+        "low" | "moderate" | "high" | "veryhigh" | "very_high" | "very-high"
+    )
 }
 
 fn retune_near_delay_buffer(delay: &mut VecDeque<f32>, target_samples: usize) {
@@ -466,6 +558,26 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("between 0 and 500"));
+
+        let set_ns =
+            parse_runtime_control_command(r#"{"cmd":"set_aec3_ns","ns":true,"ns_level":"high"}"#)
+                .unwrap();
+        assert!(matches!(
+            set_ns,
+            RuntimeControlCommand::SetAec3Ns {
+                enabled: true,
+                ref level
+            } if level == "high"
+        ));
+
+        let err =
+            parse_runtime_control_command(r#"{"cmd":"set_aec3_ns","ns":true,"ns_level":"max"}"#)
+                .unwrap_err();
+        assert!(err.to_string().contains("ns_level"));
+
+        let set_agc =
+            parse_runtime_control_command(r#"{"cmd":"set_aec3_agc","agc":false}"#).unwrap();
+        assert!(matches!(set_agc, RuntimeControlCommand::SetAec3Agc(false)));
     }
 
     #[test]
@@ -475,6 +587,8 @@ mod tests {
         assert!(SUPPORTED_RUNTIME_CONTROLS.contains(&"set_output_level"));
         assert!(SUPPORTED_RUNTIME_CONTROLS.contains(&"set_near_delay_ms"));
         assert!(SUPPORTED_RUNTIME_CONTROLS.contains(&"set_initial_delay_ms"));
+        assert!(SUPPORTED_RUNTIME_CONTROLS.contains(&"set_aec3_ns"));
+        assert!(SUPPORTED_RUNTIME_CONTROLS.contains(&"set_aec3_agc"));
     }
 
     #[test]

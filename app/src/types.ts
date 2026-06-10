@@ -174,6 +174,15 @@ export interface InitialDelayChangedEvent {
   type: "initial_delay_changed";
   initial_delay_ms: number;
 }
+export interface Aec3NsChangedEvent {
+  type: "aec3_ns_changed";
+  ns: boolean;
+  ns_level: string;
+}
+export interface Aec3AgcChangedEvent {
+  type: "aec3_agc_changed";
+  agc: boolean;
+}
 
 // run --status-json 在音频流启动后先发的一条事件。
 export interface StartedEvent {
@@ -208,7 +217,9 @@ export type RunEvent =
   | ControlErrorEvent
   | OutputLevelChangedEvent
   | NearDelayChangedEvent
-  | InitialDelayChangedEvent;
+  | InitialDelayChangedEvent
+  | Aec3NsChangedEvent
+  | Aec3AgcChangedEvent;
 
 // ---- doctor audio --json(虚拟声卡检测) ----
 export interface DoctorCandidate {

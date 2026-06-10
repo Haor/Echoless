@@ -51,7 +51,7 @@ Open Design / HTML prototype 只能作为视觉原型,不能作为配置 contrac
 | backend select | `sonora_aec3` | 只展示 `processors --json` 返回且当前平台可用的 kind。 |
 | `reference_channels` | `mono` | 可选 `mono`/`stereo`;默认 mono;RTX AEC 只能 mono。 |
 | `output_level` | `50` | 全局最终输出电平,不是处理器参数。范围 `0..100`;`0` 静音,`50` 原声,`100` 约 `3x` 增益。曲线为 `gain = (output_level / 50)^log2(3)`,后端在所有处理器之后统一应用并做软限幅保护。 |
-| `ns` | `false` | AEC3 内置降噪;用户需要时可开启。 |
+| `ns` | `false` | AEC3 内置降噪;用户需要时可开启;运行中可热控。 |
 | `diagnostics.record_dir` | null | 可让用户选择保存目录。 |
 | `diagnostics.max_seconds` | null | 可提供 30s/45s 等录制时长。 |
 
@@ -59,7 +59,7 @@ Open Design / HTML prototype 只能作为视觉原型,不能作为配置 contrac
 
 | 参数 | 默认 | 暴露规则 |
 |---|---:|---|
-| `ns_level` | `low` | 仅在 `ns=true` 时有效;可选值只能是 `low`、`moderate`、`high`、`veryhigh`。UI 可显示 "very high",但提交值必须是 `veryhigh`。 |
+| `ns_level` | `low` | 仅在 `ns=true` 时有效;可选值只能是 `low`、`moderate`、`high`、`veryhigh`。UI 可显示 "very high",但提交值必须是 `veryhigh`;运行中可热控。 |
 | `sample_rate` | `48000` | 这是管线采样率,首版建议锁定或放高级设置。RTX AEC 必须是 `48000`;AEC3 推荐 `48000`;不要把 `44.1k`/`96k` 作为普通推荐项。真实设备不是 48k 时由后端 I/O 重采样处理。 |
 | `frame_ms` | `10` | 首版建议锁定或放高级设置。RTX AEC 必须是 `10`;AEC3 推荐 `10`;不要把 `20ms` 作为普通推荐项。 |
 | `near_delay_ms` | macOS `25`,其他平台 `0` | 高级/校准项。范围 `0..500`;运行中可热控。主动延迟侦测只有在推荐值大于 0 时才写入。 |
@@ -70,11 +70,11 @@ Open Design / HTML prototype 只能作为视觉原型,不能作为配置 contrac
 
 | 参数 | 默认 | 边界 |
 |---|---:|---|
-| `agc` | `false` | 保真优先默认关闭;可能造成音量泵动或双讲忽大忽小。 |
+| `agc` | `false` | 保真优先默认关闭;可能造成音量泵动或双讲忽大忽小;运行中可热控。 |
 | `initial_delay_ms` | null | AEC3 初始延迟 hint;范围 `0..500`;运行中可热控。运行时仍会动态估计回声对齐。 |
-| `tail_ms` | null | AEC3 echo tail 长度;最小值 4。 |
-| `delay_num_filters` | null | AEC3 延迟搜索窗;最小值 1。 |
-| `linear_stable_echo_path` | `false` | AEC3 高级调参项。 |
+| `tail_ms` | null | AEC3 echo tail 长度;最小值 4;运行中不可热控,修改需要重启 runtime。 |
+| `delay_num_filters` | null | AEC3 延迟搜索窗;最小值 1;运行中不可热控,修改需要重启 runtime。 |
+| `linear_stable_echo_path` | `false` | AEC3 高级调参项;运行中不可热控,修改需要重启 runtime。 |
 
 ### 主动延迟侦测可写入的参数
 
@@ -165,6 +165,10 @@ macOS/Linux 上前端可以展示为 unsupported,但不应生成可运行的 `nv
 
 - 每次保存或应用配置前,运行 `echoless config validate --config <file> --json`。
 - 切换 backend、设备、采样率、frame、模型或 RTX runtime 后,重启 runtime。
+- 运行中可热控参数以 `started.supported_controls` 为准。当前后端支持
+  `output_level`、`near_delay_ms`、AEC3 `initial_delay_ms`、AEC3 `ns/ns_level`、AEC3 `agc`
+  的 stdin runtime control;如果 `supported_controls` 缺少对应命令,前端应提示 CLI 过旧,
+  不要静默降级为重启。
 - 运行时展示 `estimated_user_latency_ms` 和 `aec_estimated_delay_ms` 时要区分语义:
   - `estimated_user_latency_ms`: Echoless 软件管线内的用户说话到虚拟输出前估算延迟;不含设备硬件缓冲、通话软件缓冲或网络延迟。首页建议标为 `Pipeline` / `管线延迟`。
   - `aec_estimated_delay_ms`: AEC3 估计的回声路径对齐延迟。
