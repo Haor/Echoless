@@ -113,6 +113,7 @@ interface Live {
   out: number | null;
   lat: number | null;
   healthy: boolean;
+  seq: number;
 }
 
 export interface Health {
@@ -179,6 +180,7 @@ export default function App() {
     out: null,
     lat: null,
     healthy: true,
+    seq: 0,
   });
   const [health, setHealth] = useState<Health>(ZERO_HEALTH);
   // 开发态:页面内按 ~ 切换,临时解开 NVAFX 平台/doctor 门槛,用于走通前端流程。
@@ -345,6 +347,7 @@ export default function App() {
             lat: s.estimated_user_latency_ms,
             healthy:
               !s.diverged && s.runtime_errors === 0 && !s.last_backend_error,
+            seq: s.frames,
           });
           setHealth((h) => ({
             input_drops: s.input_drops ?? 0,
@@ -1113,14 +1116,26 @@ export default function App() {
             <div className="near">
               <div className="trace">
                 <span className="lb">MIC</span>
-                <Scope traceKey="mic" telRef={telRef} phase={0} />
+                <Scope
+                  traceKey="mic"
+                  telRef={telRef}
+                  active={powerOn}
+                  revision={live.seq}
+                  phase={0}
+                />
                 <span className="db">
                   {dash(live.mic)} <i>dBFS</i>
                 </span>
               </div>
               <div className="trace">
                 <span className="lb">REF</span>
-                <Scope traceKey="ref" telRef={telRef} phase={2.1} />
+                <Scope
+                  traceKey="ref"
+                  telRef={telRef}
+                  active={powerOn}
+                  revision={live.seq}
+                  phase={2.1}
+                />
                 <span className="db">
                   {dash(live.ref)} <i>dBFS</i>
                 </span>
@@ -1130,7 +1145,13 @@ export default function App() {
             <div className="far">
               <div className="trace">
                 <span className="lb">OUT</span>
-                <Scope traceKey="out" telRef={telRef} phase={4.2} />
+                <Scope
+                  traceKey="out"
+                  telRef={telRef}
+                  active={powerOn}
+                  revision={live.seq}
+                  phase={4.2}
+                />
                 <span className="db">
                   {dash(live.out)} <i>dBFS</i>
                 </span>
@@ -1293,7 +1314,7 @@ export default function App() {
             </>
           )}
         </span>
-        <FooterBars telRef={telRef} />
+        <FooterBars telRef={telRef} active={powerOn} revision={live.seq} />
       </footer>
     </div>
   );
