@@ -76,6 +76,14 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
+      - name: Sonora tests
+        working-directory: vendor/sonora
+        run: cargo test -p sonora -p sonora-aec3 --locked
+
+      - name: Sonora clippy
+        working-directory: vendor/sonora
+        run: cargo clippy -p sonora -p sonora-aec3 --all-targets --locked -- -D warnings
+
       - name: Build release
         run: cargo build --release --workspace --locked
 
