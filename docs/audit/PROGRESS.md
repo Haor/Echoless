@@ -36,7 +36,7 @@ Last updated: 2026-06-10
 | QUAL-2 | P4 hardening | done | `91e19fb` | `PipelineConfig::frame_size()` now computes in `u64`, clamps to `u32::MAX`, and preserves a minimum frame size of 1; regression coverage includes normal, zero, and extreme values. Verified with `cargo test -p echoless-core --locked`; `cargo fmt -p echoless-core --check`; `cargo clippy --workspace --all-targets --locked -- -D warnings` |
 | SON-2 | P4 hardening | todo | - | Audit production-path `assert!` and profile sonora allocation behavior |
 | SON-3 | P4 hardening | todo | - | Add vendor/sonora CI gate if fork remains vendored |
-| DOC-1 | P4 hardening | todo | - | Centralize and document nvafx pin hash rotation |
+| DOC-1 | P4 hardening | done | `411e686` | NvAFX default-release SHA256 pins now live in one `NVAFX_DEFAULT_RELEASE_PINS` table with structural tests, and `docs/research/nvafx_runtime_pin_rotation.md` documents trust model plus release rotation steps; frontend RTX handoff now states embedded pins are authoritative for the default tag. Verified with `cargo test -p echoless-cli nvafx_install --locked`; `cargo fmt -p echoless-cli --check`; `cargo clippy --workspace --all-targets --locked -- -D warnings` |
 | FE-1 | P5 frontend | todo | - | Pause idle waveform rAF loops and cache canvas sizing |
 | FE-2 | P5 frontend | todo | - | Isolate live/health status rendering |
 | LAT-1 | P5 frontend | todo | - | Fix or relabel user latency estimate |
