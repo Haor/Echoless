@@ -11,9 +11,9 @@ Last updated: 2026-06-10
 | ID | Phase | Status | Closing commit | Verification |
 | --- | --- | --- | --- | --- |
 | P0.0 | green baseline | done | `7406a14` | `cargo clippy --workspace --all-targets --locked -- -D warnings`; `(cd app/src-tauri && cargo clippy --all-targets --locked -- -D warnings)`; `cargo test --workspace --locked`; `(cd app/src-tauri && cargo build --locked)` |
-| TEST-1 | P0 safety net | todo | - | Add CI coverage for Tauri backend, frontend, and GUI build path |
-| TEST-2 | P0 safety net | todo | - | Add audit/deny, fmt, and frontend type/lint gates |
-| CFG-1 | P0 safety net | todo | - | Pin LocalVQE source checkout in CI |
+| TEST-1 | P0 safety net | done | `ee8999a` | CI now includes Tauri backend clippy/build, frontend `tsc --noEmit`, and `pnpm tauri build --debug --no-bundle --ci`; local Tauri build smoke passed |
+| TEST-2 | P0 safety net | done | `ee8999a` | CI now includes first-party Rust fmt checks and root/app/vendor cargo-audit; local scoped fmt and cargo-audit runs passed |
+| CFG-1 | P0 safety net | done | `ee8999a` | CI pins LocalVQE checkout to `de56a174d9662b65f404ec65ae8e4bc9712db0da` |
 | RUNTIME-1 | P1 usable | todo | - | GUI/CLI capability handshake and old-CLI UX |
 | RUNTIME-2 | P1 usable | todo | - | LocalVQE native library/resource availability in dev/package paths |
 | PKG-1 | P1 usable | todo | - | CLI sidecar, resources, Process Tap helper, LocalVQE native libraries |
@@ -50,3 +50,4 @@ Last updated: 2026-06-10
 
 - `cargo fmt --all --check` currently reaches `vendor/sonora`, which is documented as a read-only third-party fork and has pre-existing rustfmt drift. P0.0 used scoped formatting checks for first-party root packages and `app/src-tauri`.
 - Tauri clippy/build still reports the known `block v0.1.6` future-incompatibility note; CODE_AUDIT tracks that under later dependency governance rather than P0.0.
+- P0 was verified locally but the GitHub Actions matrix was not triggered; no push was performed.
