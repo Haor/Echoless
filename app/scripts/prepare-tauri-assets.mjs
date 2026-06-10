@@ -219,6 +219,20 @@ function prepareLocalvqeNative() {
   return true;
 }
 
+function warnDegradedBundle(hasModel, hasNative) {
+  const missing = [];
+  if (!hasModel) missing.push("model (.gguf)");
+  if (!hasNative) missing.push("native runtime (liblocalvqe + ggml backends)");
+  const banner = "=".repeat(72);
+  console.warn(`\n${banner}`);
+  console.warn("⚠  RELEASE BUNDLE WILL SHIP WITHOUT LOCALVQE");
+  console.warn(`   missing: ${missing.join(", ")}`);
+  console.warn("   The packaged app will run, but enabling LocalVQE fails at runtime.");
+  console.warn("   For a release build, supply ECHOLESS_LOCALVQE_MODEL / ECHOLESS_LOCALVQE_LIBRARY");
+  console.warn("   (or RUNNER_TEMP assets) and re-run with --require-localvqe-assets to fail fast.");
+  console.warn(`${banner}\n`);
+}
+
 function main() {
   const targetTriple = rustTargetTriple();
   console.log(`Preparing Tauri assets for ${targetTriple} (${profile})`);
@@ -228,6 +242,11 @@ function main() {
   const hasNative = prepareLocalvqeNative();
   if (requireLocalvqe && (!hasModel || !hasNative)) {
     throw new Error("LocalVQE assets are incomplete");
+  }
+  // 非 dev(发布打包)且缺 LocalVQE 资产时,不再静默产出退化包:打印醒目 banner。
+  // 仍保持退出码 0 以不破坏"只想打包测试 UI"的流程;发布请用 --require-localvqe-assets。
+  if (!dev && (!hasModel || !hasNative)) {
+    warnDegradedBundle(hasModel, hasNative);
   }
 }
 
