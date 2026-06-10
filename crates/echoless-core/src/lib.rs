@@ -138,7 +138,8 @@ impl Default for PipelineConfig {
 
 impl PipelineConfig {
     pub fn frame_size(&self) -> u32 {
-        (self.sample_rate * self.frame_ms / 1000).max(1)
+        let frames = (u64::from(self.sample_rate) * u64::from(self.frame_ms)) / 1000;
+        frames.clamp(1, u64::from(u32::MAX)) as u32
     }
 }
 
@@ -383,6 +384,30 @@ mod tests {
             OUTPUT_LEVEL_MAX_GAIN,
             0.001,
         );
+    }
+
+    #[test]
+    fn frame_size_handles_zero_and_extreme_values_without_overflow() {
+        let normal = PipelineConfig {
+            sample_rate: 48_000,
+            frame_ms: 10,
+            ..PipelineConfig::default()
+        };
+        assert_eq!(normal.frame_size(), 480);
+
+        let zero = PipelineConfig {
+            sample_rate: 0,
+            frame_ms: 0,
+            ..PipelineConfig::default()
+        };
+        assert_eq!(zero.frame_size(), 1);
+
+        let huge = PipelineConfig {
+            sample_rate: u32::MAX,
+            frame_ms: u32::MAX,
+            ..PipelineConfig::default()
+        };
+        assert_eq!(huge.frame_size(), u32::MAX);
     }
 
     #[test]
