@@ -1,0 +1,120 @@
+use anyhow::Result;
+#[cfg(not(feature = "realtime"))]
+use serde_json::json;
+
+use crate::cli::{DevicesArgs, DoctorArgs, DoctorAudioArgs, DoctorCmd};
+#[cfg(feature = "realtime")]
+use crate::realtime;
+
+#[cfg(feature = "realtime")]
+pub(crate) fn cmd_devices(args: DevicesArgs) -> Result<()> {
+    if args.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&realtime::devices_json()?)?
+        );
+        return Ok(());
+    }
+    realtime::print_devices()
+}
+
+#[cfg(not(feature = "realtime"))]
+pub(crate) fn cmd_devices(args: DevicesArgs) -> Result<()> {
+    if args.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "ok": false,
+                "error": "设备枚举需 realtime 特性(cpal);当前构建未启用。",
+                "inputs": [],
+                "outputs": [],
+                "reference_sources": [
+                    { "id": "system", "label": "System audio", "kind": "system" },
+                    { "id": "none", "label": "No reference", "kind": "none" }
+                ]
+            }))?
+        );
+        return Ok(());
+    }
+    println!("设备枚举需 realtime 特性(cpal);当前构建未启用。");
+    Ok(())
+}
+
+#[cfg(feature = "realtime")]
+pub(crate) fn cmd_doctor(args: DoctorArgs) -> Result<()> {
+    match args.cmd {
+        DoctorCmd::Audio(a) => cmd_doctor_audio(a),
+    }
+}
+
+#[cfg(feature = "realtime")]
+pub(crate) fn cmd_doctor_audio(args: DoctorAudioArgs) -> Result<()> {
+    let report = realtime::audio_doctor_json_with_options(realtime::AudioDoctorOptions {
+        request_system_audio: args.request_system_audio,
+    })?;
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
+    println!("Audio doctor");
+    println!("  ok: {}", report["ok"]);
+    println!(
+        "  virtual_output_detected: {}",
+        report["virtual_output_detected"]
+    );
+    println!("  recommended_driver: {}", report["recommended_driver"]);
+    println!("  install_status: {}", report["install_status"]);
+    println!("Use --json for GUI-readable details.");
+    Ok(())
+}
+
+#[cfg(not(feature = "realtime"))]
+pub(crate) fn cmd_doctor(args: DoctorArgs) -> Result<()> {
+    match args.cmd {
+        DoctorCmd::Audio(a) => cmd_doctor_audio(a),
+    }
+}
+
+#[cfg(not(feature = "realtime"))]
+pub(crate) fn cmd_doctor_audio(args: DoctorAudioArgs) -> Result<()> {
+    let report = json!({
+        "ok": false,
+        "platform": std::env::consts::OS,
+        "error": "audio doctor 需 realtime 特性(cpal);当前构建未启用。",
+        "virtual_output_detected": false,
+        "candidate_outputs": [],
+        "candidate_inputs": [],
+        "recommended_driver": recommended_audio_driver(),
+        "install_status": "unknown",
+        "needs_reboot": false,
+        "permission_state": "unknown",
+        "system_audio_permission": "unknown",
+        "system_audio_permission_probe": if args.request_system_audio {
+            json!({
+                "requested": true,
+                "ok": false,
+                "state": "unknown",
+                "detail": "audio doctor 需 realtime 特性(cpal);当前构建未启用。"
+            })
+        } else {
+            json!(null)
+        },
+    });
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        println!("audio doctor 需 realtime 特性(cpal);当前构建未启用。");
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "realtime"))]
+fn recommended_audio_driver() -> &'static str {
+    if cfg!(windows) {
+        "vb-cable"
+    } else if cfg!(target_os = "macos") {
+        "blackhole-2ch"
+    } else {
+        "unknown"
+    }
+}
