@@ -3,15 +3,17 @@
 //! 负责:① 相邻节点间的采样率/声道适配(边界 SRC + downmix);② 把真实 far ref 分发到各节点域;
 //! ③ 延迟累计。单开 = 长度 1 的链;串联/组合 = 有序节点列表;空链 = 直通。
 //!
-//! ⚠️ 骨架阶段边界 SRC 用占位**线性重采样**(每块独立,块边界有微伪影)+ downmix-then-spread。
-//! 正式实现替换为 rubato 有状态 SRC + 立体声保留(蓝本 §10 / 主文档 §8.3)。
+//! 节点边界 SRC 使用 rubato 同步 FFT resampler,并在 chain 生命周期内复用 scratch buffer。
 
 use crate::{registry, EchoProcessor, NodeConfig, ProcessorStats};
+use rubato::{FftFixedIn, Resampler};
 
 pub struct ProcessorChain {
     base_rate: u32,
     base_far_channels: u16,
     nodes: Vec<Box<dyn EchoProcessor>>,
+    adapters: Vec<NodeAdapters>,
+    cur_near_base: Vec<f32>,
 }
 
 impl ProcessorChain {
@@ -20,10 +22,18 @@ impl ProcessorChain {
             base_rate,
             base_far_channels: base_far_channels.max(1),
             nodes: Vec::new(),
+            adapters: Vec::new(),
+            cur_near_base: Vec::new(),
         }
     }
 
     pub fn push(&mut self, p: Box<dyn EchoProcessor>) {
+        let spec = p.io_spec();
+        self.adapters.push(NodeAdapters::new(
+            self.base_rate,
+            self.base_far_channels,
+            spec,
+        ));
         self.nodes.push(p);
     }
 
@@ -55,6 +65,9 @@ impl ProcessorChain {
         for n in self.nodes.iter_mut() {
             n.reset();
         }
+        for adapter in self.adapters.iter_mut() {
+            adapter.reset();
+        }
     }
 
     /// near = 原始 mic(base_rate,mono);far = 真实 ref(base_rate,base_far_channels);
@@ -70,37 +83,22 @@ impl ProcessorChain {
             copy_into(near_base_mono, out_base_mono);
             return;
         }
-        let mut cur_near = near_base_mono.to_vec(); // base_rate, mono
-        for node in self.nodes.iter_mut() {
-            let spec = node.io_spec();
-            let near_n = adapt(
-                &cur_near,
-                self.base_rate,
-                1,
-                spec.sample_rate,
-                spec.near_channels,
-            );
-            let far_n = adapt(
-                far_base,
-                self.base_rate,
-                self.base_far_channels,
-                spec.sample_rate,
-                spec.far_channels,
-            );
+        self.cur_near_base.clear();
+        self.cur_near_base.extend_from_slice(near_base_mono);
+        for (node, adapter) in self.nodes.iter_mut().zip(self.adapters.iter_mut()) {
+            let spec = adapter.spec;
+            let near_n = adapter.near_in.adapt(&self.cur_near_base);
+            let far_n = adapter.far_in.adapt(far_base);
             let nc = spec.near_channels.max(1) as usize;
             let node_frames = (near_n.len() / nc) as u32;
-            let mut out_n = vec![0f32; near_n.len()];
-            node.process(&near_n, &far_n, &mut out_n, node_frames);
+            adapter.out_n.resize(near_n.len(), 0.0);
+            node.process(near_n, far_n, &mut adapter.out_n, node_frames);
             // 回到 base 域(mono),作为下一级 near
-            cur_near = adapt(
-                &out_n,
-                spec.sample_rate,
-                spec.near_channels,
-                self.base_rate,
-                1,
-            );
+            let out_base = adapter.near_out.adapt(&adapter.out_n);
+            self.cur_near_base.clear();
+            self.cur_near_base.extend_from_slice(out_base);
         }
-        copy_into(&cur_near, out_base_mono);
+        copy_into(&self.cur_near_base, out_base_mono);
     }
 }
 
@@ -127,71 +125,392 @@ fn copy_into(src: &[f32], dst: &mut [f32]) {
     }
 }
 
-/// 采样率 + 声道适配(占位实现)。
-fn adapt(input: &[f32], in_rate: u32, in_ch: u16, out_rate: u32, out_ch: u16) -> Vec<f32> {
-    let remapped = remap_channels(input, in_ch, out_ch);
-    if in_rate == out_rate {
-        return remapped;
-    }
-    let chs = out_ch.max(1) as usize;
-    let frames = remapped.len() / chs;
-    // 逐声道线性重采样(占位;TODO: rubato 有状态 SRC)
-    let mut out = Vec::new();
-    let mut planes: Vec<Vec<f32>> = vec![Vec::with_capacity(frames); chs];
-    for f in 0..frames {
-        for c in 0..chs {
-            planes[c].push(remapped[f * chs + c]);
-        }
-    }
-    let resampled: Vec<Vec<f32>> = planes
-        .iter()
-        .map(|p| resample_linear(p, in_rate, out_rate))
-        .collect();
-    let out_frames = resampled.first().map(|p| p.len()).unwrap_or(0);
-    out.reserve(out_frames * chs);
-    for f in 0..out_frames {
-        for plane in resampled.iter() {
-            out.push(plane.get(f).copied().unwrap_or(0.0));
-        }
-    }
-    out
+struct NodeAdapters {
+    spec: crate::IoSpec,
+    near_in: BoundaryAdapter,
+    far_in: BoundaryAdapter,
+    near_out: BoundaryAdapter,
+    out_n: Vec<f32>,
 }
 
-/// 声道适配(占位):同数直通;降维取平均;升维复制平均值。
-/// ⚠️ TODO: 立体声 far 应保留 L/R(蓝本 §7;主文档 §8.3),勿 downmix 后复制。
-fn remap_channels(input: &[f32], in_ch: u16, out_ch: u16) -> Vec<f32> {
-    if in_ch == out_ch || in_ch == 0 {
-        return input.to_vec();
-    }
-    let inc = in_ch as usize;
-    let outc = out_ch.max(1) as usize;
-    let frames = input.len() / inc;
-    let mut out = Vec::with_capacity(frames * outc);
-    for f in 0..frames {
-        let frame = &input[f * inc..(f + 1) * inc];
-        let mono = frame.iter().copied().sum::<f32>() / inc as f32;
-        for _ in 0..outc {
-            out.push(mono);
+impl NodeAdapters {
+    fn new(base_rate: u32, base_far_channels: u16, spec: crate::IoSpec) -> Self {
+        Self {
+            spec,
+            near_in: BoundaryAdapter::new(base_rate, 1, spec.sample_rate, spec.near_channels),
+            far_in: BoundaryAdapter::new(
+                base_rate,
+                base_far_channels,
+                spec.sample_rate,
+                spec.far_channels,
+            ),
+            near_out: BoundaryAdapter::new(spec.sample_rate, spec.near_channels, base_rate, 1),
+            out_n: Vec::new(),
         }
     }
-    out
+
+    fn reset(&mut self) {
+        self.near_in.reset();
+        self.far_in.reset();
+        self.near_out.reset();
+        self.out_n.clear();
+    }
 }
 
-/// 线性插值重采样(单声道;占位实现)。
-fn resample_linear(input: &[f32], in_rate: u32, out_rate: u32) -> Vec<f32> {
-    if in_rate == out_rate || input.is_empty() {
-        return input.to_vec();
+struct BoundaryAdapter {
+    in_rate: u32,
+    in_channels: u16,
+    out_rate: u32,
+    out_channels: u16,
+    configured_input_frames: usize,
+    planes: Vec<Vec<f32>>,
+    resampled_planes: Vec<Vec<f32>>,
+    output: Vec<f32>,
+    resampler: Option<FftFixedIn<f32>>,
+}
+
+impl BoundaryAdapter {
+    fn new(in_rate: u32, in_channels: u16, out_rate: u32, out_channels: u16) -> Self {
+        Self {
+            in_rate,
+            in_channels: in_channels.max(1),
+            out_rate,
+            out_channels: out_channels.max(1),
+            configured_input_frames: 0,
+            planes: Vec::new(),
+            resampled_planes: Vec::new(),
+            output: Vec::new(),
+            resampler: None,
+        }
     }
-    let ratio = out_rate as f64 / in_rate as f64;
-    let out_len = ((input.len() as f64) * ratio).round() as usize;
-    let mut out = Vec::with_capacity(out_len);
-    for i in 0..out_len {
-        let src = i as f64 / ratio;
-        let i0 = src.floor() as usize;
-        let frac = (src - i0 as f64) as f32;
-        let a = input.get(i0).copied().unwrap_or(0.0);
-        let b = input.get(i0 + 1).copied().unwrap_or(a);
-        out.push(a + (b - a) * frac);
+
+    fn reset(&mut self) {
+        if let Some(resampler) = self.resampler.as_mut() {
+            resampler.reset();
+        }
+        for plane in self.planes.iter_mut() {
+            plane.fill(0.0);
+        }
+        for plane in self.resampled_planes.iter_mut() {
+            plane.fill(0.0);
+        }
+        self.output.clear();
     }
-    out
+
+    fn adapt(&mut self, input: &[f32]) -> &[f32] {
+        let input_frames = input.len() / self.in_channels as usize;
+        self.ensure_layout(input_frames);
+        self.fill_planes(input, input_frames);
+
+        let output_frames = if self.in_rate == self.out_rate {
+            self.interleave_from_planes(input_frames);
+            input_frames
+        } else if let Some(resampler) = self.resampler.as_mut() {
+            match resampler.process_into_buffer(&self.planes, &mut self.resampled_planes, None) {
+                Ok((_in_frames, out_frames)) => {
+                    self.interleave_from_resampled(out_frames);
+                    out_frames
+                }
+                Err(_err) => {
+                    self.resample_linear_fallback(input_frames);
+                    self.output.len() / self.out_channels as usize
+                }
+            }
+        } else {
+            self.resample_linear_fallback(input_frames);
+            self.output.len() / self.out_channels as usize
+        };
+        let output_len = output_frames * self.out_channels as usize;
+        &self.output[..output_len.min(self.output.len())]
+    }
+
+    fn ensure_layout(&mut self, input_frames: usize) {
+        if self.configured_input_frames == input_frames {
+            return;
+        }
+        self.configured_input_frames = input_frames;
+        let out_channels = self.out_channels as usize;
+        resize_planes(&mut self.planes, out_channels, input_frames);
+        if self.in_rate != self.out_rate && input_frames > 0 {
+            self.resampler = FftFixedIn::<f32>::new(
+                self.in_rate as usize,
+                self.out_rate as usize,
+                input_frames,
+                1,
+                out_channels,
+            )
+            .ok();
+            let output_frames_max = self
+                .resampler
+                .as_ref()
+                .map(Resampler::output_frames_max)
+                .unwrap_or_else(|| scaled_frames(input_frames, self.in_rate, self.out_rate));
+            resize_planes(&mut self.resampled_planes, out_channels, output_frames_max);
+            self.output.resize(output_frames_max * out_channels, 0.0);
+        } else {
+            self.resampler = None;
+            self.resampled_planes.clear();
+            self.output.resize(input_frames * out_channels, 0.0);
+        }
+    }
+
+    fn fill_planes(&mut self, input: &[f32], frames: usize) {
+        let in_channels = self.in_channels as usize;
+        let out_channels = self.out_channels as usize;
+        for plane in self.planes.iter_mut() {
+            plane[..frames].fill(0.0);
+        }
+        for frame in 0..frames {
+            let frame_start = frame * in_channels;
+            let frame_samples = &input[frame_start..frame_start + in_channels];
+            if out_channels == in_channels {
+                for (channel, sample) in frame_samples.iter().enumerate().take(out_channels) {
+                    self.planes[channel][frame] = *sample;
+                }
+            } else if out_channels == 1 {
+                self.planes[0][frame] =
+                    frame_samples.iter().copied().sum::<f32>() / in_channels as f32;
+            } else if in_channels == 1 {
+                let sample = frame_samples[0];
+                for channel in 0..out_channels {
+                    self.planes[channel][frame] = sample;
+                }
+            } else {
+                for channel in 0..out_channels {
+                    self.planes[channel][frame] = frame_samples[channel.min(in_channels - 1)];
+                }
+            }
+        }
+    }
+
+    fn interleave_from_planes(&mut self, frames: usize) {
+        let channels = self.out_channels as usize;
+        self.output.resize(frames * channels, 0.0);
+        for frame in 0..frames {
+            for channel in 0..channels {
+                self.output[frame * channels + channel] = self.planes[channel][frame];
+            }
+        }
+    }
+
+    fn interleave_from_resampled(&mut self, frames: usize) {
+        let channels = self.out_channels as usize;
+        self.output.resize(frames * channels, 0.0);
+        for frame in 0..frames {
+            for channel in 0..channels {
+                self.output[frame * channels + channel] = self.resampled_planes[channel][frame];
+            }
+        }
+    }
+
+    fn resample_linear_fallback(&mut self, frames: usize) {
+        let channels = self.out_channels as usize;
+        let output_frames = scaled_frames(frames, self.in_rate, self.out_rate);
+        self.output.resize(output_frames * channels, 0.0);
+        for channel in 0..channels {
+            for frame in 0..output_frames {
+                let src = frame as f64 * self.in_rate as f64 / self.out_rate as f64;
+                let i0 = src.floor() as usize;
+                let frac = (src - i0 as f64) as f32;
+                let a = self.planes[channel].get(i0).copied().unwrap_or(0.0);
+                let b = self.planes[channel].get(i0 + 1).copied().unwrap_or(a);
+                self.output[frame * channels + channel] = a + (b - a) * frac;
+            }
+        }
+    }
+}
+
+fn resize_planes(planes: &mut Vec<Vec<f32>>, channels: usize, frames: usize) {
+    if planes.len() != channels {
+        planes.resize_with(channels, Vec::new);
+    }
+    for plane in planes.iter_mut() {
+        plane.resize(frames, 0.0);
+    }
+}
+
+fn scaled_frames(input_frames: usize, in_rate: u32, out_rate: u32) -> usize {
+    if in_rate == 0 {
+        return input_frames;
+    }
+    ((input_frames as f64) * out_rate as f64 / in_rate as f64).round() as usize
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::IoSpec;
+    use std::sync::{Arc, Mutex};
+
+    struct IdentityNode {
+        spec: IoSpec,
+    }
+
+    impl EchoProcessor for IdentityNode {
+        fn name(&self) -> &'static str {
+            "identity"
+        }
+
+        fn io_spec(&self) -> IoSpec {
+            self.spec
+        }
+
+        fn configure(&mut self, _params: &toml::Table) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn process(&mut self, near: &[f32], _far: &[f32], out: &mut [f32], _frames: u32) {
+            copy_into(near, out);
+        }
+
+        fn stats(&self) -> ProcessorStats {
+            ProcessorStats::empty("identity")
+        }
+
+        fn reset(&mut self) {}
+    }
+
+    struct CaptureFarNode {
+        spec: IoSpec,
+        far_seen: Arc<Mutex<Vec<f32>>>,
+    }
+
+    impl EchoProcessor for CaptureFarNode {
+        fn name(&self) -> &'static str {
+            "capture_far"
+        }
+
+        fn io_spec(&self) -> IoSpec {
+            self.spec
+        }
+
+        fn configure(&mut self, _params: &toml::Table) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn process(&mut self, near: &[f32], far: &[f32], out: &mut [f32], _frames: u32) {
+            *self.far_seen.lock().unwrap() = far.to_vec();
+            copy_into(near, out);
+        }
+
+        fn stats(&self) -> ProcessorStats {
+            ProcessorStats::empty("capture_far")
+        }
+
+        fn reset(&mut self) {}
+    }
+
+    #[test]
+    fn chain_resamples_through_16k_node_and_preserves_output_length() {
+        let mut chain = ProcessorChain::new(48_000, 1);
+        chain.push(Box::new(IdentityNode {
+            spec: IoSpec {
+                sample_rate: 16_000,
+                near_channels: 1,
+                far_channels: 1,
+                algorithmic_latency_ms: 0.0,
+            },
+        }));
+
+        let near = sine_block(480, 440.0, 48_000);
+        let far = vec![0.0; 480];
+        let mut out = vec![0.0; 480];
+
+        chain.process(&near, &far, &mut out, 480);
+
+        assert_eq!(out.len(), 480);
+        assert!(out.iter().all(|sample| sample.is_finite()));
+    }
+
+    #[test]
+    fn chain_reuses_adapter_capacity_after_warmup() {
+        let mut chain = ProcessorChain::new(48_000, 1);
+        chain.push(Box::new(IdentityNode {
+            spec: IoSpec {
+                sample_rate: 16_000,
+                near_channels: 1,
+                far_channels: 1,
+                algorithmic_latency_ms: 0.0,
+            },
+        }));
+
+        let near = sine_block(480, 440.0, 48_000);
+        let far = vec![0.0; 480];
+        let mut out = vec![0.0; 480];
+        chain.process(&near, &far, &mut out, 480);
+        let warm = capacity_signature(&chain);
+
+        chain.process(&near, &far, &mut out, 480);
+
+        assert_eq!(capacity_signature(&chain), warm);
+    }
+
+    #[test]
+    fn stereo_far_resampling_preserves_channel_difference() {
+        let far_seen = Arc::new(Mutex::new(Vec::new()));
+        let mut chain = ProcessorChain::new(48_000, 2);
+        chain.push(Box::new(CaptureFarNode {
+            spec: IoSpec {
+                sample_rate: 16_000,
+                near_channels: 1,
+                far_channels: 2,
+                algorithmic_latency_ms: 0.0,
+            },
+            far_seen: far_seen.clone(),
+        }));
+
+        let near = vec![0.0; 480];
+        let mut far = vec![0.0; 480 * 2];
+        for frame in 0..480 {
+            far[frame * 2] = 0.25;
+            far[frame * 2 + 1] = -0.75;
+        }
+        let mut out = vec![0.0; 480];
+
+        chain.process(&near, &far, &mut out, 480);
+
+        let captured = far_seen.lock().unwrap().clone();
+        assert_eq!(captured.len(), 160 * 2);
+        let (mut left_sum, mut right_sum) = (0.0f32, 0.0f32);
+        for frame in captured.chunks_exact(2).skip(8).take(144) {
+            left_sum += frame[0];
+            right_sum += frame[1];
+        }
+        let left_avg = left_sum / 144.0;
+        let right_avg = right_sum / 144.0;
+        assert!(left_avg > 0.1, "left channel collapsed: {left_avg}");
+        assert!(right_avg < -0.3, "right channel collapsed: {right_avg}");
+        assert!(
+            (left_avg - right_avg).abs() > 0.4,
+            "stereo channels were not preserved: L={left_avg}, R={right_avg}"
+        );
+    }
+
+    fn capacity_signature(chain: &ProcessorChain) -> Vec<usize> {
+        let mut caps = vec![chain.cur_near_base.capacity()];
+        for adapter in &chain.adapters {
+            caps.extend(boundary_capacity_signature(&adapter.near_in));
+            caps.extend(boundary_capacity_signature(&adapter.far_in));
+            caps.extend(boundary_capacity_signature(&adapter.near_out));
+            caps.push(adapter.out_n.capacity());
+        }
+        caps
+    }
+
+    fn boundary_capacity_signature(adapter: &BoundaryAdapter) -> Vec<usize> {
+        let mut caps = vec![adapter.output.capacity(), adapter.planes.capacity()];
+        caps.extend(adapter.planes.iter().map(Vec::capacity));
+        caps.push(adapter.resampled_planes.capacity());
+        caps.extend(adapter.resampled_planes.iter().map(Vec::capacity));
+        caps
+    }
+
+    fn sine_block(frames: usize, hz: f32, sample_rate: u32) -> Vec<f32> {
+        (0..frames)
+            .map(|frame| {
+                let phase = frame as f32 * hz * std::f32::consts::TAU / sample_rate as f32;
+                0.1 * phase.sin()
+            })
+            .collect()
+    }
 }
