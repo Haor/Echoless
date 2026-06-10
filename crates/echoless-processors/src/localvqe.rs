@@ -47,8 +47,9 @@ pub struct LocalVqe {
     noise_gate: bool,
     noise_gate_threshold_dbfs: f32,
     runtime: Option<LocalVqeRuntime>,
-    near_buffer: Vec<f32>,
-    far_buffer: Vec<f32>,
+    near_buffer: VecDeque<f32>,
+    far_buffer: VecDeque<f32>,
+    frame_out: Vec<f32>,
     out_queue: VecDeque<f32>,
     started: bool,
     last_error: Option<String>,
@@ -65,8 +66,9 @@ impl LocalVqe {
             noise_gate: false,
             noise_gate_threshold_dbfs: DEFAULT_NOISE_GATE_THRESHOLD_DBFS,
             runtime: None,
-            near_buffer: Vec::new(),
-            far_buffer: Vec::new(),
+            near_buffer: VecDeque::new(),
+            far_buffer: VecDeque::new(),
+            frame_out: Vec::new(),
             out_queue: VecDeque::new(),
             started: false,
             last_error: None,
@@ -134,8 +136,10 @@ impl LocalVqe {
         }
 
         for i in 0..samples {
-            self.near_buffer.push(near.get(i).copied().unwrap_or(0.0));
-            self.far_buffer.push(far.get(i).copied().unwrap_or(0.0));
+            self.near_buffer
+                .push_back(near.get(i).copied().unwrap_or(0.0));
+            self.far_buffer
+                .push_back(far.get(i).copied().unwrap_or(0.0));
         }
 
         let runtime = self
@@ -143,16 +147,24 @@ impl LocalVqe {
             .as_mut()
             .context("localvqe runtime is not configured")?;
         let hop = runtime.hop;
-        let mut frame_out = vec![0.0; hop];
+        if self.frame_out.len() != hop {
+            self.frame_out.resize(hop, 0.0);
+        }
         while self.near_buffer.len() >= hop && self.far_buffer.len() >= hop {
-            runtime.process_frame(
-                &self.near_buffer[..hop],
-                &self.far_buffer[..hop],
-                &mut frame_out,
-            )?;
-            self.near_buffer.drain(..hop);
-            self.far_buffer.drain(..hop);
-            self.out_queue.extend(frame_out.iter().copied());
+            {
+                let near_buffer = self.near_buffer.make_contiguous();
+                let far_buffer = self.far_buffer.make_contiguous();
+                runtime.process_frame(
+                    &near_buffer[..hop],
+                    &far_buffer[..hop],
+                    &mut self.frame_out,
+                )?;
+            }
+            for _ in 0..hop {
+                let _ = self.near_buffer.pop_front();
+                let _ = self.far_buffer.pop_front();
+            }
+            self.out_queue.extend(self.frame_out.iter().copied());
         }
 
         let start_threshold = samples.saturating_add(hop);
@@ -204,6 +216,7 @@ impl EchoProcessor for LocalVqe {
             .unwrap_or(DEFAULT_NOISE_GATE_THRESHOLD_DBFS);
 
         let runtime = self.load_runtime()?;
+        self.frame_out.resize(runtime.hop, 0.0);
         self.runtime = Some(runtime);
         self.reset_stream_state();
         Ok(())
@@ -586,6 +599,22 @@ mod tests {
         let _ = std::fs::remove_file(&model);
         assert!(err.to_string().contains("localvqe"));
         assert!(err.to_string().contains("library"));
+    }
+
+    #[test]
+    fn reset_stream_state_keeps_reusable_frame_buffer() {
+        let mut processor = LocalVqe::new();
+        processor.near_buffer.extend([1.0, 2.0]);
+        processor.far_buffer.extend([3.0, 4.0]);
+        processor.out_queue.extend([5.0, 6.0]);
+        processor.frame_out.resize(160, 0.0);
+
+        processor.reset_stream_state();
+
+        assert!(processor.near_buffer.is_empty());
+        assert!(processor.far_buffer.is_empty());
+        assert!(processor.out_queue.is_empty());
+        assert_eq!(processor.frame_out.len(), 160);
     }
 
     #[test]
