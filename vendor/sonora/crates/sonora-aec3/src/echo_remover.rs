@@ -116,6 +116,77 @@ fn form_linear_filter_output(
     signal_transition(from, to, output);
 }
 
+#[derive(Debug)]
+struct EchoRemoverScratch {
+    e: Vec<[f32; FFT_LENGTH_BY_2]>,
+    y2: Vec<[f32; FFT_LENGTH_BY_2_PLUS_1]>,
+    e2: Vec<[f32; FFT_LENGTH_BY_2_PLUS_1]>,
+    r2: Vec<[f32; FFT_LENGTH_BY_2_PLUS_1]>,
+    r2_unbounded: Vec<[f32; FFT_LENGTH_BY_2_PLUS_1]>,
+    s2_linear: Vec<[f32; FFT_LENGTH_BY_2_PLUS_1]>,
+    y_fft: Vec<FftData>,
+    e_fft: Vec<FftData>,
+    comfort_noise: Vec<FftData>,
+    high_band_comfort_noise: Vec<FftData>,
+    subtractor_output: Vec<SubtractorOutput>,
+}
+
+impl EchoRemoverScratch {
+    fn new(num_capture_channels: usize) -> Self {
+        Self {
+            e: vec![[0.0; FFT_LENGTH_BY_2]; num_capture_channels],
+            y2: vec![[0.0; FFT_LENGTH_BY_2_PLUS_1]; num_capture_channels],
+            e2: vec![[0.0; FFT_LENGTH_BY_2_PLUS_1]; num_capture_channels],
+            r2: vec![[0.0; FFT_LENGTH_BY_2_PLUS_1]; num_capture_channels],
+            r2_unbounded: vec![[0.0; FFT_LENGTH_BY_2_PLUS_1]; num_capture_channels],
+            s2_linear: vec![[0.0; FFT_LENGTH_BY_2_PLUS_1]; num_capture_channels],
+            y_fft: vec![FftData::default(); num_capture_channels],
+            e_fft: vec![FftData::default(); num_capture_channels],
+            comfort_noise: vec![FftData::default(); num_capture_channels],
+            high_band_comfort_noise: vec![FftData::default(); num_capture_channels],
+            subtractor_output: (0..num_capture_channels)
+                .map(|_| SubtractorOutput::default())
+                .collect(),
+        }
+    }
+
+    fn reset(&mut self) {
+        for e in &mut self.e {
+            e.fill(0.0);
+        }
+        for y2 in &mut self.y2 {
+            y2.fill(0.0);
+        }
+        for e2 in &mut self.e2 {
+            e2.fill(0.0);
+        }
+        for r2 in &mut self.r2 {
+            r2.fill(0.0);
+        }
+        for r2_unbounded in &mut self.r2_unbounded {
+            r2_unbounded.fill(0.0);
+        }
+        for s2_linear in &mut self.s2_linear {
+            s2_linear.fill(0.0);
+        }
+        for y_fft in &mut self.y_fft {
+            y_fft.clear();
+        }
+        for e_fft in &mut self.e_fft {
+            e_fft.clear();
+        }
+        for comfort_noise in &mut self.comfort_noise {
+            comfort_noise.clear();
+        }
+        for high_band_comfort_noise in &mut self.high_band_comfort_noise {
+            high_band_comfort_noise.clear();
+        }
+        for subtractor_output in &mut self.subtractor_output {
+            *subtractor_output = SubtractorOutput::default();
+        }
+    }
+}
+
 /// Computes a windowed (sqrt-Hanning) padded FFT and updates the related memory.
 fn windowed_padded_fft(
     fft: &Aec3Fft,
@@ -151,6 +222,7 @@ pub(crate) struct EchoRemover {
     block_counter: usize,
     gain_change_hangover: i32,
     refined_filter_output_last_selected: bool,
+    scratch: EchoRemoverScratch,
 }
 
 impl EchoRemover {
@@ -184,6 +256,7 @@ impl EchoRemover {
             block_counter: 0,
             gain_change_hangover: 0,
             refined_filter_output_last_selected: true,
+            scratch: EchoRemoverScratch::new(num_capture_channels),
         }
     }
 
@@ -221,20 +294,19 @@ impl EchoRemover {
         );
         debug_assert_eq!(capture.num_channels(), num_capture_channels);
 
-        // Per-channel working storage.
-        let mut e = vec![[0.0f32; FFT_LENGTH_BY_2]; num_capture_channels];
-        let mut y2 = vec![[0.0f32; FFT_LENGTH_BY_2_PLUS_1]; num_capture_channels];
-        let mut e2 = vec![[0.0f32; FFT_LENGTH_BY_2_PLUS_1]; num_capture_channels];
-        let mut r2 = vec![[0.0f32; FFT_LENGTH_BY_2_PLUS_1]; num_capture_channels];
-        let mut r2_unbounded = vec![[0.0f32; FFT_LENGTH_BY_2_PLUS_1]; num_capture_channels];
-        let mut s2_linear = vec![[0.0f32; FFT_LENGTH_BY_2_PLUS_1]; num_capture_channels];
-        let mut y_fft = vec![FftData::default(); num_capture_channels];
-        let mut e_fft = vec![FftData::default(); num_capture_channels];
-        let mut comfort_noise = vec![FftData::default(); num_capture_channels];
-        let mut high_band_comfort_noise = vec![FftData::default(); num_capture_channels];
-        let mut subtractor_output: Vec<SubtractorOutput> = (0..num_capture_channels)
-            .map(|_| SubtractorOutput::default())
-            .collect();
+        self.scratch.reset();
+        let scratch = &mut self.scratch;
+        let e = &mut scratch.e;
+        let y2 = &mut scratch.y2;
+        let e2 = &mut scratch.e2;
+        let r2 = &mut scratch.r2;
+        let r2_unbounded = &mut scratch.r2_unbounded;
+        let s2_linear = &mut scratch.s2_linear;
+        let y_fft = &mut scratch.y_fft;
+        let e_fft = &mut scratch.e_fft;
+        let comfort_noise = &mut scratch.comfort_noise;
+        let high_band_comfort_noise = &mut scratch.high_band_comfort_noise;
+        let subtractor_output = &mut scratch.subtractor_output;
 
         self.aec_state
             .update_capture_saturation(capture_signal_saturation);
@@ -281,7 +353,7 @@ impl EchoRemover {
             capture,
             &self.render_signal_analyzer,
             &self.aec_state,
-            &mut subtractor_output,
+            subtractor_output,
         );
 
         // Decide refined vs coarse once across all channels.
@@ -329,16 +401,16 @@ impl EchoRemover {
             adaptive_filter_frequency_responses: self.subtractor.filter_frequency_responses(),
             adaptive_filter_impulse_responses: self.subtractor.filter_impulse_responses(),
             render_buffer,
-            e2_refined: &e2,
-            y2: &y2,
-            subtractor_output: &subtractor_output,
+            e2_refined: e2.as_slice(),
+            y2: y2.as_slice(),
+            subtractor_output: subtractor_output.as_slice(),
         });
 
         // Choose the linear output.
         let y_fft_for_suppression: &[FftData] = if self.aec_state.use_linear_filter_output() {
-            &e_fft
+            e_fft.as_slice()
         } else {
-            &y_fft
+            y_fft.as_slice()
         };
 
         // Only do the below processing if the output will be used.
@@ -349,12 +421,12 @@ impl EchoRemover {
                 &ResidualEchoInput {
                     aec_state: &self.aec_state,
                     render_buffer,
-                    s2_linear: &s2_linear,
-                    y2: &y2,
+                    s2_linear: s2_linear.as_slice(),
+                    y2: y2.as_slice(),
                     dominant_nearend: self.suppression_gain.is_dominant_nearend(),
                 },
-                &mut r2,
-                &mut r2_unbounded,
+                r2.as_mut_slice(),
+                r2_unbounded.as_mut_slice(),
             );
 
             // Suppressor nearend estimate: E2 is bound by Y2.
@@ -369,25 +441,25 @@ impl EchoRemover {
             // Select nearend spectrum (after E2 clamping).
             let nearend_spectrum: &[[f32; FFT_LENGTH_BY_2_PLUS_1]] =
                 if self.aec_state.usable_linear_estimate() {
-                    &e2
+                    e2.as_slice()
                 } else {
-                    &y2
+                    y2.as_slice()
                 };
 
             // Estimate the comfort noise.
             self.cng.compute(
                 self.aec_state.saturated_capture(),
                 nearend_spectrum,
-                &mut comfort_noise,
-                &mut high_band_comfort_noise,
+                comfort_noise.as_mut_slice(),
+                high_band_comfort_noise.as_mut_slice(),
             );
 
             // Suppressor echo estimate.
             let echo_spectrum: &[[f32; FFT_LENGTH_BY_2_PLUS_1]] =
                 if self.aec_state.usable_linear_estimate() {
-                    &s2_linear
+                    s2_linear.as_slice()
                 } else {
-                    &r2
+                    r2.as_slice()
                 };
 
             // Determine if the suppressor should assume clock drift.
@@ -400,8 +472,8 @@ impl EchoRemover {
                 &SuppressionInput {
                     nearend_spectrum,
                     echo_spectrum,
-                    residual_echo_spectrum: &r2,
-                    residual_echo_spectrum_unbounded: &r2_unbounded,
+                    residual_echo_spectrum: r2.as_slice(),
+                    residual_echo_spectrum_unbounded: r2_unbounded.as_slice(),
                     comfort_noise_spectrum: self.cng.noise_spectrum(),
                     render_signal_analyzer: &self.render_signal_analyzer,
                     aec_state: &self.aec_state,
@@ -413,8 +485,8 @@ impl EchoRemover {
             );
 
             self.suppression_filter.apply_gain(
-                &comfort_noise,
-                &high_band_comfort_noise,
+                comfort_noise.as_slice(),
+                high_band_comfort_noise.as_slice(),
                 &g,
                 high_bands_gain,
                 y_fft_for_suppression,
@@ -423,15 +495,15 @@ impl EchoRemover {
         } else {
             let nearend_spectrum: &[[f32; FFT_LENGTH_BY_2_PLUS_1]] =
                 if self.aec_state.usable_linear_estimate() {
-                    &e2
+                    e2.as_slice()
                 } else {
-                    &y2
+                    y2.as_slice()
                 };
             self.cng.compute(
                 self.aec_state.saturated_capture(),
                 nearend_spectrum,
-                &mut comfort_noise,
-                &mut high_band_comfort_noise,
+                comfort_noise.as_mut_slice(),
+                high_band_comfort_noise.as_mut_slice(),
             );
             g.fill(0.0);
         }
