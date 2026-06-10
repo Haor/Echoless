@@ -48,6 +48,7 @@ Last updated: 2026-06-10
 
 ## Notes
 
+- 2026-06-10 local gate refresh after `c902e80`: `cargo clippy --workspace --all-targets --locked -- -D warnings`; `cargo test --workspace --locked`; `(cd app/src-tauri && cargo clippy --all-targets --locked -- -D warnings)`; `(cd app/src-tauri && cargo build --locked)`; `pnpm -C app build`; `cargo fmt -p echoless-audio-io -p echoless-core -p echoless-processors -p echoless-cli --check`; `(cd app/src-tauri && cargo fmt --check)`; `(cd vendor/sonora && cargo test -p sonora -p sonora-aec3 --locked)`; `(cd vendor/sonora && cargo clippy -p sonora -p sonora-aec3 --all-targets --locked -- -D warnings)`; `(cd vendor/sonora && cargo fmt -p sonora-agc2 -p sonora-aec3 --check)`; `pnpm -C app prepare:tauri-assets --require-localvqe-assets`; `pnpm -C app tauri build --debug --ci --bundles app`; `pnpm -C app smoke:tauri-bundle`. `cargo audit` was not rerun locally because `cargo-audit` is not installed here; CI installs it before the audit gate.
 - `cargo fmt --all --check` currently reaches `vendor/sonora`, which is documented as a read-only third-party fork and has pre-existing rustfmt drift. P0.0 used scoped formatting checks for first-party root packages and `app/src-tauri`.
 - Tauri clippy/build still reports the known `block v0.1.6` future-incompatibility note; CODE_AUDIT tracks that under later dependency governance rather than P0.0.
 - P0 was verified locally but the GitHub Actions matrix was not triggered; no push was performed.
