@@ -61,6 +61,10 @@ function ensureDir(dir) {
 
 function copyFile(src, dest) {
   ensureDir(path.dirname(dest));
+  if (path.resolve(src) === path.resolve(dest)) {
+    console.log(`asset: ${path.relative(repoRoot, dest)} already present`);
+    return;
+  }
   fs.copyFileSync(src, dest);
   if (process.platform !== "win32") {
     const mode = fs.statSync(src).mode;
@@ -143,6 +147,7 @@ function prepareProcessTapHelper() {
 
 function prepareLocalvqeModel() {
   const modelName = "localvqe-v1.3-4.8M-f32.gguf";
+  const dest = path.join(srcTauriDir, "resources", "localvqe", "models", modelName);
   const candidates = [
     process.env.ECHOLESS_LOCALVQE_MODEL,
     process.env.LOCALVQE_MODEL,
@@ -154,6 +159,7 @@ function prepareLocalvqeModel() {
           modelName,
         )
       : null,
+    dest,
   ].filter(Boolean);
 
   let model = candidates.find(existsFile) ?? null;
@@ -168,10 +174,7 @@ function prepareLocalvqeModel() {
     return false;
   }
 
-  copyFile(
-    model,
-    path.join(srcTauriDir, "resources", "localvqe", "models", modelName),
-  );
+  copyFile(model, dest);
   return true;
 }
 
@@ -189,11 +192,15 @@ function companionLibrary(file) {
 }
 
 function prepareLocalvqeNative() {
+  const nativeDir = path.join(srcTauriDir, "resources", "localvqe", "native");
   let library = existsFile(process.env.ECHOLESS_LOCALVQE_LIBRARY)
     ? process.env.ECHOLESS_LOCALVQE_LIBRARY
     : null;
   if (!library && process.env.RUNNER_TEMP) {
     library = firstFile(process.env.RUNNER_TEMP, localvqeLibraryName);
+  }
+  if (!library) {
+    library = firstFile(nativeDir, localvqeLibraryName);
   }
 
   if (!library) {
@@ -203,7 +210,6 @@ function prepareLocalvqeNative() {
     return false;
   }
 
-  const nativeDir = path.join(srcTauriDir, "resources", "localvqe", "native");
   ensureDir(nativeDir);
   for (const file of fs.readdirSync(path.dirname(library)).map((name) => path.join(path.dirname(library), name))) {
     if (existsFile(file) && companionLibrary(file)) {
