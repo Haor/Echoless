@@ -15,6 +15,7 @@ pub use echoless_processors::{
 };
 
 pub const MAX_NEAR_DELAY_MS: u32 = 500;
+pub const MAX_INITIAL_DELAY_MS: u32 = 500;
 pub const MIN_OUTPUT_LEVEL: u32 = 0;
 pub const MAX_OUTPUT_LEVEL: u32 = 100;
 pub const DEFAULT_OUTPUT_LEVEL: u32 = 50;

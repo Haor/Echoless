@@ -70,6 +70,12 @@ impl ProcessorChain {
         }
     }
 
+    pub fn set_stream_delay_ms(&mut self, ms: i32) {
+        for node in self.nodes.iter_mut() {
+            node.set_stream_delay_ms(ms);
+        }
+    }
+
     /// near = 原始 mic(base_rate,mono);far = 真实 ref(base_rate,base_far_channels);
     /// out = 链尾(base_rate,mono),长度应 = frames。
     pub fn process(
@@ -392,6 +398,43 @@ mod tests {
         fn reset(&mut self) {}
     }
 
+    struct CaptureDelayNode {
+        delays: Arc<Mutex<Vec<i32>>>,
+    }
+
+    impl EchoProcessor for CaptureDelayNode {
+        fn name(&self) -> &'static str {
+            "capture_delay"
+        }
+
+        fn io_spec(&self) -> IoSpec {
+            IoSpec {
+                sample_rate: 48_000,
+                near_channels: 1,
+                far_channels: 1,
+                algorithmic_latency_ms: 0.0,
+            }
+        }
+
+        fn configure(&mut self, _params: &toml::Table) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn set_stream_delay_ms(&mut self, ms: i32) {
+            self.delays.lock().unwrap().push(ms);
+        }
+
+        fn process(&mut self, near: &[f32], _far: &[f32], out: &mut [f32], _frames: u32) {
+            copy_or_zero(near, out);
+        }
+
+        fn stats(&self) -> ProcessorStats {
+            ProcessorStats::empty("capture_delay")
+        }
+
+        fn reset(&mut self) {}
+    }
+
     #[test]
     fn chain_resamples_through_16k_node_and_preserves_output_length() {
         let mut chain = ProcessorChain::new(48_000, 1);
@@ -494,6 +537,20 @@ mod tests {
         let output = adapter.adapt(&[0.25, -0.5]);
 
         assert_eq!(output, &[0.25, 0.25, -0.5, -0.5]);
+    }
+
+    #[test]
+    fn chain_forwards_stream_delay_to_nodes() {
+        let delays = Arc::new(Mutex::new(Vec::new()));
+        let mut chain = ProcessorChain::new(48_000, 1);
+        chain.push(Box::new(CaptureDelayNode {
+            delays: delays.clone(),
+        }));
+
+        chain.set_stream_delay_ms(25);
+        chain.set_stream_delay_ms(0);
+
+        assert_eq!(*delays.lock().unwrap(), vec![25, 0]);
     }
 
     fn capacity_signature(chain: &ProcessorChain) -> Vec<usize> {

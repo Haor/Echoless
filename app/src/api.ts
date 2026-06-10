@@ -168,6 +168,11 @@ export function setNearDelayMs(nearDelayMs: number): Promise<void> {
     JSON.stringify({ cmd: "set_near_delay_ms", near_delay_ms: nearDelayMs }),
   );
 }
+export function setInitialDelayMs(initialDelayMs: number): Promise<void> {
+  return sendRunControl(
+    JSON.stringify({ cmd: "set_initial_delay_ms", initial_delay_ms: initialDelayMs }),
+  );
+}
 
 // 订阅 run 的事件流(started + status 都走这个通道)。返回取消订阅函数。
 export function onRunEvent(cb: (e: RunEvent) => void): Promise<UnlistenFn> {

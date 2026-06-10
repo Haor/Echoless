@@ -17,6 +17,7 @@ import {
   openPath,
   openUrl,
   requestSystemAudio,
+  setInitialDelayMs,
   setNearDelayMs,
   setOutputLevel,
   startDiagnostics,
@@ -71,6 +72,7 @@ const REQUIRED_RUN_CONTROLS = [
   "stop_diagnostics",
   "set_output_level",
   "set_near_delay_ms",
+  "set_initial_delay_ms",
 ];
 
 // 系统设置 › 隐私与安全性(系统音频录制权限在此开启;具体面板随 macOS 版本)。
@@ -275,6 +277,9 @@ export default function App() {
           }
           // 实时 near_delay 变更回执:值由前端驱动,下一条 status 会带同样读数。
           if (ev.type === "near_delay_changed") {
+            return;
+          }
+          if (ev.type === "initial_delay_changed") {
             return;
           }
           // 诊断录制收尾:writer 已 finalize 文件。仅「录满 max_seconds」时
@@ -573,8 +578,8 @@ export default function App() {
     await start();
   }
 
-  // 运行中改配置 → 重启 runtime 应用新值(后端契约要求)。
-  // 成功路径不动 powerOn,避免状态框/开关跟着 scramble(各管各的)。
+  // Applies changes that still require rebuilding the sidecar runtime.
+  // Hot controls bypass this path to avoid an audio dropout.
   async function applyChange(next: Override) {
     if (!powerOnRef.current) return;
     setBusy(true);
@@ -619,6 +624,21 @@ export default function App() {
     paramsRef.current = np; // 同步更新 ref:探测后自动恢复引擎时能立刻读到新 initial_delay_ms
     paramsByKind.current[kind] = np;
     setParams(np);
+    if (kind === "sonora_aec3" && key === "initial_delay_ms") {
+      if (powerOnRef.current) {
+        if (!hasRunControl("set_initial_delay_ms")) {
+          reportMissingRunControl("set_initial_delay_ms");
+          return;
+        }
+        const delayMs = hotInitialDelayValue(val);
+        if (delayMs == null) {
+          setErr("initial_delay_ms must be a finite number");
+          return;
+        }
+        setInitialDelayMs(delayMs).catch((e) => setErr(String(e)));
+      }
+      return;
+    }
     applyChange({ params: np });
   }
   // 选 LocalVQE 模型(清单常驻):原子地切到 localvqe 引擎并设 model,避免把 model 写到当前引擎上。
@@ -639,6 +659,12 @@ export default function App() {
   function isNearDelayOnlyPatch(patch: Partial<PipelineCfg>): boolean {
     const keys = Object.keys(patch);
     return keys.length === 1 && keys[0] === "near_delay_ms";
+  }
+  function hotInitialDelayValue(value: unknown): number | null {
+    if (value == null || value === "") return 0;
+    const delayMs = Number(value);
+    if (!Number.isFinite(delayMs)) return null;
+    return Math.round(delayMs);
   }
   // 改管线项。near_delay_ms 可运行中热控;采样率/帧长/参考声道仍需重启。
   function changePipeline(patch: Partial<PipelineCfg>) {

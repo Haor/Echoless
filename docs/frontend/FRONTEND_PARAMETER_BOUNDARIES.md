@@ -62,7 +62,7 @@ Open Design / HTML prototype 只能作为视觉原型,不能作为配置 contrac
 | `ns_level` | `low` | 仅在 `ns=true` 时有效;可选值只能是 `low`、`moderate`、`high`、`veryhigh`。UI 可显示 "very high",但提交值必须是 `veryhigh`。 |
 | `sample_rate` | `48000` | 这是管线采样率,首版建议锁定或放高级设置。RTX AEC 必须是 `48000`;AEC3 推荐 `48000`;不要把 `44.1k`/`96k` 作为普通推荐项。真实设备不是 48k 时由后端 I/O 重采样处理。 |
 | `frame_ms` | `10` | 首版建议锁定或放高级设置。RTX AEC 必须是 `10`;AEC3 推荐 `10`;不要把 `20ms` 作为普通推荐项。 |
-| `near_delay_ms` | macOS `25`,其他平台 `0` | 高级/校准项。范围 `0..500`;主动延迟侦测只有在推荐值大于 0 时才写入。 |
+| `near_delay_ms` | macOS `25`,其他平台 `0` | 高级/校准项。范围 `0..500`;运行中可热控。主动延迟侦测只有在推荐值大于 0 时才写入。 |
 
 ### 高级设置
 
@@ -71,7 +71,7 @@ Open Design / HTML prototype 只能作为视觉原型,不能作为配置 contrac
 | 参数 | 默认 | 边界 |
 |---|---:|---|
 | `agc` | `false` | 保真优先默认关闭;可能造成音量泵动或双讲忽大忽小。 |
-| `initial_delay_ms` | null | AEC3 初始延迟 hint;运行时仍会动态估计回声对齐。 |
+| `initial_delay_ms` | null | AEC3 初始延迟 hint;范围 `0..500`;运行中可热控。运行时仍会动态估计回声对齐。 |
 | `tail_ms` | null | AEC3 echo tail 长度;最小值 4。 |
 | `delay_num_filters` | null | AEC3 延迟搜索窗;最小值 1。 |
 | `linear_stable_echo_path` | `false` | AEC3 高级调参项。 |
@@ -86,12 +86,13 @@ reference 与 mic 的相对到达时间。完整调用、
 
 - 顶层 `near_delay_ms`: 仅当 `recommended_near_delay_ms > 0` 且测量稳定时使用该值。
   `recommended_near_delay_ms = 0` 表示不需要主动 near 延迟,只展示诊断信息。macOS 默认是
-  `25ms`;Windows/Linux 默认是 `0ms`。
+  `25ms`;Windows/Linux 默认是 `0ms`。运行中的手动修改可热控;probe 本身仍需要暂停主
+  runtime,因为它要独占设备播放蜂鸣和录制。
 
 可以显示但不要默认自动改:
 
 - AEC3 `initial_delay_ms`: 可把 `max(0, event_lag_mean_ms + recommended_near_delay_ms)`
-  作为高级 hint,但 AEC3 本身会动态估计,默认不需要写。
+  作为高级 hint,但 AEC3 本身会动态估计,默认不需要写。若用户手动调整,运行中可热控。
 - AEC3 `delay_num_filters`: 只有多次 probe 都显示延迟非常稳定、且后续实测需要降低 CPU/收敛范围时才考虑。
 
 不能由这次侦测推导:

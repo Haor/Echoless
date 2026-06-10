@@ -3,8 +3,8 @@ use serde_json::json;
 
 use crate::cli::ProcessorsArgs;
 use echoless_core::{
-    default_near_delay_ms, default_output_level, MAX_NEAR_DELAY_MS, MAX_OUTPUT_LEVEL,
-    MIN_OUTPUT_LEVEL, OUTPUT_LEVEL_CURVE_EXPONENT, OUTPUT_LEVEL_MAX_BOOST_DB,
+    default_near_delay_ms, default_output_level, MAX_INITIAL_DELAY_MS, MAX_NEAR_DELAY_MS,
+    MAX_OUTPUT_LEVEL, MIN_OUTPUT_LEVEL, OUTPUT_LEVEL_CURVE_EXPONENT, OUTPUT_LEVEL_MAX_BOOST_DB,
     OUTPUT_LEVEL_MAX_GAIN, UNITY_OUTPUT_LEVEL,
 };
 use echoless_processors::registry;
@@ -99,6 +99,8 @@ fn processor_manifest() -> serde_json::Value {
                     "initial_delay_ms": {
                         "type": "number",
                         "default": null,
+                        "min": 0,
+                        "max": MAX_INITIAL_DELAY_MS,
                         "advanced": true
                     },
                     "tail_ms": {
@@ -194,6 +196,11 @@ mod tests {
         assert_eq!(
             aec3["params"]["reference_channels"]["values"],
             json!(["mono", "stereo"])
+        );
+        assert_eq!(aec3["params"]["initial_delay_ms"]["min"], json!(0));
+        assert_eq!(
+            aec3["params"]["initial_delay_ms"]["max"],
+            json!(MAX_INITIAL_DELAY_MS)
         );
         assert_eq!(
             manifest["pipeline"]["params"]["near_delay_ms"]["default"],

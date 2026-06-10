@@ -64,7 +64,7 @@ pub struct SonoraAec3 {
     #[cfg(feature = "sonora-engine")]
     inner: Inner,
     #[cfg(feature = "sonora-engine")]
-    delay_applied: bool,
+    stream_delay_pending: bool,
 }
 
 impl SonoraAec3 {
@@ -74,7 +74,7 @@ impl SonoraAec3 {
             #[cfg(feature = "sonora-engine")]
             inner: Inner::new(&tuning),
             #[cfg(feature = "sonora-engine")]
-            delay_applied: false,
+            stream_delay_pending: false,
             tuning,
             initial_delay_ms: 0,
             last: ProcessorStats::empty("sonora_aec3"),
@@ -132,7 +132,7 @@ impl EchoProcessor for SonoraAec3 {
         #[cfg(feature = "sonora-engine")]
         {
             self.inner = Inner::new(&self.tuning);
-            self.delay_applied = false;
+            self.stream_delay_pending = self.initial_delay_ms > 0;
         }
         Ok(())
     }
@@ -140,7 +140,7 @@ impl EchoProcessor for SonoraAec3 {
         self.initial_delay_ms = ms;
         #[cfg(feature = "sonora-engine")]
         {
-            self.delay_applied = false;
+            self.stream_delay_pending = true;
         }
     }
     fn process(&mut self, near: &[f32], far: &[f32], out: &mut [f32], frames: u32) {
@@ -161,7 +161,7 @@ impl EchoProcessor for SonoraAec3 {
         #[cfg(feature = "sonora-engine")]
         {
             self.inner = Inner::new(&self.tuning);
-            self.delay_applied = false;
+            self.stream_delay_pending = self.initial_delay_ms > 0;
         }
     }
 }
@@ -287,7 +287,7 @@ impl SonoraAec3 {
     fn process_sonora(&mut self, near: &[f32], far: &[f32], out: &mut [f32], frames: usize) {
         let mut runtime_error_count = self.last.runtime_error_count;
         let mut last_backend_error = self.last.last_backend_error.clone();
-        if !self.delay_applied && self.initial_delay_ms > 0 {
+        if self.stream_delay_pending {
             if let Err(err) = self.inner.apm.set_stream_delay_ms(self.initial_delay_ms) {
                 record_backend_error(
                     &mut runtime_error_count,
@@ -296,7 +296,7 @@ impl SonoraAec3 {
                     err,
                 );
             }
-            self.delay_applied = true;
+            self.stream_delay_pending = false;
         }
 
         let mut i = 0;

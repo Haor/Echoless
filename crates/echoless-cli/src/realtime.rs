@@ -473,7 +473,7 @@ fn process_loop<M, R, O>(
             RuntimeControlContext {
                 diagnostic: &mut diagnostic,
                 stats: stats.as_mut(),
-                chain: &chain,
+                chain: &mut chain,
                 sample_rate: runtime.sample_rate,
                 reference_channels: runtime.reference_channels as u16,
                 frame_ms: runtime.frame_ms,

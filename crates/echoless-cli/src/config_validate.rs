@@ -5,7 +5,8 @@ use clap::{Args, Subcommand};
 use serde_json::json;
 
 use echoless_core::{
-    PipelineConfig, ReferenceChannels, MAX_NEAR_DELAY_MS, MAX_OUTPUT_LEVEL, MIN_OUTPUT_LEVEL,
+    PipelineConfig, ReferenceChannels, MAX_INITIAL_DELAY_MS, MAX_NEAR_DELAY_MS, MAX_OUTPUT_LEVEL,
+    MIN_OUTPUT_LEVEL,
 };
 use echoless_processors::{registry, NodeConfig};
 
@@ -349,7 +350,14 @@ fn validate_sonora_node(base: &str, params: &toml::Table, errors: &mut Vec<Confi
     expect_bool(params, base, "ns", errors);
     expect_bool(params, base, "agc", errors);
     expect_bool(params, base, "linear_stable_echo_path", errors);
-    expect_i64(params, base, "initial_delay_ms", errors);
+    expect_i64_range(
+        params,
+        base,
+        "initial_delay_ms",
+        0,
+        i64::from(MAX_INITIAL_DELAY_MS),
+        errors,
+    );
     expect_i64_min(params, base, "tail_ms", 4, errors);
     expect_i64_min(params, base, "delay_num_filters", 1, errors);
     expect_string_one_of(
@@ -513,6 +521,29 @@ fn expect_i64_min(
             Some(_) => errors.push(ConfigValidationError::new(
                 format!("{base}.{key}"),
                 format!("{key} must be >= {min}"),
+            )),
+            None => errors.push(ConfigValidationError::new(
+                format!("{base}.{key}"),
+                format!("{key} must be an integer"),
+            )),
+        }
+    }
+}
+
+fn expect_i64_range(
+    params: &toml::Table,
+    base: &str,
+    key: &str,
+    min: i64,
+    max: i64,
+    errors: &mut Vec<ConfigValidationError>,
+) {
+    if let Some(value) = params.get(key) {
+        match value.as_integer() {
+            Some(v) if (min..=max).contains(&v) => {}
+            Some(_) => errors.push(ConfigValidationError::new(
+                format!("{base}.{key}"),
+                format!("{key} must be between {min} and {max}"),
             )),
             None => errors.push(ConfigValidationError::new(
                 format!("{base}.{key}"),
@@ -706,6 +737,10 @@ mod tests {
     #[test]
     fn config_validation_reports_frontend_safe_errors() {
         let mut bad_params = toml::Table::new();
+        bad_params.insert(
+            "initial_delay_ms".into(),
+            toml::Value::Integer(i64::from(MAX_INITIAL_DELAY_MS) + 1),
+        );
         bad_params.insert("tail_ms".into(), toml::Value::Integer(1));
         bad_params.insert("ns".into(), toml::Value::String("yes".into()));
         let cfg = PipelineConfig {
@@ -737,6 +772,7 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert!(paths.contains(&"chain[0].tail_ms"));
+        assert!(paths.contains(&"chain[0].initial_delay_ms"));
         assert!(paths.contains(&"chain[0].ns"));
         assert!(paths.contains(&"chain[2].kind"));
         assert!(paths.contains(&"sample_rate"));

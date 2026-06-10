@@ -6,7 +6,10 @@ use std::thread;
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 
-use echoless_core::{output_level_gain_db, DiagnosticsConfig, MAX_NEAR_DELAY_MS, MAX_OUTPUT_LEVEL};
+use echoless_core::{
+    output_level_gain_db, DiagnosticsConfig, MAX_INITIAL_DELAY_MS, MAX_NEAR_DELAY_MS,
+    MAX_OUTPUT_LEVEL,
+};
 
 use super::diagnostics::{DiagnosticDoneReason, DiagnosticRecorder, DiagnosticRecorderConfig};
 use super::stats::RealtimeStats;
@@ -21,6 +24,7 @@ pub(super) enum RuntimeControlCommand {
     StopDiagnostics,
     SetOutputLevel(u32),
     SetNearDelayMs(u32),
+    SetInitialDelayMs(i32),
 }
 
 pub(super) const SUPPORTED_RUNTIME_CONTROLS: &[&str] = &[
@@ -28,6 +32,7 @@ pub(super) const SUPPORTED_RUNTIME_CONTROLS: &[&str] = &[
     "stop_diagnostics",
     "set_output_level",
     "set_near_delay_ms",
+    "set_initial_delay_ms",
 ];
 
 #[derive(Debug)]
@@ -117,6 +122,16 @@ fn parse_runtime_control_command(line: &str) -> Result<RuntimeControlCommand> {
             }
             Ok(RuntimeControlCommand::SetNearDelayMs(delay_ms as u32))
         }
+        "set_initial_delay_ms" => {
+            let delay_ms = value
+                .get("initial_delay_ms")
+                .and_then(Value::as_i64)
+                .context("set_initial_delay_ms requires integer field `initial_delay_ms`")?;
+            if delay_ms < 0 || delay_ms > i64::from(MAX_INITIAL_DELAY_MS) {
+                bail!("set_initial_delay_ms `initial_delay_ms` must be between 0 and {MAX_INITIAL_DELAY_MS}");
+            }
+            Ok(RuntimeControlCommand::SetInitialDelayMs(delay_ms as i32))
+        }
         other => bail!("unknown runtime control command `{other}`"),
     }
 }
@@ -124,7 +139,7 @@ fn parse_runtime_control_command(line: &str) -> Result<RuntimeControlCommand> {
 pub(super) struct RuntimeControlContext<'a> {
     pub(super) diagnostic: &'a mut Option<DiagnosticRecorder>,
     pub(super) stats: Option<&'a mut RealtimeStats>,
-    pub(super) chain: &'a ProcessorChain,
+    pub(super) chain: &'a mut ProcessorChain,
     pub(super) sample_rate: u32,
     pub(super) reference_channels: u16,
     pub(super) frame_ms: u32,
@@ -177,7 +192,7 @@ pub(super) fn handle_runtime_controls(
 struct RuntimeControlCommandContext<'a> {
     diagnostic: &'a mut Option<DiagnosticRecorder>,
     stats: Option<&'a mut RealtimeStats>,
-    chain: &'a ProcessorChain,
+    chain: &'a mut ProcessorChain,
     sample_rate: u32,
     reference_channels: u16,
     frame_ms: u32,
@@ -329,6 +344,16 @@ fn handle_runtime_control_command(
                 }),
             );
         }
+        RuntimeControlCommand::SetInitialDelayMs(delay_ms) => {
+            ctx.chain.set_stream_delay_ms(delay_ms);
+            emit_runtime_json(
+                ctx.status_json,
+                json!({
+                    "type": "initial_delay_changed",
+                    "initial_delay_ms": delay_ms,
+                }),
+            );
+        }
     }
 }
 
@@ -419,6 +444,28 @@ mod tests {
             parse_runtime_control_command(r#"{"cmd":"set_near_delay_ms","near_delay_ms":501}"#)
                 .unwrap_err();
         assert!(err.to_string().contains("<= 500"));
+
+        let set_initial =
+            parse_runtime_control_command(r#"{"cmd":"set_initial_delay_ms","initial_delay_ms":8}"#)
+                .unwrap();
+        assert!(matches!(
+            set_initial,
+            RuntimeControlCommand::SetInitialDelayMs(8)
+        ));
+
+        let clear_initial =
+            parse_runtime_control_command(r#"{"cmd":"set_initial_delay_ms","initial_delay_ms":0}"#)
+                .unwrap();
+        assert!(matches!(
+            clear_initial,
+            RuntimeControlCommand::SetInitialDelayMs(0)
+        ));
+
+        let err = parse_runtime_control_command(
+            r#"{"cmd":"set_initial_delay_ms","initial_delay_ms":501}"#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("between 0 and 500"));
     }
 
     #[test]
@@ -427,6 +474,7 @@ mod tests {
         assert!(SUPPORTED_RUNTIME_CONTROLS.contains(&"stop_diagnostics"));
         assert!(SUPPORTED_RUNTIME_CONTROLS.contains(&"set_output_level"));
         assert!(SUPPORTED_RUNTIME_CONTROLS.contains(&"set_near_delay_ms"));
+        assert!(SUPPORTED_RUNTIME_CONTROLS.contains(&"set_initial_delay_ms"));
     }
 
     #[test]

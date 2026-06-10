@@ -481,7 +481,8 @@ echoless config validate --config config.toml --json
 
 产品自更新和运行时参数变更是两件事:
 
-- 运行时参数变更:设备、backend、模型、AEC 参数变化时重启 runtime。
+- 运行时参数变更:设备、backend、模型和多数 AEC 参数变化时重启 runtime;`output_level`、
+  `near_delay_ms`、AEC3 `initial_delay_ms` 走 runtime hot control。
 - 产品自更新:GUI app、`echoless` sidecar、模型/runtime assets、配置 schema 升级。
 
 前端可预留的后端抽象:
@@ -546,4 +547,4 @@ UpdateService
 - `echoless offline` 继续可用。
 - RTX AEC JSON doctor 继续可用。
 - 前端能识别 Windows/macOS 虚拟音频设备安装状态。
-- 配置变化后重启 runtime 能应用新配置。
+- restart-required 配置变化后重启 runtime 能应用新配置;hot-control 参数可运行中生效。

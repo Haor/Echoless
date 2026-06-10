@@ -170,6 +170,10 @@ export interface NearDelayChangedEvent {
   near_delay_ms: number;
   near_delay_samples: number;
 }
+export interface InitialDelayChangedEvent {
+  type: "initial_delay_changed";
+  initial_delay_ms: number;
+}
 
 // run --status-json 在音频流启动后先发的一条事件。
 export interface StartedEvent {
@@ -203,7 +207,8 @@ export type RunEvent =
   | DiagnosticsStoppingEvent
   | ControlErrorEvent
   | OutputLevelChangedEvent
-  | NearDelayChangedEvent;
+  | NearDelayChangedEvent
+  | InitialDelayChangedEvent;
 
 // ---- doctor audio --json(虚拟声卡检测) ----
 export interface DoctorCandidate {
