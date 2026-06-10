@@ -340,12 +340,20 @@ where
 {
     let (sender, receiver) = channel();
     thread::spawn(move || {
-        for line in BufReader::new(reader)
-            .lines()
-            .map_while(std::result::Result::ok)
-        {
-            if sender.send(line).is_err() {
-                break;
+        // 显式处理读取错误(ROB-4):不要用 lines().flatten()/map_while(Result::ok)
+        // 静默吞掉 IO 错误/非 UTF-8 行——出错时打印一条 stderr 警告再停止读取,
+        // 以免 probe 子进程输出异常时无声丢失。
+        for line in BufReader::new(reader).lines() {
+            match line {
+                Ok(line) => {
+                    if sender.send(line).is_err() {
+                        break;
+                    }
+                }
+                Err(err) => {
+                    eprintln!("probe-delay: 读取子进程输出失败,停止读取: {err}");
+                    break;
+                }
             }
         }
     });
