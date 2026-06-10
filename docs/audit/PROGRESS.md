@@ -22,7 +22,7 @@ Last updated: 2026-06-10
 | QUAL-1 | P3 realtime | todo | - | Stateful node-boundary resampling and stereo preservation |
 | QUAL-3 | P3 realtime | todo | - | LocalVQE streaming buffer allocation/drain fix |
 | QUAL-4 | P3 realtime | todo | - | Online waveform bucket aggregation |
-| ROB-2 | P3 realtime | todo | - | Diagnostic writer finish/join hardening |
+| ROB-2 | P3 realtime | done | `e937bdf` | `request_finish` now preserves the diagnostic writer `JoinHandle` so `Drop` can join and finalize WAV/stats files; regression test covers stop-triggered finalize without leftover `.part` files. Verified with `cargo test -p echoless-cli diagnostic_recorder --locked`; `cargo fmt -p echoless-cli --check`; `cargo clippy --workspace --all-targets --locked -- -D warnings`; `cargo test --workspace --locked` |
 | SON-1 | P3 realtime | todo | - | Surface sonora process errors |
 | SEC-1 | P4 hardening | todo | - | Validate `open_url` scheme or use opener plugin |
 | SEC-2 | P4 hardening | todo | - | Prefer embedded nvafx pin hashes for default release |
