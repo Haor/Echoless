@@ -17,6 +17,7 @@ import {
   openPath,
   openUrl,
   requestSystemAudio,
+  setNearDelayMs,
   setOutputLevel,
   startDiagnostics,
   startRun,
@@ -69,6 +70,7 @@ const REQUIRED_RUN_CONTROLS = [
   "start_diagnostics",
   "stop_diagnostics",
   "set_output_level",
+  "set_near_delay_ms",
 ];
 
 // 系统设置 › 隐私与安全性(系统音频录制权限在此开启;具体面板随 macOS 版本)。
@@ -269,6 +271,10 @@ export default function App() {
           // 实时音量变更回执:值由前端驱动,无需处理(否则会被当成 status 读到一堆 undefined,
           // 让 MIC/REF/OUT 表瞬间跳成「—」)。
           if (ev.type === "output_level_changed") {
+            return;
+          }
+          // 实时 near_delay 变更回执:值由前端驱动,下一条 status 会带同样读数。
+          if (ev.type === "near_delay_changed") {
             return;
           }
           // 诊断录制收尾:writer 已 finalize 文件。仅「录满 max_seconds」时
@@ -627,11 +633,28 @@ export default function App() {
     setParams(np);
     applyChange({ kind: "localvqe", params: np });
   }
-  // 改管线项(Advanced:sample_rate / frame_ms / reference_channels)。
+  function hotNearDelayValue(next: PipelineCfg): number {
+    return next.near_delay_ms ?? (platform === "macos" ? 25 : 0);
+  }
+  function isNearDelayOnlyPatch(patch: Partial<PipelineCfg>): boolean {
+    const keys = Object.keys(patch);
+    return keys.length === 1 && keys[0] === "near_delay_ms";
+  }
+  // 改管线项。near_delay_ms 可运行中热控;采样率/帧长/参考声道仍需重启。
   function changePipeline(patch: Partial<PipelineCfg>) {
     const npl = { ...pipelineRef.current, ...patch };
     pipelineRef.current = npl; // 同步更新 ref:探测后自动恢复引擎时能立刻读到新 near_delay
     setPipeline(npl);
+    if (isNearDelayOnlyPatch(patch)) {
+      if (powerOnRef.current) {
+        if (!hasRunControl("set_near_delay_ms")) {
+          reportMissingRunControl("set_near_delay_ms");
+          return;
+        }
+        setNearDelayMs(hotNearDelayValue(npl)).catch((e) => setErr(String(e)));
+      }
+      return;
+    }
     applyChange({ pipeline: npl });
   }
   // 输出音量(滚轮 0-100):落进 pipeline(下次 start 用);运行中走 stdin 实时控制,

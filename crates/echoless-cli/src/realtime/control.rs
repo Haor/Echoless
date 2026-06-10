@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::io::BufRead;
 use std::sync::mpsc::{channel, Receiver, TryRecvError};
 use std::thread;
@@ -5,7 +6,7 @@ use std::thread;
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 
-use echoless_core::{output_level_gain_db, DiagnosticsConfig, MAX_OUTPUT_LEVEL};
+use echoless_core::{output_level_gain_db, DiagnosticsConfig, MAX_NEAR_DELAY_MS, MAX_OUTPUT_LEVEL};
 
 use super::diagnostics::{DiagnosticDoneReason, DiagnosticRecorder, DiagnosticRecorderConfig};
 use super::stats::RealtimeStats;
@@ -19,10 +20,15 @@ pub(super) enum RuntimeControlCommand {
     },
     StopDiagnostics,
     SetOutputLevel(u32),
+    SetNearDelayMs(u32),
 }
 
-pub(super) const SUPPORTED_RUNTIME_CONTROLS: &[&str] =
-    &["start_diagnostics", "stop_diagnostics", "set_output_level"];
+pub(super) const SUPPORTED_RUNTIME_CONTROLS: &[&str] = &[
+    "start_diagnostics",
+    "stop_diagnostics",
+    "set_output_level",
+    "set_near_delay_ms",
+];
 
 #[derive(Debug)]
 pub(super) enum RuntimeControlEvent {
@@ -101,6 +107,16 @@ fn parse_runtime_control_command(line: &str) -> Result<RuntimeControlCommand> {
             }
             Ok(RuntimeControlCommand::SetOutputLevel(level as u32))
         }
+        "set_near_delay_ms" => {
+            let delay_ms = value
+                .get("near_delay_ms")
+                .and_then(Value::as_u64)
+                .context("set_near_delay_ms requires integer field `near_delay_ms`")?;
+            if delay_ms > u64::from(MAX_NEAR_DELAY_MS) {
+                bail!("set_near_delay_ms `near_delay_ms` must be <= {MAX_NEAR_DELAY_MS}");
+            }
+            Ok(RuntimeControlCommand::SetNearDelayMs(delay_ms as u32))
+        }
         other => bail!("unknown runtime control command `{other}`"),
     }
 }
@@ -112,7 +128,9 @@ pub(super) struct RuntimeControlContext<'a> {
     pub(super) sample_rate: u32,
     pub(super) reference_channels: u16,
     pub(super) frame_ms: u32,
-    pub(super) near_delay_ms: u32,
+    pub(super) near_delay_ms: &'a mut u32,
+    pub(super) near_delay_samples: &'a mut usize,
+    pub(super) near_delay_buffer: &'a mut VecDeque<f32>,
     pub(super) output_level: &'a mut u32,
     pub(super) status_json: bool,
 }
@@ -137,6 +155,8 @@ pub(super) fn handle_runtime_controls(
                         reference_channels: ctx.reference_channels,
                         frame_ms: ctx.frame_ms,
                         near_delay_ms: ctx.near_delay_ms,
+                        near_delay_samples: ctx.near_delay_samples,
+                        near_delay_buffer: ctx.near_delay_buffer,
                         output_level: ctx.output_level,
                         status_json: ctx.status_json,
                     },
@@ -161,7 +181,9 @@ struct RuntimeControlCommandContext<'a> {
     sample_rate: u32,
     reference_channels: u16,
     frame_ms: u32,
-    near_delay_ms: u32,
+    near_delay_ms: &'a mut u32,
+    near_delay_samples: &'a mut usize,
+    near_delay_buffer: &'a mut VecDeque<f32>,
     output_level: &'a mut u32,
     status_json: bool,
 }
@@ -215,7 +237,7 @@ fn handle_runtime_control_command(
                 sample_rate: ctx.sample_rate,
                 reference_channels: ctx.reference_channels,
                 frame_ms: ctx.frame_ms,
-                near_delay_ms: ctx.near_delay_ms,
+                near_delay_ms: *ctx.near_delay_ms,
                 output_level: *ctx.output_level,
                 node_stats: &node_stats,
                 status_json: ctx.status_json,
@@ -290,6 +312,40 @@ fn handle_runtime_control_command(
                 }),
             );
         }
+        RuntimeControlCommand::SetNearDelayMs(delay_ms) => {
+            let delay_samples = delay_ms_to_samples(delay_ms, ctx.sample_rate);
+            retune_near_delay_buffer(ctx.near_delay_buffer, delay_samples);
+            *ctx.near_delay_ms = delay_ms;
+            *ctx.near_delay_samples = delay_samples;
+            if let Some(stats) = ctx.stats {
+                stats.set_near_delay_ms(delay_ms);
+            }
+            emit_runtime_json(
+                ctx.status_json,
+                json!({
+                    "type": "near_delay_changed",
+                    "near_delay_ms": delay_ms,
+                    "near_delay_samples": delay_samples,
+                }),
+            );
+        }
+    }
+}
+
+pub(super) fn delay_ms_to_samples(ms: u32, sample_rate: u32) -> usize {
+    ((u64::from(ms) * u64::from(sample_rate) + 500) / 1000) as usize
+}
+
+fn retune_near_delay_buffer(delay: &mut VecDeque<f32>, target_samples: usize) {
+    if target_samples == 0 {
+        delay.clear();
+        return;
+    }
+    while delay.len() > target_samples {
+        let _ = delay.pop_front();
+    }
+    while delay.len() < target_samples {
+        delay.push_front(0.0);
     }
 }
 
@@ -350,6 +406,19 @@ mod tests {
         let err =
             parse_runtime_control_command(r#"{"cmd":"set_output_level","level":101}"#).unwrap_err();
         assert!(err.to_string().contains("<= 100"));
+
+        let set_delay =
+            parse_runtime_control_command(r#"{"cmd":"set_near_delay_ms","near_delay_ms":25}"#)
+                .unwrap();
+        assert!(matches!(
+            set_delay,
+            RuntimeControlCommand::SetNearDelayMs(25)
+        ));
+
+        let err =
+            parse_runtime_control_command(r#"{"cmd":"set_near_delay_ms","near_delay_ms":501}"#)
+                .unwrap_err();
+        assert!(err.to_string().contains("<= 500"));
     }
 
     #[test]
@@ -357,5 +426,23 @@ mod tests {
         assert!(SUPPORTED_RUNTIME_CONTROLS.contains(&"start_diagnostics"));
         assert!(SUPPORTED_RUNTIME_CONTROLS.contains(&"stop_diagnostics"));
         assert!(SUPPORTED_RUNTIME_CONTROLS.contains(&"set_output_level"));
+        assert!(SUPPORTED_RUNTIME_CONTROLS.contains(&"set_near_delay_ms"));
+    }
+
+    #[test]
+    fn near_delay_buffer_retune_expands_trims_and_clears() {
+        let mut delay = VecDeque::from(vec![1.0, 2.0]);
+
+        retune_near_delay_buffer(&mut delay, 4);
+        assert_eq!(
+            delay.iter().copied().collect::<Vec<_>>(),
+            vec![0.0, 0.0, 1.0, 2.0]
+        );
+
+        retune_near_delay_buffer(&mut delay, 2);
+        assert_eq!(delay.iter().copied().collect::<Vec<_>>(), vec![1.0, 2.0]);
+
+        retune_near_delay_buffer(&mut delay, 0);
+        assert!(delay.is_empty());
     }
 }

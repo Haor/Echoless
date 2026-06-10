@@ -1045,8 +1045,8 @@ fn start_run(
     Ok(())
 }
 
-/// 向运行中的 echoless run 子进程 stdin 写一行 JSON 控制命令
-/// (start_diagnostics / stop_diagnostics)。就地起停录制,不重启音频管线。
+/// 向运行中的 echoless run 子进程 stdin 写一行 JSON 控制命令。
+/// 具体能力由 CLI started.supported_controls 上报。
 #[tauri::command]
 fn send_run_control(state: State<RunState>, line: String) -> Result<(), String> {
     let mut guard = run_state_guard(&state);

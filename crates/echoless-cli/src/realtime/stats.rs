@@ -256,6 +256,10 @@ impl RealtimeStats {
         self.output_gain_db = output_level_gain_db(output_level);
     }
 
+    pub(super) fn set_near_delay_ms(&mut self, near_delay_ms: u32) {
+        self.near_delay_ms = near_delay_ms;
+    }
+
     pub(super) fn observe(&mut self, sample: &StatsSample<'_>) {
         self.total_frames += sample.frame_size as u64;
         self.near_samples += sample.near.len() as u64;
@@ -515,5 +519,9 @@ mod tests {
         let value = stats.status_value(stats.started + Duration::from_secs(2));
         assert_eq!(value["output_level"], 0);
         assert!(value["output_gain_db"].is_null());
+
+        stats.set_near_delay_ms(40);
+        let value = stats.status_value(stats.started + Duration::from_secs(3));
+        assert_eq!(value["near_delay_ms"], 40);
     }
 }

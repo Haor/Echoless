@@ -139,7 +139,7 @@ export function stopRun(): Promise<void> {
   return invoke<void>("stop_run");
 }
 
-// 向运行中的子进程 stdin 写一行 JSON 控制命令(就地起停录制,不重启 run)。
+// 向运行中的子进程 stdin 写一行 JSON 控制命令。具体能力以 started.supported_controls 为准。
 export function sendRunControl(line: string): Promise<void> {
   return invoke<void>("send_run_control", { line });
 }
@@ -161,6 +161,12 @@ export function stopDiagnostics(): Promise<void> {
 // 运行中实时改输出电平(0-100),逐 buffer 生效、零掉音。仅在 run 存活时调用。
 export function setOutputLevel(level: number): Promise<void> {
   return sendRunControl(JSON.stringify({ cmd: "set_output_level", level }));
+}
+// 运行中实时改近端对齐延迟(ms),只调整处理线程里的 delay buffer,不重启 run。
+export function setNearDelayMs(nearDelayMs: number): Promise<void> {
+  return sendRunControl(
+    JSON.stringify({ cmd: "set_near_delay_ms", near_delay_ms: nearDelayMs }),
+  );
 }
 
 // 订阅 run 的事件流(started + status 都走这个通道)。返回取消订阅函数。

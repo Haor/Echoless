@@ -51,8 +51,8 @@ const DESC: Record<string, { en: string; zh: string }> = {
     zh: "默认关闭,避免音量泵动(忽大忽小)。",
   },
   near_delay_ms: {
-    en: "Top-level near/mic alignment delay. Empty = backend default (macOS 25, others 0). Probe fills the measured value (incl. 8ms AEC safety).",
-    zh: "顶层近端对齐延迟。留空走后端默认(macOS 25 / 其它 0)。侦测会填入实测值(含 8ms AEC 安全余量)。",
+    en: "Top-level near/mic alignment delay. Empty = backend default (macOS 25, others 0). Applies live while running.",
+    zh: "顶层近端对齐延迟。留空走后端默认(macOS 25 / 其它 0)。运行中可实时生效。",
   },
   initial_delay_ms: {
     en: "Initial stream delay hint; runtime still estimates dynamically. On macOS the probe writes it: 8ms when a near delay is applied, else the measured echo delay.",

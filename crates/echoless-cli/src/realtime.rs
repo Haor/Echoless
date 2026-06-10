@@ -35,8 +35,8 @@ use ringbuf::HeapRb;
 use serde_json::json;
 
 use self::control::{
-    handle_runtime_controls, spawn_control_reader, RuntimeControlContext, RuntimeControlEvent,
-    SUPPORTED_RUNTIME_CONTROLS,
+    delay_ms_to_samples, handle_runtime_controls, spawn_control_reader, RuntimeControlContext,
+    RuntimeControlEvent, SUPPORTED_RUNTIME_CONTROLS,
 };
 pub use self::devices::{
     audio_doctor_json_with_options, devices_json, print_devices, AudioDoctorOptions,
@@ -477,7 +477,9 @@ fn process_loop<M, R, O>(
                 sample_rate: runtime.sample_rate,
                 reference_channels: runtime.reference_channels as u16,
                 frame_ms: runtime.frame_ms,
-                near_delay_ms: runtime.near_delay_ms,
+                near_delay_ms: &mut runtime.near_delay_ms,
+                near_delay_samples: &mut runtime.near_delay_samples,
+                near_delay_buffer: &mut near_delay,
                 output_level: &mut runtime.output_level,
                 status_json: runtime.status_json,
             },
@@ -564,10 +566,6 @@ fn skip_stale<C: Consumer<Item = f32>>(consumer: &mut C, frame_size: usize) -> u
     } else {
         0
     }
-}
-
-fn delay_ms_to_samples(ms: u32, sample_rate: u32) -> usize {
-    ((u64::from(ms) * u64::from(sample_rate) + 500) / 1000) as usize
 }
 
 fn apply_near_delay(

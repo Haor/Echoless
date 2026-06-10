@@ -164,6 +164,12 @@ export interface OutputLevelChangedEvent {
   output_level: number;
   output_gain_db: number | null;
 }
+// set_near_delay_ms 实时生效后的回执(值由前端驱动,UI 仅忽略)。
+export interface NearDelayChangedEvent {
+  type: "near_delay_changed";
+  near_delay_ms: number;
+  near_delay_samples: number;
+}
 
 // run --status-json 在音频流启动后先发的一条事件。
 export interface StartedEvent {
@@ -173,6 +179,8 @@ export interface StartedEvent {
   backend: string;
   sample_rate: number;
   frame_ms: number;
+  near_delay_ms?: number;
+  near_delay_samples?: number;
   reference_channels: string;
   mic_device_sample_rate?: number | null;
   output_device_sample_rate?: number | null;
@@ -194,7 +202,8 @@ export type RunEvent =
   | DiagnosticsStartedEvent
   | DiagnosticsStoppingEvent
   | ControlErrorEvent
-  | OutputLevelChangedEvent;
+  | OutputLevelChangedEvent
+  | NearDelayChangedEvent;
 
 // ---- doctor audio --json(虚拟声卡检测) ----
 export interface DoctorCandidate {
