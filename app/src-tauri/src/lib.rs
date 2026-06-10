@@ -10,7 +10,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
@@ -31,6 +31,14 @@ struct RunChild {
 }
 /// 当前运行中的 echoless run 子进程(同一时刻最多一个)。
 struct RunState(Mutex<Option<RunChild>>);
+
+fn run_state_guard(state: &RunState) -> MutexGuard<'_, Option<RunChild>> {
+    // Keep the GUI backend recoverable after an unrelated panic while holding the run lock.
+    state
+        .0
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 const TAURI_TARGET_TRIPLE: &str = env!("TAURI_ENV_TARGET_TRIPLE");
 const JSON_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
@@ -920,7 +928,7 @@ fn start_run(
     toml_text: String,
     stats_interval_ms: Option<u32>,
 ) -> Result<(), String> {
-    let mut guard = state.0.lock().unwrap();
+    let mut guard = run_state_guard(&state);
     // 幂等启动:若有残留子进程(并发重启 / 上次崩溃遗留),先标记 intentional 再杀掉,
     // 避免 "already running" 卡死。其 reader 退出会被判定为 intentional,不报崩溃。
     if let Some(mut prev) = guard.take() {
@@ -982,12 +990,23 @@ fn start_run(
     let stop_reader = stopping.clone();
     let reader_config_path = path.clone();
     std::thread::spawn(move || {
-        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-            if line.trim().is_empty() {
-                continue;
-            }
-            if let Ok(v) = serde_json::from_str::<Value>(&line) {
-                let _ = app_out.emit("echoless://status", v);
+        for line in BufReader::new(stdout).lines() {
+            match line {
+                Ok(line) => {
+                    if line.trim().is_empty() {
+                        continue;
+                    }
+                    if let Ok(v) = serde_json::from_str::<Value>(&line) {
+                        let _ = app_out.emit("echoless://status", v);
+                    }
+                }
+                Err(err) => {
+                    let _ = app_out.emit(
+                        "echoless://log",
+                        format!("failed to read echoless stdout: {err}"),
+                    );
+                    break;
+                }
             }
         }
         // 退出归因:intentional=主动停/重启(本 flag 已被置 true);否则=子进程自己退出(崩溃)。
@@ -1002,8 +1021,19 @@ fn start_run(
     // stderr = 人类日志
     let app_err = app.clone();
     std::thread::spawn(move || {
-        for line in BufReader::new(stderr).lines().map_while(Result::ok) {
-            let _ = app_err.emit("echoless://log", line);
+        for line in BufReader::new(stderr).lines() {
+            match line {
+                Ok(line) => {
+                    let _ = app_err.emit("echoless://log", line);
+                }
+                Err(err) => {
+                    let _ = app_err.emit(
+                        "echoless://log",
+                        format!("failed to read echoless stderr: {err}"),
+                    );
+                    break;
+                }
+            }
         }
     });
 
@@ -1019,7 +1049,7 @@ fn start_run(
 /// (start_diagnostics / stop_diagnostics)。就地起停录制,不重启音频管线。
 #[tauri::command]
 fn send_run_control(state: State<RunState>, line: String) -> Result<(), String> {
-    let mut guard = state.0.lock().unwrap();
+    let mut guard = run_state_guard(&state);
     let rc = guard.as_mut().ok_or("not running")?;
     let stdin = rc.child.stdin.as_mut().ok_or("no stdin")?;
     stdin
@@ -1032,7 +1062,7 @@ fn send_run_control(state: State<RunState>, line: String) -> Result<(), String> 
 
 #[tauri::command]
 fn stop_run(state: State<RunState>) -> Result<(), String> {
-    let mut guard = state.0.lock().unwrap();
+    let mut guard = run_state_guard(&state);
     if let Some(mut rc) = guard.take() {
         rc.stopping.store(true, Ordering::SeqCst); // 主动停 → 其 reader 退出判为 intentional
         let _ = rc.child.kill();
@@ -1108,8 +1138,8 @@ pub fn run() {
             if let WindowEvent::CloseRequested { .. } = event {
                 let child_opt = {
                     let state = window.state::<RunState>();
-                    let taken = state.0.lock().ok().and_then(|mut g| g.take());
-                    taken
+                    let mut guard = run_state_guard(&state);
+                    guard.take()
                 };
                 if let Some(mut rc) = child_opt {
                     rc.stopping.store(true, Ordering::SeqCst);
@@ -1161,6 +1191,19 @@ mod tests {
 
         assert!(err.contains("timed out"), "{err}");
         assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn run_state_guard_recovers_poisoned_lock() {
+        let state = RunState(Mutex::new(None));
+        let _ = std::panic::catch_unwind(|| {
+            let _guard = state.0.lock().expect("test lock should start healthy");
+            panic!("poison run state");
+        });
+
+        assert!(state.0.is_poisoned());
+        let guard = run_state_guard(&state);
+        assert!(guard.is_none());
     }
 
     #[test]
