@@ -79,23 +79,57 @@ pub(super) fn estimate_user_latency_ms(
 
 const STATUS_WAVE_BUCKETS: usize = 64;
 
-fn peak_waveform(samples: &[f32], buckets: usize) -> Vec<f32> {
-    if buckets == 0 {
-        return Vec::new();
+struct WaveBuckets {
+    peaks: Vec<f32>,
+    bucket_index: usize,
+    frames_in_bucket: usize,
+    frames_per_bucket: usize,
+}
+
+impl WaveBuckets {
+    fn new(buckets: usize, sample_rate: u32, interval: Duration) -> Self {
+        let expected_frames = (sample_rate as f64 * interval.as_secs_f64()).ceil() as usize;
+        let frames_per_bucket = (expected_frames
+            .max(1)
+            .saturating_add(buckets.saturating_sub(1))
+            / buckets.max(1))
+        .max(1);
+        Self {
+            peaks: vec![0.0; buckets],
+            bucket_index: 0,
+            frames_in_bucket: 0,
+            frames_per_bucket,
+        }
     }
-    if samples.is_empty() {
-        return vec![0.0; buckets];
-    }
-    (0..buckets)
-        .map(|bucket| {
-            let start = bucket * samples.len() / buckets;
-            let end = ((bucket + 1) * samples.len() / buckets).max(start + 1);
-            samples[start..end.min(samples.len())]
+
+    fn observe_samples(&mut self, samples: &[f32], frame_size: usize) {
+        if self.peaks.is_empty() || samples.is_empty() {
+            return;
+        }
+        let channels = samples.len().checked_div(frame_size).unwrap_or(1).max(1);
+        for frame in samples.chunks(channels) {
+            let peak = frame
                 .iter()
                 .map(|sample| sample.abs().min(1.0))
-                .fold(0.0, f32::max)
-        })
-        .collect()
+                .fold(0.0, f32::max);
+            self.peaks[self.bucket_index] = self.peaks[self.bucket_index].max(peak);
+            self.frames_in_bucket += 1;
+            if self.frames_in_bucket >= self.frames_per_bucket {
+                self.frames_in_bucket = 0;
+                self.bucket_index = (self.bucket_index + 1).min(self.peaks.len() - 1);
+            }
+        }
+    }
+
+    fn values(&self) -> Vec<f32> {
+        self.peaks.clone()
+    }
+
+    fn reset(&mut self) {
+        self.peaks.fill(0.0);
+        self.bucket_index = 0;
+        self.frames_in_bucket = 0;
+    }
 }
 
 pub(super) struct RealtimeStats {
@@ -120,9 +154,9 @@ pub(super) struct RealtimeStats {
     near_sq: f64,
     far_sq: f64,
     out_sq: f64,
-    near_wave_samples: Vec<f32>,
-    far_wave_samples: Vec<f32>,
-    out_wave_samples: Vec<f32>,
+    near_wave: WaveBuckets,
+    far_wave: WaveBuckets,
+    out_wave: WaveBuckets,
     mic_q: usize,
     ref_q: usize,
     out_q: usize,
@@ -177,9 +211,9 @@ impl RealtimeStats {
             near_sq: 0.0,
             far_sq: 0.0,
             out_sq: 0.0,
-            near_wave_samples: Vec::new(),
-            far_wave_samples: Vec::new(),
-            out_wave_samples: Vec::new(),
+            near_wave: WaveBuckets::new(STATUS_WAVE_BUCKETS, config.sample_rate, config.interval),
+            far_wave: WaveBuckets::new(STATUS_WAVE_BUCKETS, config.sample_rate, config.interval),
+            out_wave: WaveBuckets::new(STATUS_WAVE_BUCKETS, config.sample_rate, config.interval),
             mic_q: 0,
             ref_q: 0,
             out_q: 0,
@@ -219,9 +253,10 @@ impl RealtimeStats {
         self.near_sq += sum_squares(sample.near);
         self.far_sq += sum_squares(sample.far);
         self.out_sq += sum_squares(sample.out);
-        self.near_wave_samples.extend_from_slice(sample.near);
-        self.far_wave_samples.extend_from_slice(sample.far);
-        self.out_wave_samples.extend_from_slice(sample.out);
+        self.near_wave
+            .observe_samples(sample.near, sample.frame_size);
+        self.far_wave.observe_samples(sample.far, sample.frame_size);
+        self.out_wave.observe_samples(sample.out, sample.frame_size);
         self.mic_q = sample.mic_q;
         self.ref_q = sample.ref_q;
         self.out_q = sample.out_q;
@@ -259,9 +294,9 @@ impl RealtimeStats {
         self.near_sq = 0.0;
         self.far_sq = 0.0;
         self.out_sq = 0.0;
-        self.near_wave_samples.clear();
-        self.far_wave_samples.clear();
-        self.out_wave_samples.clear();
+        self.near_wave.reset();
+        self.far_wave.reset();
+        self.out_wave.reset();
         self.mic_input_drops = 0;
         self.ref_input_drops = 0;
         self.stale_drops = 0;
@@ -346,9 +381,9 @@ impl RealtimeStats {
             "mic_dbfs": rms_dbfs(self.near_sq, self.near_samples),
             "ref_dbfs": rms_dbfs(self.far_sq, self.far_samples),
             "out_dbfs": rms_dbfs(self.out_sq, self.out_samples),
-            "mic_wave": peak_waveform(&self.near_wave_samples, STATUS_WAVE_BUCKETS),
-            "ref_wave": peak_waveform(&self.far_wave_samples, STATUS_WAVE_BUCKETS),
-            "out_wave": peak_waveform(&self.out_wave_samples, STATUS_WAVE_BUCKETS),
+            "mic_wave": self.near_wave.values(),
+            "ref_wave": self.far_wave.values(),
+            "out_wave": self.out_wave.values(),
             "mic_q_samples": self.mic_q,
             "ref_q_samples": self.ref_q,
             "out_q_samples": self.out_q,
@@ -406,11 +441,14 @@ mod tests {
     }
 
     #[test]
-    fn peak_waveform_returns_fixed_peak_buckets() {
-        let wave = peak_waveform(&[0.0, -0.5, 0.25, 1.5], 2);
+    fn wave_buckets_accumulate_peaks_without_sample_cache() {
+        let mut buckets = WaveBuckets::new(2, 4, Duration::from_secs(1));
 
-        assert_eq!(wave, vec![0.5, 1.0]);
-        assert_eq!(peak_waveform(&[], 3), vec![0.0, 0.0, 0.0]);
+        buckets.observe_samples(&[0.0, -0.5, 0.25, 1.5], 4);
+
+        assert_eq!(buckets.values(), vec![0.5, 1.0]);
+        buckets.reset();
+        assert_eq!(buckets.values(), vec![0.0, 0.0]);
     }
 
     #[test]
