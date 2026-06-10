@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, ensure, Context, Result};
 use clap::{Args, Subcommand};
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -310,8 +310,8 @@ fn cmd_nvafx_download_install(a: NvafxDownloadInstallArgs) -> Result<()> {
     let common_url = nvafx_release_asset_url(tag, NVAFX_COMMON_RUNTIME_ASSET);
     let model_url = nvafx_release_asset_url(tag, &model_asset);
     let common_expected =
-        expected_sha256_for_release_asset(tag, &release_sha256sums, NVAFX_COMMON_RUNTIME_ASSET);
-    let model_expected = expected_sha256_for_release_asset(tag, &release_sha256sums, &model_asset);
+        expected_sha256_for_release_asset(tag, &release_sha256sums, NVAFX_COMMON_RUNTIME_ASSET)?;
+    let model_expected = expected_sha256_for_release_asset(tag, &release_sha256sums, &model_asset)?;
 
     download_release_asset(
         &common_url,
@@ -538,12 +538,20 @@ fn expected_sha256_for_release_asset(
     tag: &str,
     release_sha256sums: &HashMap<String, String>,
     asset: &str,
-) -> Option<String> {
-    release_sha256sums.get(asset).cloned().or_else(|| {
-        (tag == DEFAULT_NVAFX_RELEASE_TAG)
-            .then(|| expected_sha256_for_asset(Path::new(asset)).map(str::to_string))
-            .flatten()
-    })
+) -> Result<Option<String>> {
+    if tag == DEFAULT_NVAFX_RELEASE_TAG {
+        if let Some(embedded) = expected_sha256_for_asset(Path::new(asset)) {
+            if let Some(release) = release_sha256sums.get(asset) {
+                ensure!(
+                    release.eq_ignore_ascii_case(embedded),
+                    "GitHub release SHA256SUMS.txt 与内置 pin 不一致: asset={asset}, release={release}, embedded={embedded}"
+                );
+            }
+            return Ok(Some(embedded.to_string()));
+        }
+    }
+
+    Ok(release_sha256sums.get(asset).cloned())
 }
 
 fn download_release_asset(
@@ -875,21 +883,35 @@ mod tests {
     }
 
     #[test]
-    fn expected_sha256_prefers_release_sums_then_default_embedded_values() {
+    fn expected_sha256_prefers_default_embedded_values_and_rejects_mismatch() {
         let mut sums = HashMap::new();
         sums.insert(
             NVAFX_COMMON_RUNTIME_ASSET.to_string(),
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
         );
 
+        let err = expected_sha256_for_release_asset(
+            DEFAULT_NVAFX_RELEASE_TAG,
+            &sums,
+            NVAFX_COMMON_RUNTIME_ASSET,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("SHA256SUMS.txt 与内置 pin 不一致"), "{err}");
+
+        sums.insert(
+            NVAFX_COMMON_RUNTIME_ASSET.to_string(),
+            "dcacac954b7973ae18369b252d13f24b973b10114d00e5293eab0713601c7bcb".to_string(),
+        );
         assert_eq!(
             expected_sha256_for_release_asset(
                 DEFAULT_NVAFX_RELEASE_TAG,
                 &sums,
                 NVAFX_COMMON_RUNTIME_ASSET
             )
+            .unwrap()
             .as_deref(),
-            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+            Some("dcacac954b7973ae18369b252d13f24b973b10114d00e5293eab0713601c7bcb")
         );
         assert_eq!(
             expected_sha256_for_release_asset(
@@ -897,6 +919,7 @@ mod tests {
                 &HashMap::new(),
                 NVAFX_COMMON_RUNTIME_ASSET,
             )
+            .unwrap()
             .as_deref(),
             Some("dcacac954b7973ae18369b252d13f24b973b10114d00e5293eab0713601c7bcb")
         );
@@ -905,8 +928,16 @@ mod tests {
                 "custom-tag",
                 &HashMap::new(),
                 NVAFX_COMMON_RUNTIME_ASSET
-            ),
+            )
+            .unwrap(),
             None
+        );
+
+        assert_eq!(
+            expected_sha256_for_release_asset("custom-tag", &sums, NVAFX_COMMON_RUNTIME_ASSET)
+                .unwrap()
+                .as_deref(),
+            Some("dcacac954b7973ae18369b252d13f24b973b10114d00e5293eab0713601c7bcb")
         );
     }
 }
