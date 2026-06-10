@@ -57,17 +57,6 @@ impl Aec3Tuning {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn aec3_default_ns_level_matches_frontend_contract() {
-        let tuning = Aec3Tuning::default();
-        assert_eq!(tuning.ns_level, "low");
-    }
-}
-
 pub struct SonoraAec3 {
     tuning: Aec3Tuning,
     initial_delay_ms: i32,
@@ -370,5 +359,16 @@ impl SonoraAec3 {
             selected_gpu_arch: None,
             last_backend_error: None,
         };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn aec3_default_ns_level_matches_frontend_contract() {
+        let tuning = Aec3Tuning::default();
+        assert_eq!(tuning.ns_level, "low");
     }
 }

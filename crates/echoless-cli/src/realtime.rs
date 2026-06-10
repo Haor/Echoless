@@ -408,16 +408,16 @@ pub fn run_with_options(cfg: &PipelineConfig, options: RuntimeOptions) -> Result
     let algorithmic_latency_ms = chain.total_latency_ms();
     let initial_node_stats = chain.stats();
     let stats_interval = options.stats_interval_ms.map(Duration::from_millis);
-    let diagnostic = DiagnosticRecorder::new(
-        &cfg.diagnostics,
+    let diagnostic = DiagnosticRecorder::new(DiagnosticRecorderConfig {
+        cfg: &cfg.diagnostics,
         sample_rate,
-        reference_channels as u16,
-        cfg.frame_ms,
-        cfg.near_delay_ms,
-        cfg.output_level,
-        &initial_node_stats,
-        options.status_json,
-    )?;
+        reference_channels: reference_channels as u16,
+        frame_ms: cfg.frame_ms,
+        near_delay_ms: cfg.near_delay_ms,
+        output_level: cfg.output_level,
+        node_stats: &initial_node_stats,
+        status_json: options.status_json,
+    })?;
     let diagnostics_session_dir = diagnostic
         .as_ref()
         .map(|recorder| recorder.dir.display().to_string());
@@ -604,18 +604,18 @@ fn process_loop<M, R, O>(
     let mut out = vec![0.0f32; frame_size];
     let mut near_delay = VecDeque::from(vec![0.0f32; runtime.near_delay_samples]);
     let mut stats = runtime.stats_interval.map(|interval| {
-        RealtimeStats::new(
+        RealtimeStats::new(RealtimeStatsConfig {
             interval,
-            runtime.sample_rate,
-            runtime.frame_ms,
-            runtime.near_delay_ms,
-            runtime.output_level,
-            runtime.backend.clone(),
-            runtime.algorithmic_latency_ms,
-            runtime.status_json,
-            runtime.diagnostics_session_dir.clone(),
-            runtime.diagnostics_status.clone(),
-        )
+            sample_rate: runtime.sample_rate,
+            frame_ms: runtime.frame_ms,
+            near_delay_ms: runtime.near_delay_ms,
+            output_level: runtime.output_level,
+            backend: runtime.backend.clone(),
+            algorithmic_latency_ms: runtime.algorithmic_latency_ms,
+            status_json: runtime.status_json,
+            diagnostics_session_dir: runtime.diagnostics_session_dir.clone(),
+            diagnostics_status: runtime.diagnostics_status.clone(),
+        })
     });
     let mut diagnostic = runtime.diagnostic;
     let mut control = runtime.control;
@@ -623,15 +623,17 @@ fn process_loop<M, R, O>(
     while running.load(Ordering::SeqCst) {
         handle_runtime_controls(
             &mut control,
-            &mut diagnostic,
-            stats.as_mut(),
-            &chain,
-            runtime.sample_rate,
-            runtime.reference_channels as u16,
-            runtime.frame_ms,
-            runtime.near_delay_ms,
-            &mut runtime.output_level,
-            runtime.status_json,
+            RuntimeControlContext {
+                diagnostic: &mut diagnostic,
+                stats: stats.as_mut(),
+                chain: &chain,
+                sample_rate: runtime.sample_rate,
+                reference_channels: runtime.reference_channels as u16,
+                frame_ms: runtime.frame_ms,
+                near_delay_ms: runtime.near_delay_ms,
+                output_level: &mut runtime.output_level,
+                status_json: runtime.status_json,
+            },
         );
 
         if mic_cons.occupied_len() < frame_size {
@@ -705,38 +707,45 @@ fn process_loop<M, R, O>(
     }
 }
 
-fn handle_runtime_controls(
-    control: &mut Option<Receiver<RuntimeControlEvent>>,
-    diagnostic: &mut Option<DiagnosticRecorder>,
-    stats: Option<&mut RealtimeStats>,
-    chain: &ProcessorChain,
+struct RuntimeControlContext<'a> {
+    diagnostic: &'a mut Option<DiagnosticRecorder>,
+    stats: Option<&'a mut RealtimeStats>,
+    chain: &'a ProcessorChain,
     sample_rate: u32,
     reference_channels: u16,
     frame_ms: u32,
     near_delay_ms: u32,
-    output_level: &mut u32,
+    output_level: &'a mut u32,
     status_json: bool,
+}
+
+fn handle_runtime_controls(
+    control: &mut Option<Receiver<RuntimeControlEvent>>,
+    mut ctx: RuntimeControlContext<'_>,
 ) {
     let Some(receiver) = control.as_mut() else {
         return;
     };
-    let mut stats = stats;
     loop {
         match receiver.try_recv() {
-            Ok(RuntimeControlEvent::Command(command)) => handle_runtime_control_command(
-                command,
-                diagnostic,
-                stats.as_mut().map(|stats| &mut **stats),
-                chain,
-                sample_rate,
-                reference_channels,
-                frame_ms,
-                near_delay_ms,
-                output_level,
-                status_json,
-            ),
+            Ok(RuntimeControlEvent::Command(command)) => {
+                handle_runtime_control_command(
+                    command,
+                    RuntimeControlCommandContext {
+                        diagnostic: ctx.diagnostic,
+                        stats: ctx.stats.as_deref_mut(),
+                        chain: ctx.chain,
+                        sample_rate: ctx.sample_rate,
+                        reference_channels: ctx.reference_channels,
+                        frame_ms: ctx.frame_ms,
+                        near_delay_ms: ctx.near_delay_ms,
+                        output_level: ctx.output_level,
+                        status_json: ctx.status_json,
+                    },
+                );
+            }
             Ok(RuntimeControlEvent::Error(message)) => {
-                emit_control_error(status_json, None, message);
+                emit_control_error(ctx.status_json, None, message);
             }
             Err(TryRecvError::Empty) => break,
             Err(TryRecvError::Disconnected) => {
@@ -747,17 +756,21 @@ fn handle_runtime_controls(
     }
 }
 
-fn handle_runtime_control_command(
-    command: RuntimeControlCommand,
-    diagnostic: &mut Option<DiagnosticRecorder>,
-    stats: Option<&mut RealtimeStats>,
-    chain: &ProcessorChain,
+struct RuntimeControlCommandContext<'a> {
+    diagnostic: &'a mut Option<DiagnosticRecorder>,
+    stats: Option<&'a mut RealtimeStats>,
+    chain: &'a ProcessorChain,
     sample_rate: u32,
     reference_channels: u16,
     frame_ms: u32,
     near_delay_ms: u32,
-    output_level: &mut u32,
+    output_level: &'a mut u32,
     status_json: bool,
+}
+
+fn handle_runtime_control_command(
+    command: RuntimeControlCommand,
+    ctx: RuntimeControlCommandContext<'_>,
 ) {
     match command {
         RuntimeControlCommand::StartDiagnostics {
@@ -766,7 +779,7 @@ fn handle_runtime_control_command(
         } => {
             if record_dir.trim().is_empty() {
                 emit_control_error(
-                    status_json,
+                    ctx.status_json,
                     Some("start_diagnostics"),
                     "record_dir must not be empty",
                 );
@@ -774,49 +787,50 @@ fn handle_runtime_control_command(
             }
             if matches!(max_seconds, Some(0)) {
                 emit_control_error(
-                    status_json,
+                    ctx.status_json,
                     Some("start_diagnostics"),
                     "max_seconds must be greater than 0",
                 );
                 return;
             }
-            if diagnostic
+            if ctx
+                .diagnostic
                 .as_ref()
                 .is_some_and(DiagnosticRecorder::is_recording)
             {
                 emit_control_error(
-                    status_json,
+                    ctx.status_json,
                     Some("start_diagnostics"),
                     "diagnostics is already recording",
                 );
                 return;
             }
 
-            let _previous = diagnostic.take();
+            let _previous = ctx.diagnostic.take();
             let cfg = DiagnosticsConfig {
                 record_dir: Some(record_dir),
                 max_seconds,
             };
-            let node_stats = chain.stats();
-            match DiagnosticRecorder::new(
-                &cfg,
-                sample_rate,
-                reference_channels,
-                frame_ms,
-                near_delay_ms,
-                *output_level,
-                &node_stats,
-                status_json,
-            ) {
+            let node_stats = ctx.chain.stats();
+            match DiagnosticRecorder::new(DiagnosticRecorderConfig {
+                cfg: &cfg,
+                sample_rate: ctx.sample_rate,
+                reference_channels: ctx.reference_channels,
+                frame_ms: ctx.frame_ms,
+                near_delay_ms: ctx.near_delay_ms,
+                output_level: *ctx.output_level,
+                node_stats: &node_stats,
+                status_json: ctx.status_json,
+            }) {
                 Ok(Some(recorder)) => {
                     let session_dir = recorder.session_dir_string();
                     let status = recorder.status_handle();
-                    if let Some(stats) = stats {
+                    if let Some(stats) = ctx.stats {
                         stats.set_diagnostics(Some(session_dir.clone()), Some(status));
                     }
-                    *diagnostic = Some(recorder);
+                    *ctx.diagnostic = Some(recorder);
                     emit_runtime_json(
-                        status_json,
+                        ctx.status_json,
                         json!({
                             "type": "diagnostics_started",
                             "session_dir": session_dir,
@@ -826,21 +840,21 @@ fn handle_runtime_control_command(
                     );
                 }
                 Ok(None) => emit_control_error(
-                    status_json,
+                    ctx.status_json,
                     Some("start_diagnostics"),
                     "record_dir did not create a diagnostics recorder",
                 ),
                 Err(err) => emit_control_error(
-                    status_json,
+                    ctx.status_json,
                     Some("start_diagnostics"),
                     format!("failed to start diagnostics: {err:#}"),
                 ),
             }
         }
         RuntimeControlCommand::StopDiagnostics => {
-            let Some(recorder) = diagnostic.as_mut() else {
+            let Some(recorder) = ctx.diagnostic.as_mut() else {
                 emit_control_error(
-                    status_json,
+                    ctx.status_json,
                     Some("stop_diagnostics"),
                     "diagnostics is not active",
                 );
@@ -848,7 +862,7 @@ fn handle_runtime_control_command(
             };
             if !recorder.is_recording() {
                 emit_control_error(
-                    status_json,
+                    ctx.status_json,
                     Some("stop_diagnostics"),
                     "diagnostics is already stopping or stopped",
                 );
@@ -857,7 +871,7 @@ fn handle_runtime_control_command(
             let session_dir = recorder.session_dir_string();
             recorder.request_finish(DiagnosticDoneReason::Stopped);
             emit_runtime_json(
-                status_json,
+                ctx.status_json,
                 json!({
                     "type": "diagnostics_stopping",
                     "session_dir": session_dir,
@@ -865,12 +879,12 @@ fn handle_runtime_control_command(
             );
         }
         RuntimeControlCommand::SetOutputLevel(level) => {
-            *output_level = level;
-            if let Some(stats) = stats {
+            *ctx.output_level = level;
+            if let Some(stats) = ctx.stats {
                 stats.set_output_level(level);
             }
             emit_runtime_json(
-                status_json,
+                ctx.status_json,
                 json!({
                     "type": "output_level_changed",
                     "output_level": level,
@@ -1037,7 +1051,7 @@ impl DiagnosticDoneReason {
 }
 
 enum DiagnosticCommand {
-    Frame(DiagnosticFrame),
+    Frame(Box<DiagnosticFrame>),
     Finish(DiagnosticDoneReason),
 }
 
@@ -1100,18 +1114,21 @@ struct DiagnosticRecorder {
     status: DiagnosticsStatusHandle,
 }
 
+struct DiagnosticRecorderConfig<'a> {
+    cfg: &'a DiagnosticsConfig,
+    sample_rate: u32,
+    reference_channels: u16,
+    frame_ms: u32,
+    near_delay_ms: u32,
+    output_level: u32,
+    node_stats: &'a [ProcessorStats],
+    status_json: bool,
+}
+
 impl DiagnosticRecorder {
-    fn new(
-        cfg: &DiagnosticsConfig,
-        sample_rate: u32,
-        reference_channels: u16,
-        frame_ms: u32,
-        near_delay_ms: u32,
-        output_level: u32,
-        node_stats: &[ProcessorStats],
-        status_json: bool,
-    ) -> Result<Option<Self>> {
-        let Some(record_dir) = cfg
+    fn new(config: DiagnosticRecorderConfig<'_>) -> Result<Option<Self>> {
+        let Some(record_dir) = config
+            .cfg
             .record_dir
             .as_deref()
             .map(str::trim)
@@ -1125,28 +1142,29 @@ impl DiagnosticRecorder {
         let dir = make_session_dir(base)?;
         let spec = WavSpec {
             channels: 1,
-            sample_rate,
+            sample_rate: config.sample_rate,
             bits_per_sample: 32,
             sample_format: hound::SampleFormat::Float,
         };
         let ref_spec = WavSpec {
-            channels: reference_channels.max(1),
+            channels: config.reference_channels.max(1),
             ..spec
         };
-        let max_frames = cfg
+        let max_frames = config
+            .cfg
             .max_seconds
-            .map(|seconds| u64::from(seconds) * u64::from(sample_rate));
+            .map(|seconds| u64::from(seconds) * u64::from(config.sample_rate));
 
-        write_diagnostic_metadata(
-            &dir,
-            sample_rate,
-            frame_ms,
-            near_delay_ms,
-            output_level,
-            reference_channels,
+        write_diagnostic_metadata(DiagnosticMetadata {
+            dir: &dir,
+            sample_rate: config.sample_rate,
+            frame_ms: config.frame_ms,
+            near_delay_ms: config.near_delay_ms,
+            output_level: config.output_level,
+            reference_channels: config.reference_channels,
             max_frames,
-            node_stats,
-        )?;
+            node_stats: config.node_stats,
+        })?;
         let stats_part_path = dir.join("stats.csv.part");
         let mut stats = BufWriter::new(
             File::create(&stats_part_path)
@@ -1160,7 +1178,7 @@ impl DiagnosticRecorder {
         let mic_part_path = dir.join("mic.wav.part");
         let ref_part_path = dir.join("ref.wav.part");
         let out_part_path = dir.join("out.wav.part");
-        let status = DiagnosticsStatusHandle::new(sample_rate);
+        let status = DiagnosticsStatusHandle::new(config.sample_rate);
         let writer = DiagnosticWriter {
             dir: dir.clone(),
             mic: Some(WavWriter::create(&mic_part_path, spec)?),
@@ -1175,19 +1193,22 @@ impl DiagnosticRecorder {
             ref_path: dir.join("ref.wav"),
             out_path: dir.join("out.wav"),
             stats_path: dir.join("stats.csv"),
-            sample_rate,
-            frame_ms,
+            sample_rate: config.sample_rate,
+            frame_ms: config.frame_ms,
             max_frames,
             written_frames: 0,
             frame_index: 0,
-            human_to_stderr: status_json,
-            status_json,
+            human_to_stderr: config.status_json,
+            status_json: config.status_json,
             status: status.clone(),
         };
         let (sender, receiver) = sync_channel(DIAGNOSTIC_QUEUE_FRAMES);
         let writer = thread::spawn(move || writer.run(receiver));
 
-        print_human(status_json, format!("诊断录制目录: {}", dir.display()));
+        print_human(
+            config.status_json,
+            format!("诊断录制目录: {}", dir.display()),
+        );
         Ok(Some(Self {
             dir,
             sender: Some(sender),
@@ -1215,8 +1236,8 @@ impl DiagnosticRecorder {
         let Some(sender) = self.sender.as_ref() else {
             return Ok(false);
         };
-        match sender.try_send(DiagnosticCommand::Frame(DiagnosticFrame::from_sample(
-            sample,
+        match sender.try_send(DiagnosticCommand::Frame(Box::new(
+            DiagnosticFrame::from_sample(sample),
         ))) {
             Ok(()) => Ok(true),
             Err(TrySendError::Full(_)) => {
@@ -1378,9 +1399,9 @@ impl DiagnosticWriter {
         self.written_frames += frame.frame_size as u64;
         self.status.set_frames(self.written_frames);
 
-        Ok(!self
+        Ok(self
             .max_frames
-            .is_some_and(|max_frames| self.written_frames >= max_frames))
+            .is_none_or(|max_frames| self.written_frames < max_frames))
     }
 
     fn finish(&mut self, reason: DiagnosticDoneReason, ok_so_far: bool) {
@@ -1489,36 +1510,38 @@ fn make_session_dir(base: &Path) -> Result<PathBuf> {
     bail!("创建诊断 session 目录失败: {} 下重名过多", base.display())
 }
 
-fn write_diagnostic_metadata(
-    dir: &Path,
+struct DiagnosticMetadata<'a> {
+    dir: &'a Path,
     sample_rate: u32,
     frame_ms: u32,
     near_delay_ms: u32,
     output_level: u32,
     reference_channels: u16,
     max_frames: Option<u64>,
-    node_stats: &[ProcessorStats],
-) -> Result<()> {
+    node_stats: &'a [ProcessorStats],
+}
+
+fn write_diagnostic_metadata(metadata: DiagnosticMetadata<'_>) -> Result<()> {
     let mut file = BufWriter::new(
-        File::create(dir.join("metadata.txt"))
-            .with_context(|| format!("创建诊断 metadata.txt 失败: {}", dir.display()))?,
+        File::create(metadata.dir.join("metadata.txt"))
+            .with_context(|| format!("创建诊断 metadata.txt 失败: {}", metadata.dir.display()))?,
     );
     writeln!(file, "version={}", env!("CARGO_PKG_VERSION"))?;
-    writeln!(file, "sample_rate={sample_rate}")?;
-    writeln!(file, "frame_ms={frame_ms}")?;
-    writeln!(file, "near_delay_ms={near_delay_ms}")?;
-    writeln!(file, "output_level={output_level}")?;
-    match output_level_gain_db(output_level) {
+    writeln!(file, "sample_rate={}", metadata.sample_rate)?;
+    writeln!(file, "frame_ms={}", metadata.frame_ms)?;
+    writeln!(file, "near_delay_ms={}", metadata.near_delay_ms)?;
+    writeln!(file, "output_level={}", metadata.output_level)?;
+    match output_level_gain_db(metadata.output_level) {
         Some(gain_db) => writeln!(file, "output_gain_db={gain_db:.3}")?,
         None => writeln!(file, "output_gain_db=mute")?,
     }
-    writeln!(file, "reference_channels={reference_channels}")?;
-    if let Some(max_frames) = max_frames {
+    writeln!(file, "reference_channels={}", metadata.reference_channels)?;
+    if let Some(max_frames) = metadata.max_frames {
         writeln!(file, "max_frames={max_frames}")?;
     } else {
         writeln!(file, "max_frames=unbounded")?;
     }
-    for (index, node) in node_stats.iter().enumerate() {
+    for (index, node) in metadata.node_stats.iter().enumerate() {
         writeln!(file, "node.{index}.name={}", node.name)?;
         if let Some(arch) = &node.selected_gpu_arch {
             writeln!(file, "node.{index}.selected_gpu_arch={arch}")?;
@@ -1654,35 +1677,37 @@ struct RealtimeStats {
     node_last_error: Option<String>,
 }
 
+struct RealtimeStatsConfig {
+    interval: Duration,
+    sample_rate: u32,
+    frame_ms: u32,
+    near_delay_ms: u32,
+    output_level: u32,
+    backend: String,
+    algorithmic_latency_ms: f32,
+    status_json: bool,
+    diagnostics_session_dir: Option<String>,
+    diagnostics_status: Option<DiagnosticsStatusHandle>,
+}
+
 impl RealtimeStats {
-    fn new(
-        interval: Duration,
-        sample_rate: u32,
-        frame_ms: u32,
-        near_delay_ms: u32,
-        output_level: u32,
-        backend: String,
-        algorithmic_latency_ms: f32,
-        status_json: bool,
-        diagnostics_session_dir: Option<String>,
-        diagnostics_status: Option<DiagnosticsStatusHandle>,
-    ) -> Self {
+    fn new(config: RealtimeStatsConfig) -> Self {
         let now = Instant::now();
         Self {
-            interval,
+            interval: config.interval,
             started: now,
             last_print: now,
-            sample_rate,
-            frame_ms,
-            backend,
-            near_delay_ms,
-            output_level,
-            output_gain_db: output_level_gain_db(output_level),
+            sample_rate: config.sample_rate,
+            frame_ms: config.frame_ms,
+            backend: config.backend,
+            near_delay_ms: config.near_delay_ms,
+            output_level: config.output_level,
+            output_gain_db: output_level_gain_db(config.output_level),
             near_delay_buffered_samples: 0,
-            algorithmic_latency_ms,
-            status_json,
-            diagnostics_session_dir,
-            diagnostics_status,
+            algorithmic_latency_ms: config.algorithmic_latency_ms,
+            status_json: config.status_json,
+            diagnostics_session_dir: config.diagnostics_session_dir,
+            diagnostics_status: config.diagnostics_status,
             total_frames: 0,
             near_samples: 0,
             far_samples: 0,
@@ -2044,7 +2069,7 @@ fn pick_config(device: &Device, kind: DeviceKind, sample_rate: u32) -> Result<St
         .max_by(|a, b| a.cmp_default_heuristics(b))
     {
         return Ok(StreamConfigChoice::new(
-            exact.clone().with_sample_rate(sample_rate),
+            (*exact).with_sample_rate(sample_rate),
             sample_rate,
         ));
     }
@@ -3046,8 +3071,17 @@ mod tests {
             max_seconds: Some(1),
         };
         let node_stats = [ProcessorStats::empty("test")];
-        let mut recorder =
-            DiagnosticRecorder::new(&cfg, 48_000, 2, 10, 25, 75, &node_stats, false)?.unwrap();
+        let mut recorder = DiagnosticRecorder::new(DiagnosticRecorderConfig {
+            cfg: &cfg,
+            sample_rate: 48_000,
+            reference_channels: 2,
+            frame_ms: 10,
+            near_delay_ms: 25,
+            output_level: 75,
+            node_stats: &node_stats,
+            status_json: false,
+        })?
+        .unwrap();
         let dir = recorder.dir.clone();
         let near = [0.25f32, -0.25];
         let far = [0.1f32, -0.1, 0.2, -0.2];
@@ -3109,8 +3143,17 @@ mod tests {
             max_seconds: Some(1),
         };
         let node_stats = [ProcessorStats::empty("test")];
-        let mut recorder =
-            DiagnosticRecorder::new(&cfg, 2, 1, 1000, 0, 50, &node_stats, false)?.unwrap();
+        let mut recorder = DiagnosticRecorder::new(DiagnosticRecorderConfig {
+            cfg: &cfg,
+            sample_rate: 2,
+            reference_channels: 1,
+            frame_ms: 1000,
+            near_delay_ms: 0,
+            output_level: 50,
+            node_stats: &node_stats,
+            status_json: false,
+        })?
+        .unwrap();
         let dir = recorder.dir.clone();
         let status = recorder.status_handle();
         let near = [0.25f32, -0.25];
@@ -3173,8 +3216,17 @@ mod tests {
             max_seconds: None,
         };
         let node_stats = [ProcessorStats::empty("test")];
-        let mut recorder =
-            DiagnosticRecorder::new(&cfg, 48_000, 1, 10, 0, 50, &node_stats, false)?.unwrap();
+        let mut recorder = DiagnosticRecorder::new(DiagnosticRecorderConfig {
+            cfg: &cfg,
+            sample_rate: 48_000,
+            reference_channels: 1,
+            frame_ms: 10,
+            near_delay_ms: 0,
+            output_level: 50,
+            node_stats: &node_stats,
+            status_json: false,
+        })?
+        .unwrap();
         let dir = recorder.dir.clone();
         let status = recorder.status_handle();
         let near = [0.25f32, -0.25];
@@ -3286,18 +3338,18 @@ mod tests {
 
     #[test]
     fn runtime_status_json_exposes_frontend_latency_fields() {
-        let mut stats = RealtimeStats::new(
-            Duration::from_millis(1000),
-            48_000,
-            10,
-            25,
-            75,
-            "localvqe".into(),
-            16.0,
-            true,
-            Some("diagnostics/session-1".into()),
-            None,
-        );
+        let mut stats = RealtimeStats::new(RealtimeStatsConfig {
+            interval: Duration::from_millis(1000),
+            sample_rate: 48_000,
+            frame_ms: 10,
+            near_delay_ms: 25,
+            output_level: 75,
+            backend: "localvqe".into(),
+            algorithmic_latency_ms: 16.0,
+            status_json: true,
+            diagnostics_session_dir: Some("diagnostics/session-1".into()),
+            diagnostics_status: None,
+        });
         stats.total_frames = 480;
         stats.near_samples = 480;
         stats.far_samples = 480;

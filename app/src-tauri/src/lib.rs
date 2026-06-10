@@ -129,11 +129,7 @@ fn request_system_audio() -> Result<Value, String> {
 /// 约 15 秒、会外放蜂鸣 —— 故必须先停掉主 run(probe 内部自起子进程占用设备),由前端 gating。
 /// 当前后端只支持 macOS Process Tap;其它平台 CLI 会非 0 退出,错误经 stderr 透传给前端。
 #[tauri::command]
-async fn probe_delay(
-    mic: String,
-    reference: String,
-    output: String,
-) -> Result<Value, String> {
+async fn probe_delay(mic: String, reference: String, output: String) -> Result<Value, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let mut args: Vec<String> = vec!["probe-delay".into(), "--json".into()];
         // selector 透传(含 "default",与 run 同一套解析);仅空串时省略走 CLI 内置默认。
@@ -168,10 +164,7 @@ const LOCALVQE_HF_BASE: &str = "https://huggingface.co/LocalAI-io/LocalVQE/resol
 
 /// 下载模型的本地目录:<app_local_data>/localvqe/models(自动创建)。
 fn localvqe_models_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {
-    let base = app
-        .path()
-        .app_local_data_dir()
-        .map_err(|e| e.to_string())?;
+    let base = app.path().app_local_data_dir().map_err(|e| e.to_string())?;
     let dir = base.join("localvqe").join("models");
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     // 目录说明:用户手动放入的 .gguf 与应用内下载的模型都落在这里,引擎页自动检测。
@@ -217,10 +210,10 @@ fn localvqe_assets(app: tauri::AppHandle) -> Result<Value, String> {
     let dir = localvqe_models_dir(&app)?;
     let mut models: Vec<Value> = vec![];
     collect_gguf(&dir, "downloaded", &mut models);
-    if let Ok(res) = app
-        .path()
-        .resolve("resources/localvqe/models", tauri::path::BaseDirectory::Resource)
-    {
+    if let Ok(res) = app.path().resolve(
+        "resources/localvqe/models",
+        tauri::path::BaseDirectory::Resource,
+    ) {
         collect_gguf(&res, "bundled", &mut models);
     }
     Ok(serde_json::json!({
@@ -432,7 +425,7 @@ fn start_run(
     let app_out = app.clone();
     let stop_reader = stopping.clone();
     std::thread::spawn(move || {
-        for line in BufReader::new(stdout).lines().flatten() {
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
             if line.trim().is_empty() {
                 continue;
             }
@@ -452,7 +445,7 @@ fn start_run(
     let stderr = child.stderr.take().ok_or("no stderr")?;
     let app_err = app.clone();
     std::thread::spawn(move || {
-        for line in BufReader::new(stderr).lines().flatten() {
+        for line in BufReader::new(stderr).lines().map_while(Result::ok) {
             let _ = app_err.emit("echoless://log", line);
         }
     });
