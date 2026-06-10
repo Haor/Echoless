@@ -11,6 +11,14 @@ This is a packaging/runtime smoke. It does not replace AEC3 / LocalVQE subjectiv
 
 ## What This Smoke Checks
 
+`app/scripts/smoke-windows-installed-app.ps1` is the preferred Windows wrapper:
+
+```powershell
+pwsh -NoProfile -ExecutionPolicy Bypass -File .\scripts\smoke-windows-installed-app.ps1
+```
+
+It finds the generated NSIS/MSI installer under `src-tauri\target\debug\bundle`, installs it silently, locates the installed Echoless directory, and then delegates to `smoke-tauri-bundle.mjs --installed-app`.
+
 `app/scripts/smoke-tauri-bundle.mjs` now supports:
 
 ```powershell
@@ -38,13 +46,34 @@ pnpm -C app prepare:tauri-assets --require-localvqe-assets
 pnpm -C app tauri build --debug --ci
 ```
 
-Install the generated Windows bundle. The exact installer path depends on Tauri output, but it is usually under:
+The generated Windows installer is usually under:
 
 ```text
 app\src-tauri\target\debug\bundle\
 ```
 
 If testing a release build, use the matching release bundle and installed directory instead.
+
+## Run Installer + Installed-App Smoke
+
+From `app\`:
+
+```powershell
+pwsh -NoProfile -ExecutionPolicy Bypass -File .\scripts\smoke-windows-installed-app.ps1
+```
+
+Optional arguments:
+
+```powershell
+# Use a custom bundle output root.
+pwsh -NoProfile -ExecutionPolicy Bypass -File .\scripts\smoke-windows-installed-app.ps1 `
+  -BundleRoot ".\src-tauri\target\debug\bundle"
+
+# Skip installer execution and only smoke an already-installed app.
+pwsh -NoProfile -ExecutionPolicy Bypass -File .\scripts\smoke-windows-installed-app.ps1 `
+  -SkipInstall `
+  -InstallDir "$env:LOCALAPPDATA\Programs\Echoless"
+```
 
 ## Locate Install Directory
 
@@ -70,7 +99,7 @@ Get-ChildItem "$env:LOCALAPPDATA\Programs", "$env:ProgramFiles", "$env:ProgramFi
 
 ## Run Installed-App Smoke
 
-From `app\`:
+If the wrapper cannot locate the app, manually locate the install directory and run:
 
 ```powershell
 node .\scripts\smoke-tauri-bundle.mjs --installed-app "$env:LOCALAPPDATA\Programs\Echoless"
@@ -105,7 +134,7 @@ Add a section to `WINDOWS_AEC3_LOCALVQE_TEST_RESULTS.md` or a dedicated result f
 - Tauri build command.
 - Installer path.
 - Installed app directory.
-- Full `smoke-tauri-bundle.mjs --installed-app ...` console output.
+- Full `smoke-windows-installed-app.ps1` console output, including the delegated `smoke-tauri-bundle.mjs --installed-app ...` output.
 - Whether `bundle-smoke: ok` appeared.
 - If failed: missing file path or command stderr.
 

@@ -256,10 +256,11 @@ jobs:
           set -euo pipefail
           if [[ "${RUNNER_OS}" == "macOS" ]]; then
             pnpm tauri build --debug --ci --bundles app
+            pnpm smoke:tauri-bundle
           else
-            pnpm tauri build --debug --no-bundle --ci
+            pnpm tauri build --debug --ci
+            pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/smoke-windows-installed-app.ps1
           fi
-          pnpm smoke:tauri-bundle
 
       - name: Package
         shell: bash

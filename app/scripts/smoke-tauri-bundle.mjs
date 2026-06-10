@@ -71,6 +71,17 @@ function firstFile(root, predicate) {
   return matches[0] ?? null;
 }
 
+function firstDirectFile(root, predicate) {
+  if (!root || !fs.existsSync(root)) return null;
+  const matches = [];
+  for (const entry of fs.readdirSync(root, { withFileTypes: true })) {
+    const p = path.join(root, entry.name);
+    if (isWalkableFile(p, entry) && predicate(p)) matches.push(p);
+  }
+  matches.sort();
+  return matches[0] ?? null;
+}
+
 function basenameLower(file) {
   return path.basename(file).toLowerCase();
 }
@@ -133,19 +144,39 @@ function targetDirLayout(targetDir) {
 }
 
 function installedAppLayout(installDir) {
+  const resources = discoverResourcesDir(installDir);
   const appExecutable =
-    firstFile(
+    firstDirectFile(
       installDir,
-      (file) => ["echoless-app.exe", "echoless app.exe", "echoless_gui.exe"].includes(basenameLower(file)),
+      (file) =>
+        ["echoless.exe", "echoless-app.exe", "echoless app.exe", "echoless_gui.exe"].includes(
+          basenameLower(file),
+        ),
+    ) ??
+    firstDirectFile(
+      installDir,
+      (file) => basenameLower(file).endsWith(".exe") && basenameLower(file).includes("echoless"),
     ) ??
     firstFile(
       installDir,
       (file) =>
-        basenameLower(file).endsWith(".exe") &&
-        basenameLower(file).includes("echoless") &&
-        basenameLower(file) !== "echoless.exe",
+        ["echoless.exe", "echoless-app.exe", "echoless app.exe", "echoless_gui.exe"].includes(
+          basenameLower(file),
+        ),
+    ) ??
+    firstFile(
+      installDir,
+      (file) =>
+        basenameLower(file).endsWith(".exe") && basenameLower(file).includes("echoless"),
     );
   const cli =
+    firstFile(
+      resources,
+      (file) =>
+        (basenameLower(file) === "echoless.exe" ||
+          (basenameLower(file).startsWith("echoless-") && basenameLower(file).endsWith(".exe"))) &&
+        (!appExecutable || path.resolve(file) !== path.resolve(appExecutable)),
+    ) ??
     firstFile(
       installDir,
       (file) =>
@@ -159,7 +190,6 @@ function installedAppLayout(installDir) {
         basenameLower(file).endsWith(".exe") &&
         (!appExecutable || path.resolve(file) !== path.resolve(appExecutable)),
     );
-  const resources = discoverResourcesDir(installDir);
   return {
     kind: "windows-installed-app",
     root: installDir,
