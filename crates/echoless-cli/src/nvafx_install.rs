@@ -786,7 +786,7 @@ fn verify_zip_sha256(
 fn sha256_file(path: &Path) -> Result<String> {
     let mut file = File::open(path).with_context(|| format!("打开文件失败: {}", path.display()))?;
     let mut hasher = Sha256::new();
-    let mut buf = [0u8; 1024 * 1024];
+    let mut buf = vec![0u8; 64 * 1024];
     loop {
         let n = file
             .read(&mut buf)
@@ -980,5 +980,25 @@ mod tests {
                 .as_deref(),
             Some("dcacac954b7973ae18369b252d13f24b973b10114d00e5293eab0713601c7bcb")
         );
+    }
+
+    #[test]
+    fn nvafx_sha256_file_streams_large_files() {
+        let path = env::temp_dir().join(format!(
+            "echoless-nvafx-sha256-{}-{}.bin",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let data = vec![0x5au8; 2 * 1024 * 1024 + 17];
+        std::fs::write(&path, &data).unwrap();
+
+        let actual = sha256_file(&path).unwrap();
+        let expected = format!("{:x}", Sha256::digest(&data));
+        assert_eq!(actual, expected);
+
+        let _ = std::fs::remove_file(path);
     }
 }

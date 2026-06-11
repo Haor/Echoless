@@ -44,6 +44,9 @@ pub(crate) struct DevicesArgs {
     /// 输出 JSON,供 GUI 消费
     #[arg(long)]
     pub(crate) json: bool,
+    /// 快速枚举:只查询设备身份,跳过可能被驱动卡住的完整格式范围探测
+    #[arg(long)]
+    pub(crate) fast: bool,
 }
 
 #[derive(Args)]
@@ -63,6 +66,9 @@ pub(crate) struct DoctorAudioArgs {
     /// 输出 JSON,供 GUI onboarding 消费
     #[arg(long)]
     pub(crate) json: bool,
+    /// 快速枚举音频设备,避免坏驱动在完整格式范围探测中卡住
+    #[arg(long)]
+    pub(crate) fast_devices: bool,
     /// macOS:显式触发一次系统音频录制权限请求/探测;不会在普通 doctor 中隐式弹窗
     #[arg(long)]
     pub(crate) request_system_audio: bool,

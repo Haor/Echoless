@@ -311,7 +311,24 @@ pub fn print_devices() -> Result<()> {
     Ok(())
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct DeviceListOptions {
+    pub include_config_details: bool,
+}
+
+impl Default for DeviceListOptions {
+    fn default() -> Self {
+        Self {
+            include_config_details: true,
+        }
+    }
+}
+
 pub fn devices_json() -> Result<Value> {
+    devices_json_with_options(DeviceListOptions::default())
+}
+
+pub fn devices_json_with_options(options: DeviceListOptions) -> Result<Value> {
     let host = cpal::default_host();
     let input_devices = devices_for(&host, DeviceKind::Input)?;
     let output_devices = devices_for(&host, DeviceKind::Output)?;
@@ -328,14 +345,26 @@ pub fn devices_json() -> Result<Value> {
         .iter()
         .enumerate()
         .map(|(index, device)| {
-            device_json_entry(device, DeviceKind::Input, index, default_input_index)
+            device_json_entry(
+                device,
+                DeviceKind::Input,
+                index,
+                default_input_index,
+                options,
+            )
         })
         .collect::<Vec<_>>();
     let outputs = output_devices
         .iter()
         .enumerate()
         .map(|(index, device)| {
-            device_json_entry(device, DeviceKind::Output, index, default_output_index)
+            device_json_entry(
+                device,
+                DeviceKind::Output,
+                index,
+                default_output_index,
+                options,
+            )
         })
         .collect::<Vec<_>>();
 
@@ -383,13 +412,25 @@ pub fn devices_json() -> Result<Value> {
     }))
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug)]
 pub struct AudioDoctorOptions {
+    pub include_config_details: bool,
     pub request_system_audio: bool,
 }
 
+impl Default for AudioDoctorOptions {
+    fn default() -> Self {
+        Self {
+            include_config_details: true,
+            request_system_audio: false,
+        }
+    }
+}
+
 pub fn audio_doctor_json_with_options(options: AudioDoctorOptions) -> Result<Value> {
-    let devices = devices_json()?;
+    let devices = devices_json_with_options(DeviceListOptions {
+        include_config_details: options.include_config_details,
+    })?;
     let inputs = devices["inputs"].as_array().cloned().unwrap_or_default();
     let outputs = devices["outputs"].as_array().cloned().unwrap_or_default();
     let candidate_inputs = inputs
@@ -455,21 +496,23 @@ fn device_json_entry(
     kind: DeviceKind,
     index: usize,
     default_index: Option<usize>,
+    options: DeviceListOptions,
 ) -> Value {
-    let cfg = match kind {
+    let cfg = options.include_config_details.then(|| match kind {
         DeviceKind::Input => device.default_input_config(),
         DeviceKind::Output => device.default_output_config(),
-    };
+    });
     let (default_sample_rate, channels, sample_format, config_error) = match cfg {
-        Ok(cfg) => (
+        Some(Ok(cfg)) => (
             Some(cfg.sample_rate()),
             Some(cfg.channels()),
             Some(cfg.sample_format().to_string()),
             None,
         ),
-        Err(err) => (None, None, None, Some(err.to_string())),
+        Some(Err(err)) => (None, None, None, Some(err.to_string())),
+        None => (None, None, None, None),
     };
-    json!({
+    let mut entry = json!({
         "id": index.to_string(),
         "stable_id": stable_device_id(device, kind, index),
         "index": index,
@@ -480,9 +523,12 @@ fn device_json_entry(
         "default_sample_rate": default_sample_rate,
         "channels": channels,
         "sample_format": sample_format,
-        "supported_sample_rates": supported_sample_rates_json(device, kind),
         "config_error": config_error,
-    })
+    });
+    if options.include_config_details {
+        entry["supported_sample_rates"] = supported_sample_rates_json(device, kind);
+    }
+    entry
 }
 
 fn supported_sample_rates_json(device: &Device, kind: DeviceKind) -> Value {

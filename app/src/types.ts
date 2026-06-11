@@ -19,10 +19,11 @@ export interface AudioDevice {
   is_default: boolean;
   selector: string; // 设备索引字符串(跨重启不稳)
   stable_id: string; // 跨重启稳定 id(CoreAudio/WASAPI 派生);mic/output 配置优先用它
-  default_sample_rate: number;
+  // GUI fast device enumeration may intentionally skip driver format probing.
+  default_sample_rate: number | null;
   supported_sample_rates?: SupportedSampleRateRange[] | { error: string };
-  channels: number;
-  sample_format: string;
+  channels: number | null;
+  sample_format: string | null;
   config_error: string | null;
 }
 

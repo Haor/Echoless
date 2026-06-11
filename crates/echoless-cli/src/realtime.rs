@@ -39,7 +39,8 @@ use self::control::{
     RuntimeControlEvent, SUPPORTED_RUNTIME_CONTROLS,
 };
 pub use self::devices::{
-    audio_doctor_json_with_options, devices_json, print_devices, AudioDoctorOptions,
+    audio_doctor_json_with_options, devices_json, devices_json_with_options, print_devices,
+    AudioDoctorOptions, DeviceListOptions,
 };
 use self::devices::{
     config_choice_summary, is_macos_process_tap, macos_process_tap_sample_rate, mic_selector,

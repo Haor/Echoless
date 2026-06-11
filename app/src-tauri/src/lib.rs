@@ -44,6 +44,8 @@ const VALIDATE_COMMAND_TIMEOUT: Duration = Duration::from_secs(60);
 const PROBE_DELAY_TIMEOUT: Duration = Duration::from_secs(45);
 const NVAFX_INSTALL_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const MODEL_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x08000000;
 
 fn exe_suffix() -> &'static str {
     if cfg!(target_os = "windows") {
@@ -313,6 +315,18 @@ fn prepend_env_path(command: &mut Command, key: &str, dir: &Path) {
     }
 }
 
+fn suppress_child_console(command: &mut Command) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = command;
+    }
+}
+
 fn echoless_command(app: Option<&tauri::AppHandle>) -> Result<Command, String> {
     let cli = echoless_bin(app)?;
     let mut command = Command::new(&cli);
@@ -337,6 +351,7 @@ fn command_output_with_timeout(
     label: &str,
 ) -> Result<Output, String> {
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    suppress_child_console(command);
     let mut child = command
         .spawn()
         .map_err(|e| format!("spawn {label} failed: {e}"))?;
@@ -430,7 +445,7 @@ fn get_platform() -> &'static str {
 async fn list_devices(app: tauri::AppHandle) -> Result<Value, String> {
     run_json_async(
         app,
-        vec!["devices".into(), "--json".into()],
+        vec!["devices".into(), "--json".into(), "--fast".into()],
         JSON_COMMAND_TIMEOUT,
         "devices",
     )
@@ -452,7 +467,12 @@ async fn list_processors(app: tauri::AppHandle) -> Result<Value, String> {
 async fn doctor_audio(app: tauri::AppHandle) -> Result<Value, String> {
     run_json_async(
         app,
-        vec!["doctor".into(), "audio".into(), "--json".into()],
+        vec![
+            "doctor".into(),
+            "audio".into(),
+            "--json".into(),
+            "--fast-devices".into(),
+        ],
         JSON_COMMAND_TIMEOUT,
         "doctor audio",
     )
@@ -468,6 +488,7 @@ async fn request_system_audio(app: tauri::AppHandle) -> Result<Value, String> {
         vec![
             "doctor".into(),
             "audio".into(),
+            "--fast-devices".into(),
             "--request-system-audio".into(),
             "--json".into(),
         ],
@@ -550,7 +571,7 @@ fn sha256_file(path: &Path) -> Result<String, String> {
     let mut file =
         std::fs::File::open(path).map_err(|e| format!("打开文件失败: {}: {e}", path.display()))?;
     let mut hasher = Sha256::new();
-    let mut buf = [0u8; 1024 * 1024];
+    let mut buf = vec![0u8; 64 * 1024];
     loop {
         let n = file
             .read(&mut buf)
@@ -941,6 +962,7 @@ fn start_run(
     let interval = stats_interval_ms.unwrap_or(80).to_string();
 
     let mut command = echoless_command(Some(&app))?;
+    suppress_child_console(&mut command);
     let child_result = command
         .args([
             "run",
