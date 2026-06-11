@@ -53,7 +53,7 @@ function tryOutput(cmd, cmdArgs, options = {}) {
 function toolCandidates(name) {
   const ext = process.platform === "win32" ? ".exe" : "";
   const command = process.platform === "win32" && !name.endsWith(".exe") ? `${name}${ext}` : name;
-  const candidates = [name];
+  const candidates = [name, command];
   const cargoHomes = [
     process.env.CARGO_HOME,
     process.env.USERPROFILE ? path.join(process.env.USERPROFILE, ".cargo") : null,
