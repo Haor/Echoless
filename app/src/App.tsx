@@ -83,6 +83,7 @@ const REQUIRED_RUN_CONTROLS = [
 // 系统设置 › 隐私与安全性(系统音频录制权限在此开启;具体面板随 macOS 版本)。
 const SYS_AUDIO_PRIVACY_URL =
   "x-apple.systempreferences:com.apple.preference.security?Privacy";
+const DEVICE_SELECTION_KEY = "echoless.deviceSelection.v1";
 
 // 设备选择值统一用 stable_id(跨重启稳定;mic/output 配置直接吃它)。
 // 选默认输出:优先虚拟声卡(VB-CABLE / BlackHole),否则系统默认。
@@ -95,6 +96,54 @@ function pickDefaultOutput(outs: AudioDevice[]): string {
 }
 function pickDefaultInput(ins: AudioDevice[]): string {
   return ins.find((d) => d.is_default)?.stable_id ?? ins[0]?.stable_id ?? "default";
+}
+
+type SavedDeviceSelection = {
+  input?: string;
+  output?: string;
+  reference?: string;
+};
+
+function readSavedDeviceSelection(): SavedDeviceSelection {
+  try {
+    const raw = localStorage.getItem(DEVICE_SELECTION_KEY);
+    if (!raw) return {};
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== "object") return {};
+    return {
+      input: typeof parsed.input === "string" ? parsed.input : undefined,
+      output: typeof parsed.output === "string" ? parsed.output : undefined,
+      reference: typeof parsed.reference === "string" ? parsed.reference : undefined,
+    };
+  } catch {
+    return {};
+  }
+}
+
+function saveDeviceSelection(selection: SavedDeviceSelection) {
+  try {
+    localStorage.setItem(DEVICE_SELECTION_KEY, JSON.stringify(selection));
+  } catch {
+    // Best-effort preference cache; failing to persist must not block audio.
+  }
+}
+
+function deviceSelectionStillExists(devices: AudioDevice[], value: string): boolean {
+  if (value === "default" || value === "") return false;
+  return devices.some((d) => d.stable_id === value || d.selector === value);
+}
+
+function referenceSelectionStillExists(devices: DeviceList, value: string): boolean {
+  return devices.reference_sources.some(
+    (r) => r.available && (r.selector ?? r.id) === value,
+  );
+}
+
+function pickReference(devices: DeviceList, current: string): string {
+  if (referenceSelectionStillExists(devices, current)) return current;
+  const sys = devices.reference_sources.find((r) => r.id === "system");
+  if (sys?.available) return "system";
+  return "none";
 }
 
 const MODELS: { kind: string; label: string }[] = [
@@ -126,11 +175,16 @@ function defaultParams(proc: Processor | undefined): Record<string, unknown> {
 const dash = (v: number | null, d = 1) => (v === null ? "—" : v.toFixed(d));
 
 export default function App() {
+  const savedDeviceSelection = useRef(readSavedDeviceSelection());
   const [platform, setPlatform] = useState<Platform>("macos");
   const [devices, setDevices] = useState<DeviceList | null>(null);
   const [processors, setProcessors] = useState<Processor[]>([]);
-  const [selInput, setSelInput] = useState("default");
-  const [selOutput, setSelOutput] = useState("default");
+  const [selInput, setSelInput] = useState(
+    savedDeviceSelection.current.input ?? "default",
+  );
+  const [selOutput, setSelOutput] = useState(
+    savedDeviceSelection.current.output ?? "default",
+  );
   const [kind, setKind] = useState("sonora_aec3");
   const [pipeline, setPipeline] = useState<PipelineCfg>({
     sample_rate: 48000,
@@ -154,7 +208,9 @@ export default function App() {
   const [nvafx, setNvafx] = useState<NvafxDoctor | null>(null);
   const [nvafxBusy, setNvafxBusy] = useState(false); // RTX runtime 安装中
   // reference:可用源由 devices.reference_sources 提供;mac system 无 loopback → 默认退 none。
-  const [reference, setReference] = useState("system");
+  const [reference, setReference] = useState(
+    savedDeviceSelection.current.reference ?? "system",
+  );
   // 开发态:页面内按 ~ 切换,临时解开 NVAFX 平台/doctor 门槛,用于走通前端流程。
   const [dev, setDev] = useState(false);
   // 开发态下用模拟 doctor 走 RTX 安装流程(mac 上也能逐屏过)。
@@ -368,6 +424,14 @@ export default function App() {
     return () => window.removeEventListener("keydown", onKey);
   }, [view]);
 
+  useEffect(() => {
+    saveDeviceSelection({
+      input: selInput,
+      output: selOutput,
+      reference,
+    });
+  }, [selInput, selOutput, reference]);
+
   // backend 切换 / manifest 加载 → 优先恢复该引擎上次的参数(保住 LocalVQE 选的模型),
   // 否则用 manifest 默认值。
   useEffect(() => {
@@ -417,15 +481,16 @@ export default function App() {
     listDevices()
       .then((d) => {
         setDevices(d);
-        setSelInput((cur) => (cur === "default" ? pickDefaultInput(d.inputs) : cur));
+        setSelInput((cur) =>
+          deviceSelectionStillExists(d.inputs, cur) ? cur : pickDefaultInput(d.inputs),
+        );
         setSelOutput((cur) =>
-          cur === "default" ? pickDefaultOutput(d.outputs) : cur,
+          deviceSelectionStillExists(d.outputs, cur)
+            ? cur
+            : pickDefaultOutput(d.outputs),
         );
         // 默认 reference:system 可用就用 system,否则退到 none;用户改过则保留。
-        const sys = d.reference_sources.find((r) => r.id === "system");
-        setReference((cur) =>
-          cur !== "system" ? cur : sys && !sys.available ? "none" : "system",
-        );
+        setReference((cur) => pickReference(d, cur));
       })
       .catch((e) => setErr(String(e)));
   }

@@ -26,6 +26,8 @@ use std::sync::mpsc::Receiver;
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
+#[cfg(windows)]
+use std::time::Instant;
 
 use anyhow::{bail, Context, Result};
 use cpal::traits::{DeviceTrait, StreamTrait};
@@ -792,6 +794,115 @@ where
             None,
         )
         .context("构建输出流失败")
+}
+
+#[cfg(windows)]
+pub(crate) fn play_mono_samples_to_output(
+    selector: Option<&str>,
+    sample_rate: u32,
+    samples: Vec<f32>,
+) -> Result<()> {
+    if samples.is_empty() {
+        return Ok(());
+    }
+
+    let host = cpal::default_host();
+    let selected = select_device(&host, DeviceKind::Output, selector)?;
+    let choice = pick_config(&selected.device, DeviceKind::Output, sample_rate)?;
+    let done = Arc::new(AtomicBool::new(false));
+    let duration = Duration::from_secs_f64(samples.len() as f64 / f64::from(sample_rate));
+    let samples = Arc::new(samples);
+    let stream = match choice.sample_format() {
+        SampleFormat::I16 => build_mono_sample_player_stream::<i16>(
+            &selected.device,
+            &choice,
+            sample_rate,
+            Arc::clone(&samples),
+            Arc::clone(&done),
+        ),
+        SampleFormat::I32 => build_mono_sample_player_stream::<i32>(
+            &selected.device,
+            &choice,
+            sample_rate,
+            Arc::clone(&samples),
+            Arc::clone(&done),
+        ),
+        SampleFormat::F32 => build_mono_sample_player_stream::<f32>(
+            &selected.device,
+            &choice,
+            sample_rate,
+            Arc::clone(&samples),
+            Arc::clone(&done),
+        ),
+        SampleFormat::U16 => build_mono_sample_player_stream::<u16>(
+            &selected.device,
+            &choice,
+            sample_rate,
+            Arc::clone(&samples),
+            Arc::clone(&done),
+        ),
+        other => bail!("不支持的采样格式 {other}"),
+    }?;
+    stream.play().context("启动蜂鸣输出流失败")?;
+
+    let deadline = Instant::now() + duration + Duration::from_secs(2);
+    while !done.load(Ordering::Relaxed) && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
+    if !done.load(Ordering::Relaxed) {
+        bail!("蜂鸣播放超时:输出设备没有及时消耗测试音");
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn build_mono_sample_player_stream<T>(
+    device: &Device,
+    choice: &StreamConfigChoice,
+    source_sample_rate: u32,
+    samples: Arc<Vec<f32>>,
+    done: Arc<AtomicBool>,
+) -> Result<Stream>
+where
+    T: SizedSample + FromSample<f32> + Copy + Send + 'static,
+{
+    let config = choice.config();
+    let channels = usize::from(config.channels);
+    let stream_sample_rate = choice.stream_sample_rate();
+    let mut stream_frame = 0u64;
+    device
+        .build_output_stream(
+            &config,
+            move |data: &mut [T], _: &cpal::OutputCallbackInfo| {
+                for frame in data.chunks_mut(channels) {
+                    let source_pos = stream_frame as f64 * f64::from(source_sample_rate)
+                        / f64::from(stream_sample_rate);
+                    let sample = if source_pos < samples.len() as f64 {
+                        interpolated_sample(&samples, source_pos).clamp(-1.0, 1.0)
+                    } else {
+                        done.store(true, Ordering::Relaxed);
+                        0.0
+                    };
+                    stream_frame += 1;
+                    let out_sample = T::from_sample(sample);
+                    for out in frame {
+                        *out = out_sample;
+                    }
+                }
+            },
+            |err| eprintln!("蜂鸣输出流错误: {err}"),
+            None,
+        )
+        .context("构建蜂鸣输出流失败")
+}
+
+#[cfg(windows)]
+fn interpolated_sample(samples: &[f32], position: f64) -> f32 {
+    let i = position.floor() as usize;
+    let frac = (position - i as f64) as f32;
+    let a = samples.get(i).copied().unwrap_or(0.0);
+    let b = samples.get(i + 1).copied().unwrap_or(a);
+    a + (b - a) * frac
 }
 
 #[cfg(test)]

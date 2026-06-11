@@ -284,10 +284,7 @@ fn run_native_delay_probe(
         a.json,
         format!("playing beep train: {}", beep_path.display()),
     );
-    let play_status = play_probe_beep(beep_path)?;
-    if !play_status.success() {
-        bail!("播放蜂鸣 WAV 失败: {play_status}");
-    }
+    play_probe_beep(a, beep_path)?;
 
     let finish_deadline = Instant::now() + Duration::from_secs(u64::from(diagnostic_seconds) + 2);
     while Instant::now() < finish_deadline {
@@ -313,25 +310,78 @@ fn run_native_delay_probe(
         .with_context(|| format!("未找到 diagnostics session: {}", out_dir.display()))
 }
 
-fn play_probe_beep(beep_path: &Path) -> Result<std::process::ExitStatus> {
-    if cfg!(target_os = "macos") {
-        return Command::new("afplay")
-            .arg(beep_path)
-            .status()
-            .context("播放蜂鸣 WAV 失败(需要 macOS afplay)");
+#[cfg(all(feature = "realtime", target_os = "macos"))]
+fn play_probe_beep(_a: &ProbeDelayArgs, beep_path: &Path) -> Result<()> {
+    let status = Command::new("afplay")
+        .arg(beep_path)
+        .status()
+        .context("播放蜂鸣 WAV 失败(需要 macOS afplay)")?;
+    if !status.success() {
+        bail!("播放蜂鸣 WAV 失败: {status}");
     }
-    if cfg!(windows) {
-        return Command::new("powershell.exe")
-            .arg("-NoProfile")
-            .arg("-ExecutionPolicy")
-            .arg("Bypass")
-            .arg("-Command")
-            .arg("$player = New-Object System.Media.SoundPlayer $args[0]; $player.Load(); $player.PlaySync()")
-            .arg(beep_path)
-            .status()
-            .context("播放蜂鸣 WAV 失败(需要 Windows PowerShell SoundPlayer)");
-    }
+    Ok(())
+}
+
+#[cfg(all(feature = "realtime", windows))]
+fn play_probe_beep(a: &ProbeDelayArgs, beep_path: &Path) -> Result<()> {
+    let selector = reference_playback_output_selector(&a.reference)?;
+    let samples = read_probe_beep_samples(beep_path)?;
+    crate::realtime::play_mono_samples_to_output(selector, PROBE_SAMPLE_RATE, samples)
+}
+
+#[cfg(all(feature = "realtime", not(any(target_os = "macos", windows))))]
+fn play_probe_beep(_a: &ProbeDelayArgs, _beep_path: &Path) -> Result<()> {
     bail!("当前平台没有 probe-delay 蜂鸣播放实现");
+}
+
+#[cfg(not(feature = "realtime"))]
+fn play_probe_beep(_a: &ProbeDelayArgs, _beep_path: &Path) -> Result<()> {
+    bail!("probe-delay 蜂鸣播放需 realtime 特性(cpal)");
+}
+
+#[cfg(any(windows, test))]
+fn reference_playback_output_selector(reference: &str) -> Result<Option<&str>> {
+    let reference = reference.trim();
+    match reference {
+        "" | "system" | "default" => Ok(None),
+        "none" => bail!("probe-delay 需要可播放的 reference;当前 reference=none"),
+        value if value.starts_with("input:") => {
+            bail!("probe-delay 无法向 input reference 播放蜂鸣: {value}")
+        }
+        value => {
+            if let Some(output) = value.strip_prefix("output:") {
+                return Ok((!output.trim().is_empty()).then_some(output));
+            }
+            Ok(Some(value))
+        }
+    }
+}
+
+#[cfg(windows)]
+fn read_probe_beep_samples(beep_path: &Path) -> Result<Vec<f32>> {
+    let mut reader = hound::WavReader::open(beep_path)
+        .with_context(|| format!("读取蜂鸣 WAV 失败: {}", beep_path.display()))?;
+    let spec = reader.spec();
+    if spec.channels != 1
+        || spec.sample_rate != PROBE_SAMPLE_RATE
+        || spec.bits_per_sample != 16
+        || spec.sample_format != hound::SampleFormat::Int
+    {
+        bail!(
+            "蜂鸣 WAV 格式不支持: channels={}, rate={}, bits={}, format={:?}",
+            spec.channels,
+            spec.sample_rate,
+            spec.bits_per_sample,
+            spec.sample_format
+        );
+    }
+    reader
+        .samples::<i16>()
+        .map(|s| {
+            s.map(|v| f32::from(v) / f32::from(i16::MAX))
+                .context("读取蜂鸣 WAV sample 失败")
+        })
+        .collect()
 }
 
 fn spawn_probe_line_reader<R>(reader: R) -> Receiver<String>
@@ -796,6 +846,22 @@ mod tests {
         assert!(retained);
         assert!(temp_dir.is_none());
         assert_eq!(out_dir, PathBuf::from("/tmp/echoless-probe-explicit"));
+    }
+
+    #[test]
+    fn reference_playback_selector_targets_output_sources() {
+        assert_eq!(reference_playback_output_selector("system").unwrap(), None);
+        assert_eq!(reference_playback_output_selector("default").unwrap(), None);
+        assert_eq!(
+            reference_playback_output_selector("output:wasapi-device-id").unwrap(),
+            Some("wasapi-device-id")
+        );
+        assert_eq!(
+            reference_playback_output_selector("plain-output-selector").unwrap(),
+            Some("plain-output-selector")
+        );
+        assert!(reference_playback_output_selector("none").is_err());
+        assert!(reference_playback_output_selector("input:mic-id").is_err());
     }
 
     #[test]
