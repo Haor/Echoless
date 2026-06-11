@@ -72,6 +72,24 @@ function resolveTool(name, probeArgs = ["--version"]) {
   return null;
 }
 
+function nativeTargetTriple() {
+  const platform = process.platform;
+  const arch = process.arch;
+  if (platform === "win32") {
+    if (arch === "x64") return "x86_64-pc-windows-msvc";
+    if (arch === "arm64") return "aarch64-pc-windows-msvc";
+  }
+  if (platform === "darwin") {
+    if (arch === "arm64") return "aarch64-apple-darwin";
+    if (arch === "x64") return "x86_64-apple-darwin";
+  }
+  if (platform === "linux") {
+    if (arch === "x64") return "x86_64-unknown-linux-gnu";
+    if (arch === "arm64") return "aarch64-unknown-linux-gnu";
+  }
+  return null;
+}
+
 function rustTargetTriple() {
   const explicit =
     valueOf("--target") ??
@@ -79,6 +97,8 @@ function rustTargetTriple() {
     process.env.CARGO_BUILD_TARGET ??
     process.env.TARGET;
   if (explicit) return explicit;
+  const native = nativeTargetTriple();
+  if (native) return native;
   const rustc = resolveTool("rustc", ["-vV"]);
   if (!rustc) {
     throw new Error("Could not find rustc; pass --target or set TAURI_TARGET_TRIPLE");
