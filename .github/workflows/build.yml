@@ -10,6 +10,7 @@ permissions:
 
 env:
   LOCALVQE_REF: de56a174d9662b65f404ec65ae8e4bc9712db0da
+  LOCALVQE_MODEL_REVISION: 5760d09ce556750f76c1251c024e4a8c37231591
 
 jobs:
   build:
@@ -124,6 +125,13 @@ jobs:
           git clone --no-checkout https://github.com/localai-org/LocalVQE.git "${localvqe_src}"
           git -C "${localvqe_src}" checkout "${LOCALVQE_REF}"
           git -C "${localvqe_src}" submodule update --init --recursive
+
+          # Upstream regression assets point at HuggingFace main, which can drift
+          # independently of the pinned LocalVQE source revision. Echoless already
+          # pins and verifies these GGUF files at this HF revision.
+          sed -i.bak \
+            "s|https://huggingface.co/LocalAI-io/LocalVQE/resolve/main/|https://huggingface.co/LocalAI-io/LocalVQE/resolve/${LOCALVQE_MODEL_REVISION}/|g" \
+            "${localvqe_src}/ggml/CMakeLists.txt"
 
           # Upstream test helpers currently miss the Windows S_ISREG aliases.
           # Keep this as a CI-local compatibility shim until upstream fixes it.
