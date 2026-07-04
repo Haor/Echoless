@@ -1,10 +1,10 @@
-//! 直接调 sonora 高层 API 的诊断测试(绕过我们的 wrapper),用于隔离
-//! "sonora 本身 vs 我们 wrapper 调用方式" 的问题。多场景对比。
+//! 直接调 aec3 高层 API 的诊断测试(绕过我们的 wrapper),用于隔离
+//! "aec3 本身 vs 我们 wrapper 调用方式" 的问题。多场景对比。
 
-#![cfg(feature = "sonora-engine")]
+#![cfg(feature = "aec3-engine")]
 
-use sonora::config::{EchoCanceller, Pipeline};
-use sonora::{AudioProcessing, Config, StreamConfig};
+use aec3_apm::config::{EchoCanceller, Pipeline};
+use aec3_apm::{AudioProcessing, Config, StreamConfig};
 
 const SR: usize = 48_000;
 const FRAME: usize = 480;
@@ -99,13 +99,13 @@ fn run(delay: usize, far_stereo: bool, set_delay_ms: Option<i32>) -> (f32, f32, 
     (mic, o, db)
 }
 
-/// 引擎健康断言:直接 sonora 高层 API,非平稳信号 50ms 回声应消 >18dB。
+/// 引擎健康断言:直接 aec3 高层 API,非平稳信号 50ms 回声应消 >18dB。
 /// (与经 wrapper 的 echo_cancellation 测试互为对照,隔离 wrapper vs 引擎问题。)
 #[test]
 fn engine_cancels_nonstationary_echo() {
-    // mono far,对齐 sonora_aec3 节点的 mono 配置。
+    // mono far,对齐 aec3 节点的 mono 配置。
     let (_, _, db) = run(2400, false, None);
-    assert!(db > 18.0, "sonora 引擎对非平稳回声压低不足:{db:.1} dB");
+    assert!(db > 18.0, "aec3 引擎对非平稳回声压低不足:{db:.1} dB");
 }
 
 /// 诊断矩阵(探查工具,非回归断言)。记录关键经验:
@@ -114,11 +114,11 @@ fn engine_cancels_nonstationary_echo() {
 /// - erle_db 统计恒常数、不可信;延迟估计在零延迟 corner 不准。
 /// - 50ms(逼近默认 tail 52ms)明显差于 10ms → 印证调大 tail 的价值。
 ///
-/// 跑:`cargo test -p echoless-processors --test sonora_direct -- --ignored --nocapture`
+/// 跑:`cargo test -p echoless-processors --test aec3_direct -- --ignored --nocapture`
 #[test]
 #[ignore = "诊断探查工具,非回归断言;手动 --ignored 运行"]
 fn diagnostic_matrix() {
-    eprintln!("=== 直接 sonora API 诊断矩阵 ===");
+    eprintln!("=== 直接 aec3 API 诊断矩阵 ===");
     run(0, false, None); // 零延迟 mono — 最简单
     run(0, true, None); // 零延迟 stereo
     run(480, false, None); // 10ms mono
