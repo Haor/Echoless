@@ -38,7 +38,7 @@ pub fn default_near_delay_ms() -> u32 {
     if cfg!(target_os = "macos") {
         25
     } else {
-        0
+        20
     }
 }
 fn default_mic() -> String {
