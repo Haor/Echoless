@@ -1,23 +1,23 @@
-//! 经典 AEC3 节点(包 vendored sonora — 纯 Rust WebRTC AudioProcessing 移植)。
+//! 经典 AEC3 节点(包 vendored aec3 — 纯 Rust WebRTC AudioProcessing 移植)。
 //!
 //! io_spec:48k,near mono,far mono/stereo 可配置。处理域固定 10ms = 480 样本/声道。
 //! 调用顺序铁律:每块先 process_render(far),再 process_capture(near)。
 //!
 //! 调参(经 vendored fork 开放的 `aec3_config()` 注入 EchoCanceller3Config):
 //!   tail_ms / delay_num_filters / linear_stable_echo_path。
-//! 顺带可选 NS(降噪)/ AGC(自动增益)—— 与 AEC3 同属一个 sonora APM pipeline。
-//! 详见 research/sonora_aec3_internal_map.md §2/§9/§11。
+//! 顺带可选 NS(降噪)/ AGC(自动增益)—— 与 AEC3 同属一个 aec3 APM pipeline。
+//! 详见 research/aec3_internal_map.md §2/§9/§11。
 //!
-//! feature `sonora-engine`(默认开)= 真实 AEC3;关掉 = 直通。
+//! feature `aec3-engine`(默认开)= 真实 AEC3;关掉 = 直通。
 
 use crate::{EchoProcessor, IoSpec, ProcessorStats};
 
 const SR: u32 = 48_000;
 const FRAME: usize = 480; // 10ms @ 48k
 
-/// 我们的高层调参。tail/num_filters/linear 映射到 EchoCanceller3Config;ns/agc 走 sonora APM。
+/// 我们的高层调参。tail/num_filters/linear 映射到 EchoCanceller3Config;ns/agc 走 aec3 APM。
 #[derive(Clone)]
-#[cfg_attr(not(feature = "sonora-engine"), allow(dead_code))]
+#[cfg_attr(not(feature = "aec3-engine"), allow(dead_code))]
 struct Aec3Tuning {
     /// echo tail 长度(ms);底层 4ms/block,默认 52ms。外放+房间混响常需更长。
     tail_ms: Option<u32>,
@@ -57,39 +57,39 @@ impl Aec3Tuning {
     }
 }
 
-pub struct SonoraAec3 {
+pub struct Aec3Engine {
     tuning: Aec3Tuning,
     initial_delay_ms: i32,
     last: ProcessorStats,
-    #[cfg(feature = "sonora-engine")]
+    #[cfg(feature = "aec3-engine")]
     inner: Inner,
-    #[cfg(feature = "sonora-engine")]
+    #[cfg(feature = "aec3-engine")]
     stream_delay_pending: bool,
 }
 
-impl SonoraAec3 {
+impl Aec3Engine {
     pub fn new() -> Self {
         let tuning = Aec3Tuning::default();
         Self {
-            #[cfg(feature = "sonora-engine")]
+            #[cfg(feature = "aec3-engine")]
             inner: Inner::new(&tuning),
-            #[cfg(feature = "sonora-engine")]
+            #[cfg(feature = "aec3-engine")]
             stream_delay_pending: false,
             tuning,
             initial_delay_ms: 0,
-            last: ProcessorStats::empty("sonora_aec3"),
+            last: ProcessorStats::empty("aec3"),
         }
     }
 }
-impl Default for SonoraAec3 {
+impl Default for Aec3Engine {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl EchoProcessor for SonoraAec3 {
+impl EchoProcessor for Aec3Engine {
     fn name(&self) -> &'static str {
-        "sonora_aec3"
+        "aec3"
     }
     fn io_spec(&self) -> IoSpec {
         IoSpec {
@@ -129,7 +129,7 @@ impl EchoProcessor for SonoraAec3 {
             self.tuning.far_channels = parse_reference_channels(v)?;
         }
         // config 在引擎构造时注入,故参数变化需重建引擎。
-        #[cfg(feature = "sonora-engine")]
+        #[cfg(feature = "aec3-engine")]
         {
             self.inner = Inner::new(&self.tuning);
             self.stream_delay_pending = self.initial_delay_ms > 0;
@@ -138,7 +138,7 @@ impl EchoProcessor for SonoraAec3 {
     }
     fn set_stream_delay_ms(&mut self, ms: i32) {
         self.initial_delay_ms = ms;
-        #[cfg(feature = "sonora-engine")]
+        #[cfg(feature = "aec3-engine")]
         {
             self.stream_delay_pending = true;
         }
@@ -172,11 +172,11 @@ impl EchoProcessor for SonoraAec3 {
         }
     }
     fn process(&mut self, near: &[f32], far: &[f32], out: &mut [f32], frames: u32) {
-        #[cfg(feature = "sonora-engine")]
+        #[cfg(feature = "aec3-engine")]
         {
-            self.process_sonora(near, far, out, frames as usize);
+            self.process_aec3(near, far, out, frames as usize);
         }
-        #[cfg(not(feature = "sonora-engine"))]
+        #[cfg(not(feature = "aec3-engine"))]
         {
             let _ = (far, frames);
             crate::dsp::copy_or_zero(near, out);
@@ -186,7 +186,7 @@ impl EchoProcessor for SonoraAec3 {
         self.last.clone()
     }
     fn reset(&mut self) {
-        #[cfg(feature = "sonora-engine")]
+        #[cfg(feature = "aec3-engine")]
         {
             self.inner = Inner::new(&self.tuning);
             self.stream_delay_pending = self.initial_delay_ms > 0;
@@ -195,10 +195,10 @@ impl EchoProcessor for SonoraAec3 {
 }
 
 // ── 把高层 tuning 映射成底层 EchoCanceller3Config ──────────────────────────────
-#[cfg(feature = "sonora-engine")]
-fn build_aec3_config(t: &Aec3Tuning) -> sonora::EchoCanceller3Config {
+#[cfg(feature = "aec3-engine")]
+fn build_aec3_config(t: &Aec3Tuning) -> aec3_apm::EchoCanceller3Config {
     const BLOCK_MS: u32 = 4; // 底层 4ms/block(common.rs)
-    let mut c = sonora::EchoCanceller3Config::default();
+    let mut c = aec3_apm::EchoCanceller3Config::default();
 
     if let Some(tail_ms) = t.tail_ms {
         let blocks = ((tail_ms + BLOCK_MS / 2) / BLOCK_MS).max(1) as usize; // 四舍五入到 block
@@ -218,9 +218,9 @@ fn build_aec3_config(t: &Aec3Tuning) -> sonora::EchoCanceller3Config {
     c
 }
 
-#[cfg(feature = "sonora-engine")]
-fn ns_level(s: &str) -> sonora::config::NoiseSuppressionLevel {
-    use sonora::config::NoiseSuppressionLevel as L;
+#[cfg(feature = "aec3-engine")]
+fn ns_level(s: &str) -> aec3_apm::config::NoiseSuppressionLevel {
+    use aec3_apm::config::NoiseSuppressionLevel as L;
     match s.to_ascii_lowercase().as_str() {
         "low" => L::Low,
         "high" => L::High,
@@ -255,9 +255,9 @@ fn parse_reference_channels(v: &toml::Value) -> anyhow::Result<u16> {
 }
 
 // ── 真实 AEC3 实现 ────────────────────────────────────────────────────────────
-#[cfg(feature = "sonora-engine")]
+#[cfg(feature = "aec3-engine")]
 struct Inner {
-    apm: sonora::AudioProcessing,
+    apm: aec3_apm::AudioProcessing,
     far_channels: u16,
     near_buf: Vec<f32>,
     far_l: Vec<f32>,
@@ -267,10 +267,10 @@ struct Inner {
     out_buf: Vec<f32>,
 }
 
-#[cfg(feature = "sonora-engine")]
+#[cfg(feature = "aec3-engine")]
 impl Inner {
     fn new(tuning: &Aec3Tuning) -> Self {
-        use sonora::{AudioProcessing, StreamConfig};
+        use aec3_apm::{AudioProcessing, StreamConfig};
 
         let mut builder = AudioProcessing::builder().config(build_apm_config(tuning));
         // 仅在真有 AEC3 调参时注入(经 vendored fork 开放的入口);否则保持上游默认路径(§11.4)。
@@ -296,13 +296,13 @@ impl Inner {
     }
 }
 
-#[cfg(feature = "sonora-engine")]
-fn build_apm_config(tuning: &Aec3Tuning) -> sonora::Config {
-    use sonora::config::{
+#[cfg(feature = "aec3-engine")]
+fn build_apm_config(tuning: &Aec3Tuning) -> aec3_apm::Config {
+    use aec3_apm::config::{
         AdaptiveDigital, EchoCanceller, GainController2, NoiseSuppression, Pipeline,
     };
 
-    sonora::Config {
+    aec3_apm::Config {
         echo_canceller: Some(EchoCanceller::default()),
         noise_suppression: tuning.ns.then(|| NoiseSuppression {
             level: ns_level(&tuning.ns_level),
@@ -321,18 +321,18 @@ fn build_apm_config(tuning: &Aec3Tuning) -> sonora::Config {
     }
 }
 
-impl SonoraAec3 {
+impl Aec3Engine {
     fn apply_runtime_apm_config(&mut self) {
-        #[cfg(feature = "sonora-engine")]
+        #[cfg(feature = "aec3-engine")]
         {
             self.inner.apm.apply_config(build_apm_config(&self.tuning));
         }
     }
 }
 
-#[cfg(feature = "sonora-engine")]
-impl SonoraAec3 {
-    fn process_sonora(&mut self, near: &[f32], far: &[f32], out: &mut [f32], frames: usize) {
+#[cfg(feature = "aec3-engine")]
+impl Aec3Engine {
+    fn process_aec3(&mut self, near: &[f32], far: &[f32], out: &mut [f32], frames: usize) {
         let mut runtime_error_count = self.last.runtime_error_count;
         let mut last_backend_error = self.last.last_backend_error.clone();
         if self.stream_delay_pending {
@@ -411,7 +411,7 @@ impl SonoraAec3 {
 
         let s = self.inner.apm.statistics();
         self.last = ProcessorStats {
-            name: "sonora_aec3",
+            name: "aec3",
             erle_db: s.echo_return_loss_enhancement.unwrap_or(0.0) as f32,
             residual_echo_likelihood: s.residual_echo_likelihood.unwrap_or(0.0) as f32,
             estimated_delay_ms: s.delay_ms.unwrap_or(0),
@@ -431,12 +431,12 @@ impl SonoraAec3 {
     }
 }
 
-#[cfg(feature = "sonora-engine")]
+#[cfg(feature = "aec3-engine")]
 fn record_backend_error(
     runtime_error_count: &mut u64,
     last_backend_error: &mut Option<String>,
     stage: &str,
-    err: sonora::Error,
+    err: aec3_apm::Error,
 ) {
     *runtime_error_count = runtime_error_count.saturating_add(1);
     *last_backend_error = Some(format!("{stage}: {err}"));
@@ -454,7 +454,7 @@ mod tests {
 
     #[test]
     fn aec3_runtime_params_update_top_level_apm_tuning() {
-        let mut processor = SonoraAec3::new();
+        let mut processor = Aec3Engine::new();
 
         assert!(processor
             .set_runtime_param("ns", &toml::Value::Boolean(true))
@@ -476,7 +476,7 @@ mod tests {
 
     #[test]
     fn aec3_runtime_params_validate_types_and_values() {
-        let mut processor = SonoraAec3::new();
+        let mut processor = Aec3Engine::new();
 
         assert!(processor
             .set_runtime_param("ns", &toml::Value::String("true".into()))
@@ -495,10 +495,10 @@ mod tests {
             .contains("boolean"));
     }
 
-    #[cfg(feature = "sonora-engine")]
+    #[cfg(feature = "aec3-engine")]
     #[test]
-    fn sonora_backend_errors_are_reported_in_stats() {
-        let mut processor = SonoraAec3::new();
+    fn aec3_backend_errors_are_reported_in_stats() {
+        let mut processor = Aec3Engine::new();
         processor.set_stream_delay_ms(600);
 
         let near = vec![0.0; FRAME];
