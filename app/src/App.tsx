@@ -19,6 +19,7 @@ import {
   requestSystemAudio,
   setAec3Agc,
   setAec3Ns,
+  setBypass,
   setInitialDelayMs,
   setLocalvqeNoiseGate,
   setNearDelayMs,
@@ -252,6 +253,8 @@ type AppState = {
   devWin: boolean;
   io: IoResamplingState;
   rec: boolean;
+  // P8-D1:穿透中(sidecar 活着,mic 直通,AEC 保温)。UI 的「电源 OFF」= 此态。
+  bypassed: boolean;
   diagSeconds: number | null;
   diagDir: string;
 };
@@ -297,6 +300,7 @@ const INITIAL_APP_STATE: AppState = {
   devWin: false,
   io: null,
   rec: false,
+  bypassed: false,
   diagSeconds: null,
   diagDir: "",
 };
@@ -373,6 +377,7 @@ function useAppController() {
     devWin,
     io,
     rec,
+    bypassed,
     diagSeconds,
     diagDir,
   } = appState;
@@ -555,6 +560,15 @@ function useAppController() {
           if (ev.type === "localvqe_noise_gate_changed") {
             return;
           }
+          // 穿透回执:以后端为准校准(乐观更新失败时会被拉回)。
+          if (ev.type === "bypass_changed") {
+            updateApp((state) =>
+              state.bypassed === ev.bypassed
+                ? state
+                : { ...state, bypassed: ev.bypassed },
+            );
+            return;
+          }
           // 诊断录制收尾:writer 已 finalize 文件。仅「录满 max_seconds」时
           // 自动关开关 + 打开会话目录;stopped / run_exit / error 不弹目录。
           if (ev.type === "diagnostics_done") {
@@ -585,6 +599,13 @@ function useAppController() {
                 : state,
             );
           }
+          // status 常驻 bypassed 字段:兜底同步(如回执丢失/前端重载)。
+          if (typeof s.bypassed === "boolean") {
+            const sb = s.bypassed;
+            updateApp((state) =>
+              state.bypassed === sb ? state : { ...state, bypassed: sb },
+            );
+          }
           const tel = telRef.current;
           tel.mic = s.mic_dbfs;
           tel.ref = s.ref_dbfs;
@@ -599,7 +620,7 @@ function useAppController() {
       uns.push(
         await onRunExit((ev) => {
           telRef.current.on = false;
-          updateApp({ io: null });
+          updateApp({ io: null, bypassed: false });
           refSourceRef.current = null;
           cliVersionRef.current = null;
           runControlsRef.current = null;
@@ -791,7 +812,8 @@ function useAppController() {
       }
       telRef.current.on = true;
       await startRun(toml, 80);
-      updateApp({ powerOn: true });
+      // 启动即 AEC on(toml 不写 bypass,后端默认 false)。
+      updateApp({ powerOn: true, bypassed: false });
     } catch (e) {
       noteError(String(e));
       telRef.current.on = false;
@@ -808,7 +830,7 @@ function useAppController() {
       noteError(String(e));
     } finally {
       telRef.current.on = false;
-      updateApp({ powerOn: false, busy: false });
+      updateApp({ powerOn: false, bypassed: false, busy: false });
     }
   }
 
@@ -819,10 +841,22 @@ function useAppController() {
     else await stop();
   }
 
+  // P8-D1 语义(用户拍板 2026-07-04):电源 OFF = 穿透,mic 绝不变哑。
+  //   sidecar 未跑 → 启动(AEC on);
+  //   AEC on     → set_bypass(true):mic 直通,引擎保温,15ms crossfade;
+  //   穿透中     → set_bypass(false):瞬时恢复 AEC(零重收敛)。
+  // 「完全停机」不是用户级操作(退出应用 = 停);stop() 只服务重启/probe/错误路径。
   async function togglePower() {
     if (busy) return;
     if (powerOn) {
-      await stop();
+      if (!hasRunControl("set_bypass")) {
+        // 旧 CLI 兼容:没有热穿透命令时退回整机停转。
+        await stop();
+        return;
+      }
+      const next = !bypassed;
+      updateApp({ bypassed: next }); // 乐观更新,回执/status 会再校准
+      setBypass(next).catch((e) => noteError(String(e)));
       return;
     }
     // 引擎未就绪(无模型 / doctor 未过)→ 先去 Engine 配置,避免启动即失败。
@@ -1127,8 +1161,12 @@ function useAppController() {
   // 由 ProcessorChain 内部适配)。不符 → 阻止运行,引导去 Advanced 改采样率。
   const sysRefRateConflict = usingSysRef && pipeline.sample_rate !== 48000;
 
-  // 运行四态(含 A4 防抖):状态盒 / srail 状态字 / zsub 共用同一判定。
-  const statusKind = useRunStatusKind(powerOn, refSel, dev);
+  // UI 电源视觉态 = sidecar 在跑且未穿透。穿透时波形照常流动(mic 活着),
+  // 但字标熄灭 + 控制件调暗(AEC 不在工作)。
+  const uiOn = powerOn && !bypassed;
+
+  // 运行五态(含 A4 防抖):状态盒 / srail 状态字 / zsub 共用同一判定。
+  const statusKind = useRunStatusKind(powerOn, refSel, dev, bypassed);
 
   // Windows 托盘偏好:持久化 + 每次变更(含首个渲染 = 启动同步)推给 Rust。
   const [trayPrefs, updateTrayPrefs] = useState<TrayPrefsState>(readTrayPrefs);
@@ -1153,16 +1191,16 @@ function useAppController() {
 
   // v14/v17:字标随电源亮灭 —— 熄→亮播 crton(磷光渐暖),亮→熄播 crtoff(衰减)。
   const [wordAnim, setWordAnim] = useState("");
-  const prevPowerRef = useRef(powerOn);
+  const prevPowerRef = useRef(uiOn);
   useEffect(() => {
-    if (prevPowerRef.current === powerOn) return;
-    prevPowerRef.current = powerOn;
-    setWordAnim(powerOn ? "igniting" : "dying");
-  }, [powerOn]);
+    if (prevPowerRef.current === uiOn) return;
+    prevPowerRef.current = uiOn;
+    setWordAnim(uiOn ? "igniting" : "dying");
+  }, [uiOn]);
 
   return (
     <div
-      className={`window ${isMac ? "mac" : "win"} ${powerOn ? "" : "sysoff"}`}
+      className={`window ${isMac ? "mac" : "win"} ${uiOn ? "" : "sysoff"}`}
     >
       {/* ---- titlebar ---- */}
       <header className="tbar" data-tauri-drag-region>
@@ -1208,7 +1246,7 @@ function useAppController() {
           </div>
           {/* v6.1/v14:半调点阵字标,随电源亮灭 */}
           <div className="word">
-            <span className={`wtxt ${powerOn ? "lit" : ""} ${wordAnim}`}>
+            <span className={`wtxt ${uiOn ? "lit" : ""} ${wordAnim}`}>
               ECHOLESS
             </span>
           </div>
@@ -1229,7 +1267,7 @@ function useAppController() {
 
         <section className="zone zb">
           <div className="zhead">Power</div>
-          <SlideSwitch on={powerOn} onToggle={togglePower} disabled={busy} />
+          <SlideSwitch on={uiOn} onToggle={togglePower} disabled={busy} />
           <RuntimeStatusStrip statusKind={statusKind} />
           <RuntimeSubline
             statusKind={statusKind}

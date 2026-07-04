@@ -23,6 +23,8 @@ const D: Record<string, { en: string; zh: string }> = {
 
   removingEcho: { en: "Removing Echo", zh: "正在消除回声" },
   echoStopped: { en: "Echo Stopped", zh: "已停止" },
+  // P8-D1:OFF = 穿透 —— 强调 mic 仍然活着,只是 AEC 旁路。
+  bypassLive: { en: "Bypass · Mic Live", zh: "直通 · 麦克风在线" },
   unstable: { en: "Unstable", zh: "不稳定" },
   noReference: { en: "No Reference", zh: "无参考信号" },
   volWheel: {

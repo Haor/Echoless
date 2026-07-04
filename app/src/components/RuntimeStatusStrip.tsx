@@ -9,15 +9,15 @@ const SYS_AUDIO_PRIVACY_URL =
 
 const dash = (v: number | null, d = 1) => (v === null ? "—" : v.toFixed(d));
 
-// 运行四态(v3 语义):工作中 / 无参考 / 不稳定 / 已停止。
-export type RunStatusKind = "live" | "noref" | "warn" | "stopped";
+// 运行五态:工作中 / 无参考 / 不稳定 / 穿透(P8-D1:OFF = mic 直通) / 已停止。
+export type RunStatusKind = "live" | "noref" | "warn" | "bypass" | "stopped";
 
-// srail 监视状态字(v14:随四态 scramble)。
-// TODO(P8-D1):后端 set_bypass 落地后,stopped 语义改直通(AEC BYPASS)。
+// srail 监视状态字(v14:随状态 scramble)。
 export const RAIL_TEXT: Record<RunStatusKind, string> = {
   live: "MONITOR LIVE",
   noref: "REF SILENT",
   warn: "MONITOR LIVE",
+  bypass: "AEC BYPASS",
   stopped: "MONITOR HELD",
 };
 
@@ -34,6 +34,7 @@ export function useRunStatusKind(
   powerOn: boolean,
   refSel: string,
   dev: boolean,
+  bypassed = false,
 ): RunStatusKind {
   const live = useRuntimeLive();
 
@@ -53,11 +54,13 @@ export function useRunStatusKind(
 
   const raw: RunStatusKind = !powerOn
     ? "stopped"
-    : !live.healthy
-      ? "warn"
-      : !hasReference
-        ? "noref"
-        : "live";
+    : bypassed
+      ? "bypass"
+      : !live.healthy
+        ? "warn"
+        : !hasReference
+          ? "noref"
+          : "live";
 
   const [shown, setShown] = useState<RunStatusKind>(raw);
   const pending = useRef<{ kind: RunStatusKind; timer: number } | null>(null);
@@ -72,9 +75,15 @@ export function useRunStatusKind(
       clearPending(); // 候选态回归当前显示 → 取消切换
       return;
     }
-    if (raw === "stopped" || shown === "stopped" || raw === "live") {
+    if (
+      raw === "stopped" ||
+      shown === "stopped" ||
+      raw === "bypass" ||
+      shown === "bypass" ||
+      raw === "live"
+    ) {
       clearPending();
-      setShown(raw); // 开/关机与「恢复正常」立即反映;只有劣化才防抖
+      setShown(raw); // 开/关机、进出穿透、恢复正常立即反映;只有劣化才防抖
       return;
     }
     if (pending.current?.kind === raw) return; // 已在计时
@@ -98,6 +107,7 @@ const BOX_CLASS: Record<RunStatusKind, string> = {
   live: "box",
   noref: "box idle",
   warn: "box warn",
+  bypass: "box stopped", // 穿透 = 用户主动的「关」态,同停机灰阶
   stopped: "box stopped",
 };
 
@@ -111,11 +121,13 @@ export const RuntimeStatusStrip = memo(function RuntimeStatusStrip({
   const statusText =
     statusKind === "stopped"
       ? t("echoStopped")
-      : statusKind === "warn"
-        ? t("unstable")
-        : statusKind === "noref"
-          ? t("noReference")
-          : t("removingEcho");
+      : statusKind === "bypass"
+        ? t("bypassLive")
+        : statusKind === "warn"
+          ? t("unstable")
+          : statusKind === "noref"
+            ? t("noReference")
+            : t("removingEcho");
   return (
     <div className="status">
       <span className={BOX_CLASS[statusKind]}>

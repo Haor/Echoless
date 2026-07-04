@@ -181,6 +181,11 @@ export function setAec3Ns(ns: boolean, nsLevel: string): Promise<void> {
 export function setAec3Agc(agc: boolean): Promise<void> {
   return sendRunControl(JSON.stringify({ cmd: "set_aec3_agc", agc }));
 }
+// P8-D1:穿透开关(OFF = mic 原样直通虚拟麦)。chain 级 bypass,AEC 保温,
+// 15ms crossfade;运行中实时生效。
+export function setBypass(enabled: boolean): Promise<void> {
+  return sendRunControl(JSON.stringify({ cmd: "set_bypass", enabled }));
+}
 // Windows 托盘偏好(P5 契约,docs/frontend/FRONTEND_STATE_HANDOFF.md §9):
 // 启动时与每次变更时同步到 Rust;非 Windows 平台后端忽略。
 export function setTrayPrefs(
