@@ -77,11 +77,11 @@ jobs:
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
       - name: AEC3 tests
-        working-directory: vendor/aec3
+        working-directory: aec3
         run: cargo test -p aec3-apm -p aec3-core --locked
 
       - name: AEC3 clippy
-        working-directory: vendor/aec3
+        working-directory: aec3
         run: cargo clippy -p aec3-apm -p aec3-core --all-targets --locked -- -D warnings
 
       - name: Build release
@@ -113,7 +113,7 @@ jobs:
           set -euo pipefail
           cargo audit
           (cd app/src-tauri && cargo audit)
-          (cd vendor/aec3 && cargo audit)
+          (cd aec3 && cargo audit)
 
       - name: LocalVQE C API regression
         shell: bash
