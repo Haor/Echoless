@@ -3,6 +3,9 @@
 按优先级排列。设计真理来源:`AEC/Design/overview.html`(v17,文件头注释=同步决策清单);
 调研真理来源:`docs/architecture/` 两份方案 + `AEC/research/windows_aec_research.md`。
 
+> **2026-07-04 更新**:P3/P4/P5 的 Codex 任务规格已写成自包含文档(现状锚点已逐项核实校准),
+> 见 `docs/codex-tasks/`(README 含派发方式与合并纪律)。派发时以规格文档为准,本文件只管优先级。
+
 ## 执行规划(worktree + 分工)
 
 前端(Claude)与后端(Codex)完全解耦,用 git worktree 并行:
