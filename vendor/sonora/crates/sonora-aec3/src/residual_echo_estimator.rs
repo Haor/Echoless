@@ -282,21 +282,18 @@ impl ResidualEchoEstimator {
 
     fn update_render_noise_power(&mut self, render_buffer: &RenderBuffer<'_>) {
         let x2 = render_buffer.spectrum(0);
-        let render_power: Vec<f32>;
-        let render_power_ref: &[f32];
+        let mut render_power = [0.0f32; FFT_LENGTH_BY_2_PLUS_1];
 
-        if self.num_render_channels > 1 {
-            let mut power_data = [0.0f32; FFT_LENGTH_BY_2_PLUS_1];
+        let render_power_ref = if self.num_render_channels > 1 {
             for channel_power in &x2[..self.num_render_channels] {
-                for (pd_k, &cp_k) in power_data.iter_mut().zip(channel_power.iter()) {
+                for (pd_k, &cp_k) in render_power.iter_mut().zip(channel_power.iter()) {
                     *pd_k += cp_k;
                 }
             }
-            render_power = power_data.to_vec();
-            render_power_ref = &render_power;
+            render_power.as_slice()
         } else {
-            render_power_ref = &x2[0];
-        }
+            &x2[0]
+        };
 
         // Estimate the stationary noise power in a minimum statistics manner.
         for ((&rp_k, nf_k), nfc_k) in render_power_ref

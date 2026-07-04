@@ -64,7 +64,7 @@ pub struct SonoraAec3 {
     #[cfg(feature = "sonora-engine")]
     inner: Inner,
     #[cfg(feature = "sonora-engine")]
-    delay_applied: bool,
+    stream_delay_pending: bool,
 }
 
 impl SonoraAec3 {
@@ -74,7 +74,7 @@ impl SonoraAec3 {
             #[cfg(feature = "sonora-engine")]
             inner: Inner::new(&tuning),
             #[cfg(feature = "sonora-engine")]
-            delay_applied: false,
+            stream_delay_pending: false,
             tuning,
             initial_delay_ms: 0,
             last: ProcessorStats::empty("sonora_aec3"),
@@ -132,7 +132,7 @@ impl EchoProcessor for SonoraAec3 {
         #[cfg(feature = "sonora-engine")]
         {
             self.inner = Inner::new(&self.tuning);
-            self.delay_applied = false;
+            self.stream_delay_pending = self.initial_delay_ms > 0;
         }
         Ok(())
     }
@@ -140,7 +140,35 @@ impl EchoProcessor for SonoraAec3 {
         self.initial_delay_ms = ms;
         #[cfg(feature = "sonora-engine")]
         {
-            self.delay_applied = false;
+            self.stream_delay_pending = true;
+        }
+    }
+    fn set_runtime_param(&mut self, key: &str, value: &toml::Value) -> anyhow::Result<bool> {
+        match key {
+            "ns" => {
+                self.tuning.ns = value
+                    .as_bool()
+                    .ok_or_else(|| anyhow::anyhow!("ns must be a boolean"))?;
+                self.apply_runtime_apm_config();
+                Ok(true)
+            }
+            "ns_level" => {
+                let level = value
+                    .as_str()
+                    .ok_or_else(|| anyhow::anyhow!("ns_level must be a string"))?;
+                validate_ns_level(level)?;
+                self.tuning.ns_level = level.to_string();
+                self.apply_runtime_apm_config();
+                Ok(true)
+            }
+            "agc" => {
+                self.tuning.agc = value
+                    .as_bool()
+                    .ok_or_else(|| anyhow::anyhow!("agc must be a boolean"))?;
+                self.apply_runtime_apm_config();
+                Ok(true)
+            }
+            _ => Ok(false),
         }
     }
     fn process(&mut self, near: &[f32], far: &[f32], out: &mut [f32], frames: u32) {
@@ -151,11 +179,7 @@ impl EchoProcessor for SonoraAec3 {
         #[cfg(not(feature = "sonora-engine"))]
         {
             let _ = (far, frames);
-            let n = out.len().min(near.len());
-            out[..n].copy_from_slice(&near[..n]);
-            for v in out[n..].iter_mut() {
-                *v = 0.0;
-            }
+            crate::dsp::copy_or_zero(near, out);
         }
     }
     fn stats(&self) -> ProcessorStats {
@@ -165,7 +189,7 @@ impl EchoProcessor for SonoraAec3 {
         #[cfg(feature = "sonora-engine")]
         {
             self.inner = Inner::new(&self.tuning);
-            self.delay_applied = false;
+            self.stream_delay_pending = self.initial_delay_ms > 0;
         }
     }
 }
@@ -205,6 +229,13 @@ fn ns_level(s: &str) -> sonora::config::NoiseSuppressionLevel {
     }
 }
 
+fn validate_ns_level(s: &str) -> anyhow::Result<()> {
+    match s.to_ascii_lowercase().as_str() {
+        "low" | "moderate" | "high" | "veryhigh" | "very_high" | "very-high" => Ok(()),
+        _ => anyhow::bail!("ns_level must be one of: low, moderate, high, veryhigh"),
+    }
+}
+
 fn parse_reference_channels(v: &toml::Value) -> anyhow::Result<u16> {
     if let Some(n) = v.as_integer() {
         return match n {
@@ -239,30 +270,9 @@ struct Inner {
 #[cfg(feature = "sonora-engine")]
 impl Inner {
     fn new(tuning: &Aec3Tuning) -> Self {
-        use sonora::config::{
-            AdaptiveDigital, EchoCanceller, GainController2, NoiseSuppression, Pipeline,
-        };
-        use sonora::{AudioProcessing, Config, StreamConfig};
+        use sonora::{AudioProcessing, StreamConfig};
 
-        let config = Config {
-            echo_canceller: Some(EchoCanceller::default()),
-            noise_suppression: tuning.ns.then(|| NoiseSuppression {
-                level: ns_level(&tuning.ns_level),
-                ..Default::default()
-            }),
-            gain_controller2: tuning.agc.then(|| GainController2 {
-                adaptive_digital: Some(AdaptiveDigital::default()),
-                ..Default::default()
-            }),
-            pipeline: Pipeline {
-                multi_channel_render: tuning.far_channels > 1,
-                multi_channel_capture: false, // near = mono
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-
-        let mut builder = AudioProcessing::builder().config(config);
+        let mut builder = AudioProcessing::builder().config(build_apm_config(tuning));
         // 仅在真有 AEC3 调参时注入(经 vendored fork 开放的入口);否则保持上游默认路径(§11.4)。
         if !tuning.aec3_is_default() {
             builder = builder.aec3_config(build_aec3_config(tuning));
@@ -287,11 +297,54 @@ impl Inner {
 }
 
 #[cfg(feature = "sonora-engine")]
+fn build_apm_config(tuning: &Aec3Tuning) -> sonora::Config {
+    use sonora::config::{
+        AdaptiveDigital, EchoCanceller, GainController2, NoiseSuppression, Pipeline,
+    };
+
+    sonora::Config {
+        echo_canceller: Some(EchoCanceller::default()),
+        noise_suppression: tuning.ns.then(|| NoiseSuppression {
+            level: ns_level(&tuning.ns_level),
+            ..Default::default()
+        }),
+        gain_controller2: tuning.agc.then(|| GainController2 {
+            adaptive_digital: Some(AdaptiveDigital::default()),
+            ..Default::default()
+        }),
+        pipeline: Pipeline {
+            multi_channel_render: tuning.far_channels > 1,
+            multi_channel_capture: false, // near = mono
+            ..Default::default()
+        },
+        ..Default::default()
+    }
+}
+
+impl SonoraAec3 {
+    fn apply_runtime_apm_config(&mut self) {
+        #[cfg(feature = "sonora-engine")]
+        {
+            self.inner.apm.apply_config(build_apm_config(&self.tuning));
+        }
+    }
+}
+
+#[cfg(feature = "sonora-engine")]
 impl SonoraAec3 {
     fn process_sonora(&mut self, near: &[f32], far: &[f32], out: &mut [f32], frames: usize) {
-        if !self.delay_applied && self.initial_delay_ms > 0 {
-            let _ = self.inner.apm.set_stream_delay_ms(self.initial_delay_ms);
-            self.delay_applied = true;
+        let mut runtime_error_count = self.last.runtime_error_count;
+        let mut last_backend_error = self.last.last_backend_error.clone();
+        if self.stream_delay_pending {
+            if let Err(err) = self.inner.apm.set_stream_delay_ms(self.initial_delay_ms) {
+                record_backend_error(
+                    &mut runtime_error_count,
+                    &mut last_backend_error,
+                    "set_stream_delay_ms",
+                    err,
+                );
+            }
+            self.stream_delay_pending = false;
         }
 
         let mut i = 0;
@@ -319,21 +372,37 @@ impl SonoraAec3 {
             }
 
             // 先 render(far),再 capture(near)
-            if self.inner.far_channels > 1 {
-                let _ = self.inner.apm.process_render_f32(
+            let render_result = if self.inner.far_channels > 1 {
+                self.inner.apm.process_render_f32(
                     &[&self.inner.far_l, &self.inner.far_r],
                     &mut [&mut self.inner.far_out_l, &mut self.inner.far_out_r],
-                );
+                )
             } else {
-                let _ = self
-                    .inner
+                self.inner
                     .apm
-                    .process_render_f32(&[&self.inner.far_l], &mut [&mut self.inner.far_out_l]);
+                    .process_render_f32(&[&self.inner.far_l], &mut [&mut self.inner.far_out_l])
+            };
+            if let Err(err) = render_result {
+                record_backend_error(
+                    &mut runtime_error_count,
+                    &mut last_backend_error,
+                    "process_render_f32",
+                    err,
+                );
             }
-            let _ = self
+            if let Err(err) = self
                 .inner
                 .apm
-                .process_capture_f32(&[&self.inner.near_buf], &mut [&mut self.inner.out_buf]);
+                .process_capture_f32(&[&self.inner.near_buf], &mut [&mut self.inner.out_buf])
+            {
+                record_backend_error(
+                    &mut runtime_error_count,
+                    &mut last_backend_error,
+                    "process_capture_f32",
+                    err,
+                );
+                self.inner.out_buf[..blk].copy_from_slice(&self.inner.near_buf[..blk]);
+            }
 
             let n = blk.min(out.len().saturating_sub(i));
             out[i..i + n].copy_from_slice(&self.inner.out_buf[..n]);
@@ -354,12 +423,23 @@ impl SonoraAec3 {
                 .unwrap_or(false),
             mic_clipped: false,
             process_time_ms: 0.0,
-            runtime_error_count: 0,
+            runtime_error_count,
             selected_model: None,
             selected_gpu_arch: None,
-            last_backend_error: None,
+            last_backend_error,
         };
     }
+}
+
+#[cfg(feature = "sonora-engine")]
+fn record_backend_error(
+    runtime_error_count: &mut u64,
+    last_backend_error: &mut Option<String>,
+    stage: &str,
+    err: sonora::Error,
+) {
+    *runtime_error_count = runtime_error_count.saturating_add(1);
+    *last_backend_error = Some(format!("{stage}: {err}"));
 }
 
 #[cfg(test)]
@@ -370,5 +450,67 @@ mod tests {
     fn aec3_default_ns_level_matches_frontend_contract() {
         let tuning = Aec3Tuning::default();
         assert_eq!(tuning.ns_level, "low");
+    }
+
+    #[test]
+    fn aec3_runtime_params_update_top_level_apm_tuning() {
+        let mut processor = SonoraAec3::new();
+
+        assert!(processor
+            .set_runtime_param("ns", &toml::Value::Boolean(true))
+            .unwrap());
+        assert!(processor
+            .set_runtime_param("ns_level", &toml::Value::String("high".into()))
+            .unwrap());
+        assert!(processor
+            .set_runtime_param("agc", &toml::Value::Boolean(true))
+            .unwrap());
+        assert!(!processor
+            .set_runtime_param("tail_ms", &toml::Value::Integer(120))
+            .unwrap());
+
+        assert!(processor.tuning.ns);
+        assert_eq!(processor.tuning.ns_level, "high");
+        assert!(processor.tuning.agc);
+    }
+
+    #[test]
+    fn aec3_runtime_params_validate_types_and_values() {
+        let mut processor = SonoraAec3::new();
+
+        assert!(processor
+            .set_runtime_param("ns", &toml::Value::String("true".into()))
+            .unwrap_err()
+            .to_string()
+            .contains("boolean"));
+        assert!(processor
+            .set_runtime_param("ns_level", &toml::Value::String("extreme".into()))
+            .unwrap_err()
+            .to_string()
+            .contains("ns_level must be one of"));
+        assert!(processor
+            .set_runtime_param("agc", &toml::Value::Integer(1))
+            .unwrap_err()
+            .to_string()
+            .contains("boolean"));
+    }
+
+    #[cfg(feature = "sonora-engine")]
+    #[test]
+    fn sonora_backend_errors_are_reported_in_stats() {
+        let mut processor = SonoraAec3::new();
+        processor.set_stream_delay_ms(600);
+
+        let near = vec![0.0; FRAME];
+        let far = vec![0.0; FRAME];
+        let mut out = vec![1.0; FRAME];
+        processor.process(&near, &far, &mut out, FRAME as u32);
+
+        let stats = processor.stats();
+        assert_eq!(stats.runtime_error_count, 1);
+        assert!(stats
+            .last_backend_error
+            .as_deref()
+            .is_some_and(|err| err.contains("set_stream_delay_ms: stream parameter was clamped")));
     }
 }

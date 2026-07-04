@@ -27,16 +27,14 @@ impl PartialEq for SaturationProtectorBuffer {
         if self.size != other.size {
             return false;
         }
-        let mut i0 = self.front_index();
-        let mut i1 = other.front_index();
-        for _ in 0..self.size {
-            if self.buffer[i0 % SATURATION_PROTECTOR_BUFFER_SIZE]
-                != other.buffer[i1 % SATURATION_PROTECTOR_BUFFER_SIZE]
-            {
+        let front0 = self.front_index();
+        let front1 = other.front_index();
+        for offset in 0..self.size {
+            let i0 = (front0 + offset) % SATURATION_PROTECTOR_BUFFER_SIZE;
+            let i1 = (front1 + offset) % SATURATION_PROTECTOR_BUFFER_SIZE;
+            if self.buffer[i0] != other.buffer[i1] {
                 return false;
             }
-            i0 += 1;
-            i1 += 1;
         }
         true
     }

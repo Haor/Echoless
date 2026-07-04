@@ -19,10 +19,11 @@ export interface AudioDevice {
   is_default: boolean;
   selector: string; // 设备索引字符串(跨重启不稳)
   stable_id: string; // 跨重启稳定 id(CoreAudio/WASAPI 派生);mic/output 配置优先用它
-  default_sample_rate: number;
+  // GUI fast device enumeration may intentionally skip driver format probing.
+  default_sample_rate: number | null;
   supported_sample_rates?: SupportedSampleRateRange[] | { error: string };
-  channels: number;
-  sample_format: string;
+  channels: number | null;
+  sample_format: string | null;
   config_error: string | null;
 }
 
@@ -101,6 +102,7 @@ export interface RuntimeStatus {
   mic_q_samples: number;
   ref_q_samples: number;
   out_q_samples: number;
+  input_queue_latency_ms: number;
   output_queue_latency_ms: number;
   algorithmic_latency_ms: number;
   estimated_user_latency_ms: number;
@@ -163,13 +165,41 @@ export interface OutputLevelChangedEvent {
   output_level: number;
   output_gain_db: number | null;
 }
+// set_near_delay_ms 实时生效后的回执(值由前端驱动,UI 仅忽略)。
+export interface NearDelayChangedEvent {
+  type: "near_delay_changed";
+  near_delay_ms: number;
+  near_delay_samples: number;
+}
+export interface InitialDelayChangedEvent {
+  type: "initial_delay_changed";
+  initial_delay_ms: number;
+}
+export interface Aec3NsChangedEvent {
+  type: "aec3_ns_changed";
+  ns: boolean;
+  ns_level: string;
+}
+export interface Aec3AgcChangedEvent {
+  type: "aec3_agc_changed";
+  agc: boolean;
+}
+export interface LocalvqeNoiseGateChangedEvent {
+  type: "localvqe_noise_gate_changed";
+  noise_gate: boolean;
+  noise_gate_threshold_dbfs: number;
+}
 
 // run --status-json 在音频流启动后先发的一条事件。
 export interface StartedEvent {
   type: "started";
+  cli_version?: string;
+  supported_controls?: string[];
   backend: string;
   sample_rate: number;
   frame_ms: number;
+  near_delay_ms?: number;
+  near_delay_samples?: number;
   reference_channels: string;
   mic_device_sample_rate?: number | null;
   output_device_sample_rate?: number | null;
@@ -191,7 +221,12 @@ export type RunEvent =
   | DiagnosticsStartedEvent
   | DiagnosticsStoppingEvent
   | ControlErrorEvent
-  | OutputLevelChangedEvent;
+  | OutputLevelChangedEvent
+  | NearDelayChangedEvent
+  | InitialDelayChangedEvent
+  | Aec3NsChangedEvent
+  | Aec3AgcChangedEvent
+  | LocalvqeNoiseGateChangedEvent;
 
 // ---- doctor audio --json(虚拟声卡检测) ----
 export interface DoctorCandidate {

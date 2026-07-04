@@ -2,8 +2,11 @@
   "name": "echoless-app",
   "private": true,
   "version": "0.1.0",
+  "packageManager": "pnpm@10.28.0",
   "type": "module",
   "scripts": {
+    "prepare:tauri-assets": "node scripts/prepare-tauri-assets.mjs",
+    "smoke:tauri-bundle": "node scripts/smoke-tauri-bundle.mjs",
     "dev": "vite",
     "build": "tsc && vite build",
     "preview": "vite preview",

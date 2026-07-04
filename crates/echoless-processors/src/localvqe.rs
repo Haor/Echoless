@@ -8,10 +8,12 @@ use anyhow::{bail, Context, Result};
 use libloading::Library;
 use std::collections::VecDeque;
 use std::ffi::{CStr, CString};
+#[cfg(target_os = "windows")]
+use std::os::raw::c_void;
 use std::os::raw::{c_char, c_float, c_int};
 use std::path::{Path, PathBuf};
 
-use crate::{EchoProcessor, IoSpec, ProcessorStats};
+use crate::{dsp::copy_or_zero, EchoProcessor, IoSpec, ProcessorStats};
 
 const LOCALVQE_SAMPLE_RATE: u32 = 16_000;
 const DEFAULT_NOISE_GATE_THRESHOLD_DBFS: f32 = -45.0;
@@ -47,8 +49,9 @@ pub struct LocalVqe {
     noise_gate: bool,
     noise_gate_threshold_dbfs: f32,
     runtime: Option<LocalVqeRuntime>,
-    near_buffer: Vec<f32>,
-    far_buffer: Vec<f32>,
+    near_buffer: VecDeque<f32>,
+    far_buffer: VecDeque<f32>,
+    frame_out: Vec<f32>,
     out_queue: VecDeque<f32>,
     started: bool,
     last_error: Option<String>,
@@ -65,8 +68,9 @@ impl LocalVqe {
             noise_gate: false,
             noise_gate_threshold_dbfs: DEFAULT_NOISE_GATE_THRESHOLD_DBFS,
             runtime: None,
-            near_buffer: Vec::new(),
-            far_buffer: Vec::new(),
+            near_buffer: VecDeque::new(),
+            far_buffer: VecDeque::new(),
+            frame_out: Vec::new(),
             out_queue: VecDeque::new(),
             started: false,
             last_error: None,
@@ -134,8 +138,10 @@ impl LocalVqe {
         }
 
         for i in 0..samples {
-            self.near_buffer.push(near.get(i).copied().unwrap_or(0.0));
-            self.far_buffer.push(far.get(i).copied().unwrap_or(0.0));
+            self.near_buffer
+                .push_back(near.get(i).copied().unwrap_or(0.0));
+            self.far_buffer
+                .push_back(far.get(i).copied().unwrap_or(0.0));
         }
 
         let runtime = self
@@ -143,16 +149,24 @@ impl LocalVqe {
             .as_mut()
             .context("localvqe runtime is not configured")?;
         let hop = runtime.hop;
-        let mut frame_out = vec![0.0; hop];
+        if self.frame_out.len() != hop {
+            self.frame_out.resize(hop, 0.0);
+        }
         while self.near_buffer.len() >= hop && self.far_buffer.len() >= hop {
-            runtime.process_frame(
-                &self.near_buffer[..hop],
-                &self.far_buffer[..hop],
-                &mut frame_out,
-            )?;
-            self.near_buffer.drain(..hop);
-            self.far_buffer.drain(..hop);
-            self.out_queue.extend(frame_out.iter().copied());
+            {
+                let near_buffer = self.near_buffer.make_contiguous();
+                let far_buffer = self.far_buffer.make_contiguous();
+                runtime.process_frame(
+                    &near_buffer[..hop],
+                    &far_buffer[..hop],
+                    &mut self.frame_out,
+                )?;
+            }
+            for _ in 0..hop {
+                let _ = self.near_buffer.pop_front();
+                let _ = self.far_buffer.pop_front();
+            }
+            self.out_queue.extend(self.frame_out.iter().copied());
         }
 
         let start_threshold = samples.saturating_add(hop);
@@ -204,6 +218,7 @@ impl EchoProcessor for LocalVqe {
             .unwrap_or(DEFAULT_NOISE_GATE_THRESHOLD_DBFS);
 
         let runtime = self.load_runtime()?;
+        self.frame_out.resize(runtime.hop, 0.0);
         self.runtime = Some(runtime);
         self.reset_stream_state();
         Ok(())
@@ -211,13 +226,32 @@ impl EchoProcessor for LocalVqe {
 
     fn process(&mut self, near: &[f32], far: &[f32], out: &mut [f32], frames: u32) {
         if self.runtime.is_none() {
-            copy_into(near, out);
+            copy_or_zero(near, out);
             return;
         }
 
         if let Err(err) = self.process_loaded(near, far, out, frames as usize) {
             self.last_error = Some(err.to_string());
-            copy_into(near, out);
+            copy_or_zero(near, out);
+        }
+    }
+
+    fn set_runtime_param(&mut self, key: &str, value: &toml::Value) -> Result<bool> {
+        match key {
+            "noise_gate" => {
+                self.noise_gate = value
+                    .as_bool()
+                    .ok_or_else(|| anyhow::anyhow!("noise_gate must be a boolean"))?;
+                self.apply_runtime_noise_gate()?;
+                Ok(true)
+            }
+            "noise_gate_threshold_dbfs" => {
+                self.noise_gate_threshold_dbfs =
+                    toml_value_to_f32(value, "noise_gate_threshold_dbfs")?;
+                self.apply_runtime_noise_gate()?;
+                Ok(true)
+            }
+            _ => Ok(false),
         }
     }
 
@@ -230,6 +264,15 @@ impl EchoProcessor for LocalVqe {
             runtime.reset();
         }
         self.reset_stream_state();
+    }
+}
+
+impl LocalVqe {
+    fn apply_runtime_noise_gate(&mut self) -> Result<()> {
+        if let Some(runtime) = self.runtime.as_mut() {
+            runtime.set_noise_gate(self.noise_gate, self.noise_gate_threshold_dbfs)?;
+        }
+        Ok(())
     }
 }
 
@@ -348,6 +391,17 @@ impl LocalVqeRuntime {
     fn reset(&mut self) {
         unsafe { (self.api.reset)(self.ctx) };
     }
+
+    fn set_noise_gate(&mut self, enabled: bool, threshold_dbfs: f32) -> Result<()> {
+        check_runtime(
+            &self.api,
+            self.ctx,
+            unsafe {
+                (self.api.set_noise_gate)(self.ctx, if enabled { 1 } else { 0 }, threshold_dbfs)
+            },
+            "set_noise_gate",
+        )
+    }
 }
 
 impl Drop for LocalVqeRuntime {
@@ -388,6 +442,7 @@ struct LocalVqeApi {
 
 impl LocalVqeApi {
     fn load(path: &Path) -> Result<Self> {
+        let _dll_dir_guard = localvqe_dll_directory_guard(path)?;
         let lib = unsafe { Library::new(path) }
             .with_context(|| format!("failed to open localvqe library {}", path.display()))?;
         unsafe {
@@ -432,6 +487,89 @@ unsafe fn symbol<T: Copy>(lib: &Library, name: &[u8]) -> Result<T> {
     })?)
 }
 
+#[cfg(target_os = "windows")]
+fn localvqe_dll_directory_guard(path: &Path) -> Result<Option<LocalVqeDllDirectoryGuard>> {
+    let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    else {
+        return Ok(None);
+    };
+    let dir = if parent.is_absolute() {
+        parent.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .with_context(|| format!("failed to resolve current directory for {}", path.display()))?
+            .join(parent)
+    };
+    LocalVqeDllDirectoryGuard::new(&[dir]).map(Some)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn localvqe_dll_directory_guard(_path: &Path) -> Result<Option<()>> {
+    Ok(None)
+}
+
+#[cfg(target_os = "windows")]
+struct LocalVqeDllDirectoryGuard {
+    cookies: Vec<*mut c_void>,
+    _paths: Vec<Vec<u16>>,
+}
+
+#[cfg(target_os = "windows")]
+impl LocalVqeDllDirectoryGuard {
+    fn new(paths: &[PathBuf]) -> Result<Self> {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::System::LibraryLoader::{
+            AddDllDirectory, SetDefaultDllDirectories, LOAD_LIBRARY_SEARCH_DEFAULT_DIRS,
+            LOAD_LIBRARY_SEARCH_USER_DIRS,
+        };
+
+        let ok = unsafe {
+            SetDefaultDllDirectories(
+                LOAD_LIBRARY_SEARCH_DEFAULT_DIRS | LOAD_LIBRARY_SEARCH_USER_DIRS,
+            )
+        };
+        if ok == 0 {
+            return Err(std::io::Error::last_os_error())
+                .context("failed to set Windows DLL default search paths for LocalVQE");
+        }
+
+        let mut cookies = Vec::new();
+        let mut wide_paths = Vec::new();
+        for path in paths {
+            let wide: Vec<u16> = path
+                .as_os_str()
+                .encode_wide()
+                .chain(std::iter::once(0))
+                .collect();
+            let cookie = unsafe { AddDllDirectory(wide.as_ptr()) };
+            if cookie.is_null() {
+                return Err(std::io::Error::last_os_error())
+                    .with_context(|| format!("failed to add DLL directory {}", path.display()));
+            }
+            cookies.push(cookie);
+            wide_paths.push(wide);
+        }
+        Ok(Self {
+            cookies,
+            _paths: wide_paths,
+        })
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl Drop for LocalVqeDllDirectoryGuard {
+    fn drop(&mut self) {
+        use windows_sys::Win32::System::LibraryLoader::RemoveDllDirectory;
+        for cookie in self.cookies.drain(..) {
+            unsafe {
+                RemoveDllDirectory(cookie);
+            }
+        }
+    }
+}
+
 fn required_path(params: &toml::Table, key: &str) -> Result<Option<PathBuf>> {
     match params.get(key).and_then(|v| v.as_str()) {
         Some(value) if !value.trim().is_empty() => Ok(Some(PathBuf::from(value))),
@@ -473,11 +611,24 @@ fn optional_i32(params: &toml::Table, key: &str) -> Result<Option<i32>> {
 
 fn optional_f32(params: &toml::Table, key: &str) -> Result<Option<f32>> {
     match params.get(key) {
-        Some(toml::Value::Float(v)) => Ok(Some(*v as f32)),
-        Some(toml::Value::Integer(v)) => Ok(Some(*v as f32)),
+        Some(v @ (toml::Value::Float(_) | toml::Value::Integer(_))) => {
+            Ok(Some(toml_value_to_f32(v, key)?))
+        }
         Some(_) => bail!("localvqe {key} must be a number"),
         None => Ok(None),
     }
+}
+
+fn toml_value_to_f32(value: &toml::Value, key: &str) -> Result<f32> {
+    let f = match value {
+        toml::Value::Float(v) => *v,
+        toml::Value::Integer(v) => *v as f64,
+        _ => bail!("localvqe {key} must be a number"),
+    };
+    if !f.is_finite() {
+        bail!("localvqe {key} must be finite");
+    }
+    Ok(f as f32)
 }
 
 fn library_candidates(configured: Option<&Path>) -> Vec<PathBuf> {
@@ -503,10 +654,6 @@ fn library_candidates(configured: Option<&Path>) -> Vec<PathBuf> {
             push_default_library_candidates(&mut candidates, dir);
             push_default_library_candidates(&mut candidates, &dir.join("localvqe"));
         }
-    }
-    if let Ok(cwd) = std::env::current_dir() {
-        push_default_library_candidates(&mut candidates, &cwd);
-        push_default_library_candidates(&mut candidates, &cwd.join("localvqe"));
     }
     candidates
 }
@@ -548,12 +695,6 @@ fn check_runtime(api: &LocalVqeApi, ctx: LocalVqeCtx, ret: c_int, call: &str) ->
     }
 }
 
-fn copy_into(src: &[f32], dst: &mut [f32]) {
-    let n = dst.len().min(src.len());
-    dst[..n].copy_from_slice(&src[..n]);
-    dst[n..].fill(0.0);
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -586,6 +727,86 @@ mod tests {
         let _ = std::fs::remove_file(&model);
         assert!(err.to_string().contains("localvqe"));
         assert!(err.to_string().contains("library"));
+    }
+
+    #[test]
+    fn reset_stream_state_keeps_reusable_frame_buffer() {
+        let mut processor = LocalVqe::new();
+        processor.near_buffer.extend([1.0, 2.0]);
+        processor.far_buffer.extend([3.0, 4.0]);
+        processor.out_queue.extend([5.0, 6.0]);
+        processor.frame_out.resize(160, 0.0);
+
+        processor.reset_stream_state();
+
+        assert!(processor.near_buffer.is_empty());
+        assert!(processor.far_buffer.is_empty());
+        assert!(processor.out_queue.is_empty());
+        assert_eq!(processor.frame_out.len(), 160);
+    }
+
+    #[test]
+    fn runtime_params_update_localvqe_noise_gate_tuning() {
+        let mut processor = LocalVqe::new();
+
+        assert!(processor
+            .set_runtime_param("noise_gate", &toml::Value::Boolean(true))
+            .unwrap());
+        assert!(processor
+            .set_runtime_param("noise_gate_threshold_dbfs", &toml::Value::Float(-40.5))
+            .unwrap());
+        assert!(!processor
+            .set_runtime_param("threads", &toml::Value::Integer(2))
+            .unwrap());
+
+        assert!(processor.noise_gate);
+        assert_eq!(processor.noise_gate_threshold_dbfs, -40.5);
+    }
+
+    #[test]
+    fn runtime_params_validate_localvqe_noise_gate_types() {
+        let mut processor = LocalVqe::new();
+
+        assert!(processor
+            .set_runtime_param("noise_gate", &toml::Value::String("true".into()))
+            .unwrap_err()
+            .to_string()
+            .contains("boolean"));
+        assert!(processor
+            .set_runtime_param(
+                "noise_gate_threshold_dbfs",
+                &toml::Value::String("-40".into()),
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("number"));
+    }
+
+    #[test]
+    fn default_library_candidates_exclude_current_directory() {
+        let cwd = std::env::current_dir().unwrap();
+        let candidates = library_candidates(None);
+
+        for name in DEFAULT_LIBRARY_NAMES {
+            assert!(
+                !candidates.contains(&cwd.join(name)),
+                "default candidates should not include CWD library {name}: {candidates:?}"
+            );
+            assert!(
+                !candidates.contains(&cwd.join("localvqe").join(name)),
+                "default candidates should not include CWD/localvqe library {name}: {candidates:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_relative_library_keeps_cwd_candidate() {
+        let relative = Path::new(DEFAULT_LIBRARY_NAMES[0]);
+        let cwd = std::env::current_dir().unwrap();
+        let candidates = library_candidates(Some(relative));
+
+        assert!(candidates.contains(&relative.to_path_buf()));
+        assert!(candidates.contains(&cwd.join(relative)));
     }
 
     #[test]

@@ -42,6 +42,12 @@ export interface LocalvqeModel {
 export interface LocalvqeAssets {
   models_dir: string;
   models: LocalvqeModel[];
+  native_ready?: boolean;
+  library_path?: string | null;
+  native_dir?: string | null;
+  native_files?: string[];
+  cli_path?: string | null;
+  process_tap_helper_path?: string | null;
 }
 export function localvqeAssets(): Promise<LocalvqeAssets> {
   return invoke<LocalvqeAssets>("localvqe_assets");
@@ -133,8 +139,8 @@ export function stopRun(): Promise<void> {
   return invoke<void>("stop_run");
 }
 
-// 向运行中的子进程 stdin 写一行 JSON 控制命令(就地起停录制,不重启 run)。
-export function sendRunControl(line: string): Promise<void> {
+// 向运行中的子进程 stdin 写一行 JSON 控制命令。具体能力以 started.supported_controls 为准。
+function sendRunControl(line: string): Promise<void> {
   return invoke<void>("send_run_control", { line });
 }
 export function startDiagnostics(
@@ -155,6 +161,37 @@ export function stopDiagnostics(): Promise<void> {
 // 运行中实时改输出电平(0-100),逐 buffer 生效、零掉音。仅在 run 存活时调用。
 export function setOutputLevel(level: number): Promise<void> {
   return sendRunControl(JSON.stringify({ cmd: "set_output_level", level }));
+}
+// 运行中实时改近端对齐延迟(ms),只调整处理线程里的 delay buffer,不重启 run。
+export function setNearDelayMs(nearDelayMs: number): Promise<void> {
+  return sendRunControl(
+    JSON.stringify({ cmd: "set_near_delay_ms", near_delay_ms: nearDelayMs }),
+  );
+}
+export function setInitialDelayMs(initialDelayMs: number): Promise<void> {
+  return sendRunControl(
+    JSON.stringify({ cmd: "set_initial_delay_ms", initial_delay_ms: initialDelayMs }),
+  );
+}
+export function setAec3Ns(ns: boolean, nsLevel: string): Promise<void> {
+  return sendRunControl(
+    JSON.stringify({ cmd: "set_aec3_ns", ns, ns_level: nsLevel }),
+  );
+}
+export function setAec3Agc(agc: boolean): Promise<void> {
+  return sendRunControl(JSON.stringify({ cmd: "set_aec3_agc", agc }));
+}
+export function setLocalvqeNoiseGate(
+  noiseGate: boolean,
+  noiseGateThresholdDbfs: number,
+): Promise<void> {
+  return sendRunControl(
+    JSON.stringify({
+      cmd: "set_localvqe_noise_gate",
+      noise_gate: noiseGate,
+      noise_gate_threshold_dbfs: noiseGateThresholdDbfs,
+    }),
+  );
 }
 
 // 订阅 run 的事件流(started + status 都走这个通道)。返回取消订阅函数。
@@ -183,7 +220,7 @@ export interface PipelineCfg {
   output_level?: number;
 }
 
-export const OUTPUT_LEVEL_UNITY = 50;
+const OUTPUT_LEVEL_UNITY = 50;
 // 仅用于前端 tooltip 显示当前 dB;曲线与后端 output_level_gain 完全一致(gain=(v/50)^log2(3))。
 const OUTPUT_LEVEL_EXP = Math.log2(3); // ≈1.58496
 export function outputLevelToGain(level: number): number {

@@ -64,6 +64,38 @@ impl FrameBlocker {
         }
     }
 
+    /// Inserts one owned 80-sample sub-frame and extracts one 64-sample block.
+    ///
+    /// This avoids building a temporary `Vec<Vec<&[f32]>>` view on realtime
+    /// paths that already store sub-frames as `Vec<Vec<Vec<f32>>>`.
+    pub fn insert_owned_sub_frame_and_extract_block(
+        &mut self,
+        sub_frame: &[Vec<Vec<f32>>],
+        block: &mut Block,
+    ) {
+        debug_assert_eq!(self.num_bands, block.num_bands());
+        debug_assert_eq!(self.num_bands, sub_frame.len());
+        for (band, (buf_band, sf_band)) in self.buffer.iter_mut().zip(sub_frame.iter()).enumerate()
+        {
+            debug_assert_eq!(self.num_channels, block.num_channels());
+            debug_assert_eq!(self.num_channels, sf_band.len());
+            for (channel, (buf_ch, sf_ch)) in buf_band.iter_mut().zip(sf_band.iter()).enumerate() {
+                debug_assert!(buf_ch.len() <= BLOCK_SIZE - 16);
+                debug_assert_eq!(SUB_FRAME_LENGTH, sf_ch.len());
+
+                let buf_len = buf_ch.len();
+                let samples_to_block = BLOCK_SIZE - buf_len;
+                let out = block.view_mut(band, channel);
+
+                out[..buf_len].copy_from_slice(buf_ch);
+                out[buf_len..].copy_from_slice(&sf_ch[..samples_to_block]);
+
+                buf_ch.clear();
+                buf_ch.extend_from_slice(&sf_ch[samples_to_block..]);
+            }
+        }
+    }
+
     /// Returns `true` if a full 64-sample block is available for extraction.
     pub fn is_block_available(&self) -> bool {
         self.buffer[0][0].len() == BLOCK_SIZE

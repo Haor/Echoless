@@ -66,11 +66,9 @@ impl RenderDelayBuffer {
         num_render_channels: usize,
     ) -> Self {
         let down_sampling_factor = config.delay.down_sampling_factor;
-        let sub_block_size = if down_sampling_factor > 0 {
-            BLOCK_SIZE / down_sampling_factor
-        } else {
-            BLOCK_SIZE
-        };
+        let sub_block_size = BLOCK_SIZE
+            .checked_div(down_sampling_factor)
+            .unwrap_or(BLOCK_SIZE);
 
         let buffer_size = get_render_delay_buffer_size(
             down_sampling_factor,

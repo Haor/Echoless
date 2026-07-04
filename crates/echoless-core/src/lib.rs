@@ -1,13 +1,13 @@
-//! echoless-core — 管线编排 + 配置 + 控制面。**不依赖任何平台 crate**(蓝本 §1)。
+//! echoless-core — 管线配置 + 离线编排 + 共享 DSP 边界工具。**不依赖任何平台 crate**。
 //!
-//! 前端(CLI 现在、Tauri/GUI 后期)只透过 `ControlApi` 访问;配置类型 serde 可序列化,
-//! CLI 用 TOML、GUI 用 JSON,映射到同一套(蓝本 §14)。
+//! 实时主路径当前由 `echoless-cli` 的 cpal sidecar runtime 提供;本 crate 不暴露未实现的
+//! realtime 控制面,只保留 CLI/GUI 共用的配置、离线路径与输出电平/声道策略。
 
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use echoless_audio_io::{AudioFormat, AudioSink, AudioSource, DeviceInfo};
+use echoless_audio_io::{AudioFormat, AudioSink, AudioSource};
 use echoless_processors::{chain_from_nodes, NodeConfig, ProcessorStats};
 
 pub use echoless_processors::{
@@ -15,6 +15,7 @@ pub use echoless_processors::{
 };
 
 pub const MAX_NEAR_DELAY_MS: u32 = 500;
+pub const MAX_INITIAL_DELAY_MS: u32 = 500;
 pub const MIN_OUTPUT_LEVEL: u32 = 0;
 pub const MAX_OUTPUT_LEVEL: u32 = 100;
 pub const DEFAULT_OUTPUT_LEVEL: u32 = 50;
@@ -138,7 +139,8 @@ impl Default for PipelineConfig {
 
 impl PipelineConfig {
     pub fn frame_size(&self) -> u32 {
-        (self.sample_rate * self.frame_ms / 1000).max(1)
+        let frames = (u64::from(self.sample_rate) * u64::from(self.frame_ms)) / 1000;
+        frames.clamp(1, u64::from(u32::MAX)) as u32
     }
 }
 
@@ -150,15 +152,6 @@ pub struct RunReport {
     pub chain: Vec<&'static str>,
     pub total_latency_ms: f32,
     pub node_stats: Vec<ProcessorStats>,
-}
-
-/// 控制面:CLI 现在直接内嵌调用;Tauri/GUI 后期经 echoless-daemon 映射成 JSON-RPC(蓝本 §14)。
-pub trait ControlApi: Send + Sync {
-    fn list_devices(&self) -> Vec<DeviceInfo>;
-    fn start(&self, cfg: &PipelineConfig) -> anyhow::Result<()>;
-    fn stop(&self);
-    fn set_chain(&self, nodes: &[NodeConfig]) -> anyhow::Result<()>;
-    fn subscribe_stats(&self) -> crossbeam_channel::Receiver<Vec<ProcessorStats>>;
 }
 
 /// 离线跑通整条链:mic 源 + ref 源 → 处理链 → sink。当前可用(P1 离线评测)。
@@ -279,27 +272,6 @@ pub fn soft_limit_output_sample(sample: f32) -> f32 {
     sample.signum() * limited.min(1.0)
 }
 
-/// 实时管线(基于泛型 AudioSource/Sink 的版本)。
-///
-/// 注:当前实时管线已落在 `echoless-cli` 的 cpal 实现(`realtime.rs`)——cpal 的回调
-/// 是 push 模型且 Stream !Send,直接套 pull 式 AudioSource 代价大,故 I/O 与处理分离、
-/// 处理仍走同一个 `ProcessorChain`。此泛型版保留供未来把实时编排抽回 core(经 daemon
-/// 复用)时使用;当前主路径用 cpal,见 cli。
-pub fn run_realtime<M, R, S>(
-    _cfg: &PipelineConfig,
-    mut mic: M,
-    _reference: R,
-    _sink: S,
-) -> anyhow::Result<()>
-where
-    M: AudioSource,
-    R: AudioSource,
-    S: AudioSink,
-{
-    let _ = mic.start()?;
-    anyhow::bail!("请用 echoless-cli 的 cpal 实时管线(`echoless run`);core 泛型版待重构")
-}
-
 fn downmix_to_mono(data: &[f32], channels: u16, frames: u32) -> Vec<f32> {
     let ch = channels.max(1) as usize;
     let frames = frames as usize;
@@ -383,6 +355,36 @@ mod tests {
             OUTPUT_LEVEL_MAX_GAIN,
             0.001,
         );
+        approx_eq(output_level_gain(u32::MAX), OUTPUT_LEVEL_MAX_GAIN, 0.001);
+        approx_eq(
+            output_level_gain_db(u32::MAX).unwrap(),
+            OUTPUT_LEVEL_MAX_BOOST_DB,
+            0.001,
+        );
+    }
+
+    #[test]
+    fn frame_size_handles_zero_and_extreme_values_without_overflow() {
+        let normal = PipelineConfig {
+            sample_rate: 48_000,
+            frame_ms: 10,
+            ..PipelineConfig::default()
+        };
+        assert_eq!(normal.frame_size(), 480);
+
+        let zero = PipelineConfig {
+            sample_rate: 0,
+            frame_ms: 0,
+            ..PipelineConfig::default()
+        };
+        assert_eq!(zero.frame_size(), 1);
+
+        let huge = PipelineConfig {
+            sample_rate: u32::MAX,
+            frame_ms: u32::MAX,
+            ..PipelineConfig::default()
+        };
+        assert_eq!(huge.frame_size(), u32::MAX);
     }
 
     #[test]
@@ -407,5 +409,9 @@ mod tests {
         assert!(protected[0] > OUTPUT_SOFT_LIMIT_THRESHOLD);
         assert_eq!(protected[1], 0.0);
         assert_eq!(protected[2], 0.0);
+
+        let mut over_range = [0.2];
+        apply_output_level(&mut over_range, u32::MAX);
+        approx_eq(over_range[0], 0.6, 0.001);
     }
 }

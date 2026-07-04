@@ -1,6 +1,8 @@
 import {
   createContext,
+  useCallback,
   useContext,
+  useMemo,
   useState,
   type ReactNode,
 } from "react";
@@ -27,7 +29,7 @@ const D: Record<string, { en: string; zh: string }> = {
     en: "scroll to adjust output volume",
     zh: "滚轮调节输出音量",
   },
-  latency: { en: "Latency", zh: "延迟" },
+  latency: { en: "Pipeline", zh: "管线延迟" },
   ms: { en: "MS", zh: "毫秒" },
   stable: { en: "Stable", zh: "稳定" },
   checkSetup: { en: "Check Setup", zh: "检查设置" },
@@ -98,6 +100,10 @@ const D: Record<string, { en: string; zh: string }> = {
   lvqeGet: { en: "GET", zh: "下载" },
   lvqeOpenDir: { en: "open model folder", zh: "打开模型目录" },
   lvqeSource: { en: "official repo", zh: "官方 repo" },
+  lvqeRuntimeMissing: {
+    en: "native runtime missing",
+    zh: "缺少原生运行库",
+  },
   engSetupHint: { en: "set up in Engine", zh: "去 Engine 配置" },
   engSetupRtx: { en: "set up RTX", zh: "配置 RTX" },
 
@@ -289,20 +295,17 @@ export function LangProvider({ children }: { children: ReactNode }) {
       return "en";
     }
   });
-  const setLang = (l: Lang) => {
+  const setLang = useCallback((l: Lang) => {
     setLangState(l);
     try {
       localStorage.setItem("echoless.lang", l);
     } catch {
       /* ignore */
     }
-  };
-  const t = (k: string) => D[k]?.[lang] ?? k;
-  return (
-    <LangCtx.Provider value={{ lang, setLang, t }}>
-      {children}
-    </LangCtx.Provider>
-  );
+  }, []);
+  const t = useCallback((k: string) => D[k]?.[lang] ?? k, [lang]);
+  const value = useMemo(() => ({ lang, setLang, t }), [lang, setLang, t]);
+  return <LangCtx.Provider value={value}>{children}</LangCtx.Provider>;
 }
 
 export const useI18n = () => useContext(LangCtx);

@@ -1,6 +1,6 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, type MutableRefObject } from "react";
 
-// 共享遥测(由 App 从 status 事件写入;canvas 用 rAF 读取以保持 60fps 平滑)。
+// 共享遥测(由 App 从 status 事件写入;canvas 按运行态/新波形事件绘制)。
 export interface Telemetry {
   mic: number;
   ref: number;
@@ -31,16 +31,27 @@ function clamp01(v: number) {
 export function Scope({
   traceKey,
   telRef,
+  active,
+  revision,
   phase,
 }: {
   traceKey: TraceKey;
-  telRef: React.MutableRefObject<Telemetry>;
+  telRef: MutableRefObject<Telemetry>;
+  active: boolean;
+  revision: number;
   phase: number;
 }) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const activeRef = useRef(active);
+  const scheduleRef = useRef<() => void>(() => {});
+
+  activeRef.current = active;
 
   useEffect(() => {
-    const canvas = canvasRef.current!;
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const x = canvas.getContext("2d");
+    if (!x) return;
     const reduce = matchMedia("(prefers-reduced-motion: reduce)").matches;
     const g = CFG[traceKey];
     let prof: Float32Array | null = null;
@@ -48,6 +59,23 @@ export function Scope({
     let acc = 0;
     let last = performance.now();
     let raf = 0;
+    const size = {
+      w: Math.max(1, canvas.clientWidth | 0),
+      h: Math.max(1, canvas.clientHeight | 0),
+      dpr: Math.min(2, window.devicePixelRatio || 1),
+    };
+
+    const applyCanvasSize = () => {
+      const dpr = Math.min(2, window.devicePixelRatio || 1);
+      const bw = Math.max(1, Math.round(size.w * dpr));
+      const bh = Math.max(1, Math.round(size.h * dpr));
+      if (canvas.width !== bw || canvas.height !== bh) {
+        canvas.width = bw;
+        canvas.height = bh;
+      }
+      size.dpr = dpr;
+      return dpr;
+    };
 
     const buildProfile = (n: number) => {
       const a = new Float32Array(n);
@@ -62,17 +90,19 @@ export function Scope({
       prof = a;
     };
 
+    const shouldAnimate = () => {
+      if (reduce || document.hidden || !activeRef.current) return false;
+      const tel = telRef.current;
+      if (!tel.on) return false;
+      const wave = tel[`${traceKey}Wave` as const];
+      return !(wave && wave.length > 1);
+    };
+
     const draw = () => {
       const tel = telRef.current;
-      const dpr = Math.min(2, window.devicePixelRatio || 1);
-      const r = canvas.getBoundingClientRect();
-      const w = Math.max(1, r.width | 0);
-      const h = Math.max(1, r.height | 0);
-      if (canvas.width !== w * dpr || canvas.height !== h * dpr) {
-        canvas.width = w * dpr;
-        canvas.height = h * dpr;
-      }
-      const x = canvas.getContext("2d")!;
+      const dpr = applyCanvasSize();
+      const w = size.w;
+      const h = size.h;
       x.setTransform(dpr, 0, 0, dpr, 0, 0);
       x.clearRect(0, 0, w, h);
 
@@ -123,10 +153,11 @@ export function Scope({
     };
 
     const frame = (now: number) => {
-      raf = requestAnimationFrame(frame);
+      raf = 0;
       const dt = Math.min(0.05, (now - last) / 1000);
       last = now;
-      if (!reduce && telRef.current.on) {
+      const animate = shouldAnimate();
+      if (animate) {
         acc += dt;
         if (acc > 0.15) {
           acc = 0;
@@ -134,10 +165,47 @@ export function Scope({
         }
       }
       draw();
+      if (animate) {
+        raf = requestAnimationFrame(frame);
+      }
     };
-    raf = requestAnimationFrame(frame);
-    return () => cancelAnimationFrame(raf);
+
+    const schedule = () => {
+      if (document.hidden || raf) return;
+      raf = requestAnimationFrame(frame);
+    };
+    const stop = () => {
+      if (raf) cancelAnimationFrame(raf);
+      raf = 0;
+    };
+    const onVisibility = () => {
+      if (document.hidden) stop();
+      else schedule();
+    };
+    const resizeObserver = new ResizeObserver((entries) => {
+      const box = entries[0]?.contentRect;
+      if (box) {
+        size.w = Math.max(1, box.width | 0);
+        size.h = Math.max(1, box.height | 0);
+      }
+      prof = null;
+      schedule();
+    });
+    resizeObserver.observe(canvas);
+    document.addEventListener("visibilitychange", onVisibility);
+    scheduleRef.current = schedule;
+    schedule();
+    return () => {
+      stop();
+      resizeObserver.disconnect();
+      document.removeEventListener("visibilitychange", onVisibility);
+      scheduleRef.current = () => {};
+    };
   }, [traceKey, telRef, phase]);
+
+  useEffect(() => {
+    scheduleRef.current();
+  }, [active, revision]);
 
   return <canvas ref={canvasRef} data-w={traceKey} />;
 }
@@ -146,19 +214,29 @@ export function Scope({
 const BAR_ENV = [0.45, 0.7, 1, 0.8, 0.55, 0.32];
 export function FooterBars({
   telRef,
+  active,
+  revision,
 }: {
-  telRef: React.MutableRefObject<Telemetry>;
+  telRef: MutableRefObject<Telemetry>;
+  active: boolean;
+  revision: number;
 }) {
   const wrapRef = useRef<HTMLSpanElement>(null);
+  const activeRef = useRef(active);
+  const scheduleRef = useRef<() => void>(() => {});
+
+  activeRef.current = active;
+
   useEffect(() => {
     let raf = 0;
     let t = 0;
     let last = performance.now();
+    const reduce = matchMedia("(prefers-reduced-motion: reduce)").matches;
     const frame = (now: number) => {
-      raf = requestAnimationFrame(frame);
+      raf = 0;
       const dt = Math.min(0.05, (now - last) / 1000);
       last = now;
-      t += dt;
+      if (!reduce && activeRef.current && !document.hidden) t += dt;
       const tel = telRef.current;
       const eo = clamp01((tel.out + 60) / 60) * (tel.on ? 1 : 0.18);
       const bars = wrapRef.current?.children;
@@ -168,10 +246,37 @@ export function FooterBars({
         const hgt = Math.min(12, 2 + eo * BAR_ENV[i] * j * 12);
         (bars[i] as HTMLElement).style.height = `${hgt.toFixed(1)}px`;
       }
+      if (!reduce && activeRef.current && !document.hidden) {
+        raf = requestAnimationFrame(frame);
+      }
     };
-    raf = requestAnimationFrame(frame);
-    return () => cancelAnimationFrame(raf);
+
+    const schedule = () => {
+      if (document.hidden || raf) return;
+      raf = requestAnimationFrame(frame);
+    };
+    const stop = () => {
+      if (raf) cancelAnimationFrame(raf);
+      raf = 0;
+    };
+    const onVisibility = () => {
+      if (document.hidden) stop();
+      else schedule();
+    };
+    document.addEventListener("visibilitychange", onVisibility);
+    scheduleRef.current = schedule;
+    schedule();
+    return () => {
+      stop();
+      document.removeEventListener("visibilitychange", onVisibility);
+      scheduleRef.current = () => {};
+    };
   }, [telRef]);
+
+  useEffect(() => {
+    scheduleRef.current();
+  }, [active, revision]);
+
   return (
     <span className="bg" ref={wrapRef}>
       {BAR_ENV.map((_, i) => (

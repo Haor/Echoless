@@ -10,6 +10,7 @@ permissions:
 
 env:
   LOCALVQE_REF: de56a174d9662b65f404ec65ae8e4bc9712db0da
+  LOCALVQE_MODEL_REVISION: 5760d09ce556750f76c1251c024e4a8c37231591
 
 jobs:
   build:
@@ -44,8 +45,6 @@ jobs:
         uses: actions/setup-node@v6
         with:
           node-version: 22
-          cache: pnpm
-          cache-dependency-path: app/pnpm-lock.yaml
 
       - name: Install pnpm
         shell: bash
@@ -76,8 +75,20 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
+      - name: Sonora tests
+        working-directory: vendor/sonora
+        run: cargo test -p sonora -p sonora-aec3 --locked
+
+      - name: Sonora clippy
+        working-directory: vendor/sonora
+        run: cargo clippy -p sonora -p sonora-aec3 --all-targets --locked -- -D warnings
+
       - name: Build release
         run: cargo build --release --workspace --locked
+
+      - name: Prepare Tauri sidecar assets
+        working-directory: app
+        run: pnpm prepare:tauri-assets
 
       - name: Tauri backend clippy
         working-directory: app/src-tauri
@@ -114,6 +125,13 @@ jobs:
           git clone --no-checkout https://github.com/localai-org/LocalVQE.git "${localvqe_src}"
           git -C "${localvqe_src}" checkout "${LOCALVQE_REF}"
           git -C "${localvqe_src}" submodule update --init --recursive
+
+          # Upstream regression assets point at HuggingFace main, which can drift
+          # independently of the pinned LocalVQE source revision. Echoless already
+          # pins and verifies these GGUF files at this HF revision.
+          sed -i.bak \
+            "s|https://huggingface.co/LocalAI-io/LocalVQE/resolve/main/|https://huggingface.co/LocalAI-io/LocalVQE/resolve/${LOCALVQE_MODEL_REVISION}/|g" \
+            "${localvqe_src}/ggml/CMakeLists.txt"
 
           # Upstream test helpers currently miss the Windows S_ISREG aliases.
           # Keep this as a CI-local compatibility shim until upstream fixes it.
@@ -198,6 +216,57 @@ jobs:
           ECHOLESS_LOCALVQE_LIBRARY="${lib}" \
           ECHOLESS_LOCALVQE_MODEL="${model}" \
             cargo test -p echoless-processors localvqe_ffi_smoke -- --ignored --nocapture
+
+      - name: Prepare Tauri LocalVQE assets
+        shell: bash
+        working-directory: app
+        run: |
+          set -euo pipefail
+          shared_build="${RUNNER_TEMP}/localvqe-shared-build"
+          regression_build="${RUNNER_TEMP}/localvqe-regression-build"
+          model_name="localvqe-v1.3-4.8M-f32.gguf"
+          model="${regression_build}/bench_assets/${model_name}"
+          if [[ ! -f "${model}" ]]; then
+            model="$(find "${regression_build}" -name "${model_name}" -print -quit)"
+          fi
+          if [[ -z "${model}" || ! -f "${model}" ]]; then
+            echo "LocalVQE model not found under ${regression_build}" >&2
+            exit 1
+          fi
+
+          if [[ "${RUNNER_OS}" == "Windows" ]]; then
+            shared_dir="${shared_build}/bin/Release"
+            lib="${shared_dir}/localvqe.dll"
+            if [[ ! -f "${lib}" ]]; then
+              echo "LocalVQE DLL not found at ${lib}" >&2
+              exit 1
+            fi
+            lib="$(cygpath -w "${lib}")"
+            model="$(cygpath -w "${model}")"
+          else
+            lib="$(find "${shared_build}" -name 'liblocalvqe*.dylib' -print -quit)"
+            if [[ -z "${lib}" || ! -f "${lib}" ]]; then
+              echo "LocalVQE dylib not found under ${shared_build}" >&2
+              exit 1
+            fi
+          fi
+
+          ECHOLESS_LOCALVQE_LIBRARY="${lib}" \
+          ECHOLESS_LOCALVQE_MODEL="${model}" \
+            pnpm prepare:tauri-assets --skip-cli-build --require-localvqe-assets
+
+      - name: Tauri bundle smoke
+        shell: bash
+        working-directory: app
+        run: |
+          set -euo pipefail
+          if [[ "${RUNNER_OS}" == "macOS" ]]; then
+            pnpm tauri build --debug --ci --bundles app,dmg
+            pnpm smoke:tauri-bundle
+          else
+            pnpm tauri build --debug --ci --bundles nsis
+            pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/smoke-windows-installed-app.ps1
+          fi
 
       - name: Package
         shell: bash
@@ -308,4 +377,7 @@ jobs:
           path: |
             echoless-${{ matrix.package }}-${{ runner.arch }}.zip
             echoless-${{ matrix.package }}-${{ runner.arch }}.tar.gz
+            app/src-tauri/target/debug/bundle/dmg/*.dmg
+            app/src-tauri/target/debug/bundle/nsis/*.exe
+            app/src-tauri/target/debug/bundle/msi/*.msi
           if-no-files-found: error

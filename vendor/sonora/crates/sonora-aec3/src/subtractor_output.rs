@@ -10,6 +10,7 @@ use crate::common::{BLOCK_SIZE, FFT_LENGTH_BY_2_PLUS_1};
 use crate::fft_data::FftData;
 
 /// Output from the echo subtractor for a single capture channel.
+#[derive(Debug)]
 pub(crate) struct SubtractorOutput {
     pub s_refined: [f32; BLOCK_SIZE],
     pub s_coarse: [f32; BLOCK_SIZE],

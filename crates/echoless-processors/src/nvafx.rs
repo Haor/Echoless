@@ -14,7 +14,7 @@ use std::time::Instant;
 use anyhow::{bail, Context, Result};
 use serde::Serialize;
 
-use crate::{EchoProcessor, IoSpec, ProcessorStats};
+use crate::{dsp::copy_or_zero, EchoProcessor, IoSpec, ProcessorStats};
 
 pub const SDK_VERSION: &str = "2.1.0";
 pub const RUNTIME_FILE_VERSION: &str = "2.1.0.9";
@@ -330,7 +330,7 @@ impl NvidiaAfxAec {
         self.last_error = Some(err.into());
         match self.cfg.on_runtime_error {
             RuntimeErrorMode::Silence => out.fill(0.0),
-            RuntimeErrorMode::Bypass => copy_into(near, out),
+            RuntimeErrorMode::Bypass => copy_or_zero(near, out),
         }
     }
 }
@@ -535,10 +535,10 @@ fn resolve_runtime_selection(
 fn check_windows_system_dependencies() -> Vec<DoctorCheck> {
     let mut checks = Vec::new();
     for dll in VC_RUNTIME_DLLS {
-        if find_windows_system_dll(dll).is_some() {
+        if let Some(path) = find_windows_system_dll(dll) {
             checks.push(DoctorCheck::ok(
                 format!("vc-runtime:{dll}"),
-                "Microsoft VC++ runtime 已存在",
+                format!("Microsoft VC++ runtime 已存在: {}", path.display()),
             ));
         } else {
             checks.push(DoctorCheck::missing(
@@ -564,32 +564,93 @@ fn check_windows_system_dependencies() -> Vec<DoctorCheck> {
 }
 
 fn find_windows_system_dll(name: &str) -> Option<PathBuf> {
+    windows_system_dll_candidates(name)
+        .into_iter()
+        .find(|path| path.is_file())
+}
+
+fn windows_system_dll_candidates(name: &str) -> Vec<PathBuf> {
+    windows_system_dll_candidates_from(name, env::var_os("SystemRoot"), env::var_os("PATH"))
+}
+
+fn windows_system_dll_candidates_from(
+    name: &str,
+    system_root: Option<std::ffi::OsString>,
+    path_var: Option<std::ffi::OsString>,
+) -> Vec<PathBuf> {
     let mut roots = Vec::new();
-    if let Some(system_root) = env::var_os("SystemRoot") {
+    if let Some(system_root) = system_root {
         let root = PathBuf::from(system_root);
         roots.push(root.join("System32"));
         roots.push(root.join("SysWOW64"));
     }
-    if let Some(path) = env::var_os("PATH") {
+    if let Some(path) = path_var {
         roots.extend(env::split_paths(&path));
     }
-    roots
+    roots.into_iter().map(|root| root.join(name)).collect()
+}
+
+fn nvidia_smi_candidates() -> Vec<PathBuf> {
+    nvidia_smi_candidates_from(
+        env::var_os("ProgramFiles"),
+        env::var_os("SystemRoot"),
+        env::var_os("PATH"),
+    )
+}
+
+fn nvidia_smi_candidates_from(
+    program_files: Option<std::ffi::OsString>,
+    system_root: Option<std::ffi::OsString>,
+    path_var: Option<std::ffi::OsString>,
+) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(program_files) = program_files {
+        candidates.push(
+            PathBuf::from(program_files)
+                .join("NVIDIA Corporation")
+                .join("NVSMI")
+                .join("nvidia-smi.exe"),
+        );
+    }
+    if let Some(system_root) = system_root {
+        candidates.push(
+            PathBuf::from(system_root)
+                .join("System32")
+                .join("nvidia-smi.exe"),
+        );
+    }
+    if let Some(path) = path_var {
+        for root in env::split_paths(&path) {
+            candidates.push(root.join(if cfg!(windows) {
+                "nvidia-smi.exe"
+            } else {
+                "nvidia-smi"
+            }));
+        }
+    }
+    candidates
+}
+
+fn resolve_nvidia_smi() -> PathBuf {
+    nvidia_smi_candidates()
         .into_iter()
-        .map(|root| root.join(name))
         .find(|path| path.is_file())
+        .unwrap_or_else(|| PathBuf::from("nvidia-smi"))
 }
 
 fn detect_gpus() -> Result<Vec<GpuInfo>> {
-    let output = Command::new("nvidia-smi")
+    let nvidia_smi = resolve_nvidia_smi();
+    let output = Command::new(&nvidia_smi)
         .args([
             "--query-gpu=name,driver_version,compute_cap",
             "--format=csv,noheader",
         ])
         .output()
-        .context("运行 nvidia-smi 失败")?;
+        .with_context(|| format!("运行 nvidia-smi 失败: {}", nvidia_smi.display()))?;
     if !output.status.success() {
         bail!(
-            "nvidia-smi 退出码 {:?}: {}",
+            "nvidia-smi ({}) 退出码 {:?}: {}",
+            nvidia_smi.display(),
             output.status.code(),
             String::from_utf8_lossy(&output.stderr).trim()
         );
@@ -793,12 +854,6 @@ fn parse_version_parts(value: &str) -> Option<Vec<u32>> {
         .collect::<std::result::Result<_, _>>()
         .ok()?;
     (!parts.is_empty()).then_some(parts)
-}
-
-fn copy_into(src: &[f32], dst: &mut [f32]) {
-    let n = dst.len().min(src.len());
-    dst[..n].copy_from_slice(&src[..n]);
-    dst[n..].fill(0.0);
 }
 
 #[cfg(windows)]
@@ -1331,5 +1386,64 @@ mod tests {
         let cfg = AecConfig::from_params(&params).unwrap();
         assert!(cfg.runtime_dir.is_none());
         assert!(cfg.model_path.is_none());
+    }
+
+    #[test]
+    fn system_dll_candidates_prefer_system_root_before_path() {
+        let system_root = PathBuf::from("/secure/SystemRoot");
+        let untrusted = PathBuf::from("/untrusted");
+        let path = env::join_paths([untrusted.clone(), system_root.join("System32")]).unwrap();
+        let candidates = windows_system_dll_candidates_from(
+            "nvcuda.dll",
+            Some(system_root.clone().into_os_string()),
+            Some(path),
+        );
+
+        assert_eq!(
+            candidates[0],
+            system_root.join("System32").join("nvcuda.dll")
+        );
+        assert_eq!(
+            candidates[1],
+            system_root.join("SysWOW64").join("nvcuda.dll")
+        );
+        assert!(candidates
+            .iter()
+            .position(|path| path == &untrusted.join("nvcuda.dll"))
+            .is_some_and(|idx| idx > 1));
+    }
+
+    #[test]
+    fn nvidia_smi_candidates_prefer_standard_install_paths_before_path() {
+        let program_files = PathBuf::from("/secure/ProgramFiles");
+        let system_root = PathBuf::from("/secure/SystemRoot");
+        let untrusted = PathBuf::from("/untrusted");
+        let path = env::join_paths([untrusted.clone()]).unwrap();
+        let candidates = nvidia_smi_candidates_from(
+            Some(program_files.clone().into_os_string()),
+            Some(system_root.clone().into_os_string()),
+            Some(path),
+        );
+
+        assert_eq!(
+            candidates[0],
+            program_files
+                .join("NVIDIA Corporation")
+                .join("NVSMI")
+                .join("nvidia-smi.exe")
+        );
+        assert_eq!(
+            candidates[1],
+            system_root.join("System32").join("nvidia-smi.exe")
+        );
+        let path_candidate_name = if cfg!(windows) {
+            "nvidia-smi.exe"
+        } else {
+            "nvidia-smi"
+        };
+        assert!(candidates
+            .iter()
+            .position(|path| path == &untrusted.join(path_candidate_name))
+            .is_some_and(|idx| idx > 1));
     }
 }
