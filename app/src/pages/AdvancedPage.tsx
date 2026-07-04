@@ -28,7 +28,7 @@ interface Props {
 // 蜂鸣节奏(对齐 CLI:startup 4s + pre-roll 0.5s,每声 70ms / 间隔 650ms ≈ 720ms,共 12 声)。
 // 段按钮定宽 74px(v9.2 对齐轴),枚举文案超宽会溢出 → 长值用缩写显示(提交值不变)。
 const SELECT_LABELS: Record<string, string> = {
-  moderate: "mod",
+  moderate: "mid",
   veryhigh: "max",
 };
 
