@@ -174,29 +174,6 @@ fn select_system_reference_source(host: &cpal::Host) -> Result<ReferenceSource> 
     })
 }
 
-pub(super) fn is_macos_process_tap(source: &ReferenceSource) -> bool {
-    #[cfg(target_os = "macos")]
-    {
-        matches!(source, ReferenceSource::ProcessTap)
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = source;
-        false
-    }
-}
-
-pub(super) fn macos_process_tap_sample_rate() -> u32 {
-    #[cfg(target_os = "macos")]
-    {
-        macos_process_tap::SAMPLE_RATE
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        48_000
-    }
-}
-
 fn select_render_device(host: &cpal::Host, selector: &str) -> Result<(SelectedDevice, DeviceKind)> {
     if let Some((prefix, sel)) = selector.split_once(':') {
         let kind = match prefix.to_lowercase().as_str() {

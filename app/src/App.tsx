@@ -933,11 +933,7 @@ function useAppController() {
       gotoView("engine");
       return;
     }
-    // mac 系统音频参考需 48k;采样率不符 → 去 Advanced 改,避免启动即被后端拒。
-    if (sysRefRateConflict) {
-      gotoView("advanced");
-      return;
-    }
+    // A5 后:tap 采样率由 helper 上报并在后端重采样,系统参考不再要求 48k。
     await start();
   }
 
@@ -1226,10 +1222,6 @@ function useAppController() {
   const usingSysRef = isMac && referenceView === "system";
   const sysAudioDenied = usingSysRef && sysAudioPerm === "denied";
   const sysAudioUndet = usingSysRef && sysAudioPerm === "undetermined";
-  // mac Process Tap reference 要求全局采样率必须 48k(与引擎无关 —— LocalVQE 的 16k
-  // 由 ProcessorChain 内部适配)。不符 → 阻止运行,引导去 Advanced 改采样率。
-  const sysRefRateConflict = usingSysRef && pipeline.sample_rate !== 48000;
-
   // UI 电源视觉态 = sidecar 在跑且未穿透。穿透时波形照常流动(mic 活着),
   // 但字标熄灭 + 控制件调暗(AEC 不在工作)。
   const uiOn = powerOn && !bypassed;
@@ -1355,11 +1347,9 @@ function useAppController() {
           <RuntimeSubline
             statusKind={statusKind}
             activeReady={activeReady}
-            sysRefRateConflict={sysRefRateConflict}
             sysAudioDenied={sysAudioDenied}
             sysAudioUndet={sysAudioUndet}
             onEngineSetup={() => gotoView("engine")}
-            onAdvanced={() => gotoView("advanced")}
             onProbeSystemAudio={probeSystemAudio}
             onCheckSetup={() => gotoView("diagnostics")}
           />

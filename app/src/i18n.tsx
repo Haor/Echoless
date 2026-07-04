@@ -65,11 +65,6 @@ const D: Record<string, { en: string; zh: string }> = {
     en: "request system audio permission",
     zh: "请求系统音频权限",
   },
-  // 系统音频参考(Process Tap)要求全局采样率 = 48k(与引擎无关)。
-  sysRefRate: {
-    en: "System Audio ref needs 48k sample rate",
-    zh: "系统音频参考需 48k 采样率",
-  },
 
   // Engine
   engNote: {

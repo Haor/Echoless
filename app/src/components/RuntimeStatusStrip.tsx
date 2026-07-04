@@ -144,21 +144,17 @@ export const RuntimeStatusStrip = memo(function RuntimeStatusStrip({
 export const RuntimeSubline = memo(function RuntimeSubline({
   statusKind,
   activeReady,
-  sysRefRateConflict,
   sysAudioDenied,
   sysAudioUndet,
   onEngineSetup,
-  onAdvanced,
   onProbeSystemAudio,
   onCheckSetup,
 }: {
   statusKind: RunStatusKind;
   activeReady: boolean;
-  sysRefRateConflict: boolean;
   sysAudioDenied: boolean;
   sysAudioUndet: boolean;
   onEngineSetup: () => void;
-  onAdvanced: () => void;
   onProbeSystemAudio: () => void;
   onCheckSetup: () => void;
 }) {
@@ -173,10 +169,6 @@ export const RuntimeSubline = memo(function RuntimeSubline({
       {!activeReady ? (
         <button type="button" className="m act plainbtn" onClick={onEngineSetup}>
           {t("engSetupHint")} <span className="mk">&raquo;</span>
-        </button>
-      ) : sysRefRateConflict ? (
-        <button type="button" className="m act plainbtn" onClick={onAdvanced}>
-          {t("sysRefRate")} <span className="mk">&raquo;</span>
         </button>
       ) : sysAudioDenied ? (
         <button

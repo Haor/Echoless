@@ -502,7 +502,15 @@ if options.probePermission {
     fputs("permission probe succeeded\n", stderr)
     exit(0)
 } else if options.streamStdout {
-    fputs("streaming raw Float32 PCM to stdout\n", stderr)
+    // A5:PCM 前先发 16 字节二进制头(magic ELTP + version + 实际采样率 + 声道数),
+    // Rust 侧据此决定是否插重采样 —— tap 采样率跟随系统输出设备,不恒为 48k。
+    var header = Data("ELTP".utf8)
+    for value in [UInt32(1), UInt32(recorder.sampleRate.rounded()), UInt32(recorder.channels)] {
+        var le = value.littleEndian
+        withUnsafeBytes(of: &le) { header.append(contentsOf: $0) }
+    }
+    FileHandle.standardOutput.write(header)
+    fputs("streaming raw Float32 PCM to stdout (\(recorder.formatDescription))\n", stderr)
     while true {
         Thread.sleep(forTimeInterval: 0.005)
         let data = recorder.drainStreamData()
