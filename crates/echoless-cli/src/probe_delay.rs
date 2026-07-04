@@ -9,6 +9,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
 use clap::Args;
+use echoless_core::default_near_delay_ms;
 use serde_json::json;
 
 use crate::dsp::rms_dbfs;
@@ -709,10 +710,9 @@ fn per_event_lags(
 }
 
 fn recommended_near_delay_ms(lag_ms: f64, safety_ms: f64) -> u32 {
-    if lag_ms >= 0.0 {
-        return 0;
-    }
-    ((-lag_ms + safety_ms) / 5.0).round().max(0.0) as u32 * 5
+    let default_bias_ms = default_near_delay_ms() as f64;
+    let recommended_ms = (-lag_ms + safety_ms).max(default_bias_ms);
+    (recommended_ms / 5.0).round().max(0.0) as u32 * 5
 }
 
 fn emit_probe_result(result: &ProbeResult, json_mode: bool, session_retained: bool) -> Result<()> {
@@ -816,10 +816,12 @@ mod tests {
     }
 
     #[test]
-    fn probe_recommendation_uses_only_mic_lead() {
+    fn probe_recommendation_preserves_default_bias() {
+        let default_bias_ms = default_near_delay_ms();
+
         assert_eq!(recommended_near_delay_ms(-18.5, 8.0), 25);
-        assert_eq!(recommended_near_delay_ms(-2.0, 8.0), 10);
-        assert_eq!(recommended_near_delay_ms(12.0, 8.0), 0);
+        assert_eq!(recommended_near_delay_ms(-2.0, 8.0), default_bias_ms);
+        assert_eq!(recommended_near_delay_ms(12.0, 8.0), default_bias_ms);
     }
 
     #[test]

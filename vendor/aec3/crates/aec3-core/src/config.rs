@@ -58,6 +58,13 @@ impl EchoCanceller3Config {
             0.0,
             1.0,
         );
+        if !self.delay.render_gate_power_threshold.is_finite()
+            || self.delay.render_gate_power_threshold <= 0.0
+        {
+            self.delay.render_gate_power_threshold = Delay::default().render_gate_power_threshold;
+            ok = false;
+        }
+        ok &= floor_limit_usize(&mut self.delay.render_gate_hold_blocks, 1);
         ok &= limit_i32(&mut self.delay.delay_selection_thresholds.initial, 1, 250);
         ok &= limit_i32(&mut self.delay.delay_selection_thresholds.converged, 1, 250);
 
@@ -429,6 +436,12 @@ pub struct Delay {
     pub use_external_delay_estimator: bool,
     /// Whether to log warnings when the delay estimate changes.
     pub log_warning_on_delay_changes: bool,
+    /// Whether underruns and low render energy should hold the current delay.
+    pub delay_hold: bool,
+    /// Render sub-block amplitude threshold for delay-estimator gating.
+    pub render_gate_power_threshold: f32,
+    /// Consecutive low-energy render blocks before estimator gating starts.
+    pub render_gate_hold_blocks: usize,
     /// Alignment mixing settings for the render signal.
     pub render_alignment_mixing: AlignmentMixing,
     /// Alignment mixing settings for the capture signal.
@@ -455,6 +468,9 @@ impl Default for Delay {
             },
             use_external_delay_estimator: false,
             log_warning_on_delay_changes: false,
+            delay_hold: false,
+            render_gate_power_threshold: 100.0,
+            render_gate_hold_blocks: 3,
             render_alignment_mixing: AlignmentMixing {
                 downmix: false,
                 adaptive_selection: true,
@@ -1025,9 +1041,13 @@ mod tests {
     fn out_of_range_values_are_clamped() {
         let mut cfg = EchoCanceller3Config::default();
         cfg.delay.down_sampling_factor = 3; // invalid, must be 4 or 8
+        cfg.delay.render_gate_power_threshold = 0.0;
+        cfg.delay.render_gate_hold_blocks = 0;
         cfg.erle.min = 200_000.0; // above max of 100_000
         assert!(!cfg.validate());
         assert_eq!(cfg.delay.down_sampling_factor, 4);
+        assert_eq!(cfg.delay.render_gate_power_threshold, 100.0);
+        assert_eq!(cfg.delay.render_gate_hold_blocks, 1);
         // erle.min gets clamped to 100_000 first, but then the
         // `min > max_l || min > max_h` check clamps it further to
         // min(max_l=4.0, max_h=1.5) = 1.5.
