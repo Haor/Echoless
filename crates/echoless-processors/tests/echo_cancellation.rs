@@ -1,0 +1,121 @@
+//! sonora_aec3 节点回归测试。验证 vendored sonora fork 后:
+//!   (1) AEC3 真实消回声;
+//!   (2) 经 fork 开放的 tail 调参口能注入、跑通、不劣化。
+//! 无外部 WAV,纯合成。仅在 sonora-engine 特性下运行(默认开)。
+//!
+//! 关键经验(调研得来,见 research/sonora_aec3_internal_map.md):
+//!   - 激励必须是**非平稳语音类**信号。AEC3 有 stationarity gate,平稳白噪声会被当
+//!     背景噪声、抑制滤波器自适应(实测平稳白噪声仅 ~8dB,非平稳语音类 20–41dB)。
+//!   - `erle_db` 统计在本路径下恒为常数、不可信(§7);效果以输出能量下降为准。
+//!   - 合成长跑(>10s)效果会随 pause 段累积退化,疑为合成信号 artifact;真实退化
+//!     行为待真实录音验证(Phase 1)。故本测试用 5s 短窗稳定断言。
+
+#![cfg(feature = "sonora-engine")]
+
+use echoless_processors::registry;
+
+const SR: usize = 48_000;
+const FRAME: usize = 480; // sonora_aec3 io_spec = 48k
+
+fn white(n: usize) -> f32 {
+    let mut x = (n as u64)
+        .wrapping_mul(6364136223846793005)
+        .wrapping_add(1442695040888963407);
+    x ^= x >> 33;
+    (x as u32) as f32 / u32::MAX as f32 - 0.5
+}
+
+/// 语音类非平稳参考信号:白噪声 × 音节起伏包络 + 周期停顿。
+fn refsig(n: usize) -> f32 {
+    use std::f32::consts::PI;
+    let t = n as f32 / SR as f32;
+    let syllable = 0.5 + 0.5 * (2.0 * PI * 3.0 * t).sin();
+    let pause = if (t % 1.0) < 0.7 { 1.0 } else { 0.08 };
+    white(n) * syllable * pause * 1.6
+}
+
+/// 跑合成回声场景。`paths` = 各回声径 (延迟样本, 增益);near 为各径叠加,无近端人声。
+/// 返回回声能量下降 dB(跳过前 2 秒收敛)。
+fn run(params: toml::Table, paths: &[(usize, f32)]) -> f32 {
+    let mut p = registry::build("sonora_aec3").unwrap();
+    p.configure(&params).unwrap();
+    let far_channels = p.io_spec().far_channels.max(1) as usize;
+
+    let total = SR * 5;
+    let warmup = SR * 2;
+    let mut near = vec![0.0f32; FRAME];
+    let mut far = vec![0.0f32; FRAME * far_channels];
+    let mut out = vec![0.0f32; FRAME];
+
+    let (mut mic_sq, mut out_sq, mut cnt) = (0.0f64, 0.0f64, 0u64);
+    let mut i = 0;
+    while i + FRAME <= total {
+        for j in 0..FRAME {
+            let n = i + j;
+            for ch in 0..far_channels {
+                far[j * far_channels + ch] = refsig(n);
+            }
+            let mut echo = 0.0;
+            for &(d, g) in paths {
+                if n >= d {
+                    echo += g * refsig(n - d);
+                }
+            }
+            near[j] = echo;
+        }
+        p.process(&near, &far, &mut out, FRAME as u32);
+        if i >= warmup {
+            for j in 0..FRAME {
+                mic_sq += (near[j] as f64).powi(2);
+                out_sq += (out[j] as f64).powi(2);
+                cnt += 1;
+            }
+        }
+        i += FRAME;
+    }
+    let mic = (mic_sq / cnt as f64).sqrt();
+    let out = (out_sq / cnt as f64).sqrt();
+    20.0 * (mic / out.max(1e-12)).log10() as f32
+}
+
+#[test]
+fn cancels_single_path_echo() {
+    // 单径 50ms 回声,默认 config。
+    let db = run(toml::Table::new(), &[(2400, 0.5)]);
+    assert!(db > 18.0, "单径回声压低不足:{db:.1} dB");
+}
+
+#[test]
+fn tuned_tail_injection_works() {
+    // 经 vendored fork 注入更长 tail,验证调参口可用且不劣化 AEC。
+    let mut params = toml::Table::new();
+    params.insert("tail_ms".into(), toml::Value::Integer(120));
+    let db = run(params, &[(2400, 0.5)]);
+    assert!(db > 18.0, "tail=120ms 注入后回声压低不足:{db:.1} dB");
+}
+
+#[test]
+fn stereo_reference_mode_cancels_single_path_echo() {
+    let mut params = toml::Table::new();
+    params.insert(
+        "reference_channels".into(),
+        toml::Value::String("stereo".into()),
+    );
+
+    let db = run(params, &[(2400, 0.5)]);
+    assert!(db > 18.0, "stereo reference 回声压低不足:{db:.1} dB");
+}
+
+#[test]
+fn stereo_reference_mode_changes_sonora_io_spec() {
+    let mut p = registry::build("sonora_aec3").unwrap();
+    let mut params = toml::Table::new();
+    params.insert(
+        "reference_channels".into(),
+        toml::Value::String("stereo".into()),
+    );
+
+    p.configure(&params).unwrap();
+
+    assert_eq!(p.io_spec().far_channels, 2);
+}

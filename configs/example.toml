@@ -1,0 +1,58 @@
+# 管线配置示例(CLI 用 TOML;后期 Tauri/GUI 用等价 JSON,映射到同一 PipelineConfig)
+#
+# 实时跑:echoless run --config configs/example.toml
+# 先看设备:echoless devices
+
+mic = "default"          # 麦克风:default / 设备名片段 / 索引
+reference = "system"     # far-end 参考:
+                         #   system = 平台系统音频参考(Windows loopback;macOS Process Tap)
+                         #   none   = 无参考(仅 NS 等单端处理)
+                         #   output:<名> / input:<名> / 设备名 / 索引
+output = "default"       # 输出:虚拟音频设备名(Win=VB-Cable / mac=BlackHole),或 default 试听
+sample_rate = 48000      # 必须能整除 100(10ms 帧);mic/ref/out 共用此率
+frame_ms = 10
+reference_channels = "mono" # mono=当前稳定基线;stereo=保留 L/R far reference 供外放对比测试
+# near_delay_ms = 25      # 可选覆盖;macOS 默认 25,Windows/Linux 默认 0
+output_level = 50         # 最终输出电平:0=静音,50=原声,100=3x;gain=(level/50)^log2(3)
+
+# 诊断录制:打开后会在目录下创建 session-*，保存 mic.wav / ref.wav / out.wav / stats.csv。
+# 也可以运行时用 --diagnostic-dir / --diagnostic-seconds 覆盖。
+[diagnostics]
+# record_dir = "diagnostics"
+# max_seconds = 30
+
+# 处理节点:首版建议选择一个 backend;空 = 直通。kind 之外的键 = 该方案参数。
+[[chain]]
+kind = "sonora_aec3"
+# initial_delay_ms = 48      # AEC3 初始延迟 hint;默认依赖运行时动态估计
+# tail_ms = 120              # echo tail 长度(默认 52ms;外放+房间混响常需更长)
+# delay_num_filters = 5      # 延迟搜索窗(默认 5 ≈ 608ms)
+# linear_stable_echo_path = false
+ns = false                   # 保真人声优先:默认不在 AEC3 内额外降噪
+# ns_level = "low"           # 如必须在本层降噪,先试 low;moderate/high 更易出电音感
+agc = false                  # 保持电平自然,避免双讲时忽大忽小
+
+# LocalVQE 是独立可选方案。
+# CI artifact 会把 Windows 所需 DLL 与当前 v1.3 模型一起放入包内。
+# 注意:当前链路边界 SRC 仍是占位线性重采样,LocalVQE 可测真实推理,但不是最终音质版 SRC。
+# [[chain]]
+# kind = "localvqe"
+# model = "models/localvqe-v1.3-4.8M-f32.gguf"
+# library = "localvqe.dll"       # Windows artifact 根目录;macOS 用 "liblocalvqe.dylib"
+# threads = 2                    # CPU 线程数;0/不填 = 上游 auto
+# noise_gate = false             # 保真人声优先;门限过高会吃掉轻声/尾音
+# noise_gate_threshold_dbfs = -60.0
+
+# NVIDIA AFX / RTX AEC 是可选 Windows backend。先运行:
+#   echoless nvafx doctor
+# 如需本地安装 prepared runtime:
+#   echoless nvafx install --common-zip <common.zip> --model-zip <model.zip>
+# v1 只支持 Windows RTX + 48000 Hz + 10ms frame + mono reference。
+# [[chain]]
+# kind = "nvidia_afx_aec"
+# runtime_dir = "auto"           # auto = ECHOLESS_NVAFX_RUNTIME_DIR 或 %LOCALAPPDATA%\Echoless\nvafx\2.1.0
+# model_path = "auto"            # auto = 按 GPU 架构选择 features/nvafxaec/models/<arch>/aec_48k.trtpkg
+# intensity_ratio = 1.0
+# use_default_gpu = true
+# disable_cuda_graph = false
+# on_runtime_error = "silence"   # silence=出错静音并记 diagnostics;bypass=出错直通 near
