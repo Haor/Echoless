@@ -31,6 +31,10 @@ pub(crate) struct EchoPathDelayEstimator {
     matched_filter_lag_aggregator: MatchedFilterLagAggregator,
     old_aggregated_lag: Option<DelayEstimate>,
     consistent_estimate_counter: usize,
+    delay_hold: bool,
+    render_gate_power_threshold: f32,
+    render_gate_hold_blocks: usize,
+    low_render_blocks: usize,
     clockdrift_detector: ClockdriftDetector,
 }
 
@@ -79,6 +83,10 @@ impl EchoPathDelayEstimator {
             matched_filter_lag_aggregator,
             old_aggregated_lag: None,
             consistent_estimate_counter: 0,
+            delay_hold: config.delay.delay_hold,
+            render_gate_power_threshold: config.delay.render_gate_power_threshold,
+            render_gate_hold_blocks: config.delay.render_gate_hold_blocks,
+            low_render_blocks: 0,
             clockdrift_detector: ClockdriftDetector::new(),
         }
     }
@@ -103,6 +111,10 @@ impl EchoPathDelayEstimator {
         let downsampled_capture = &mut downsampled_capture_data[..self.sub_block_size];
         self.capture_decimator
             .decimate(&downmixed_capture, downsampled_capture);
+
+        if self.delay_hold && self.render_gate_holding(render_buffer) {
+            return self.old_aggregated_lag;
+        }
 
         self.matched_filter.update(
             render_buffer,
@@ -162,5 +174,84 @@ impl EchoPathDelayEstimator {
         self.matched_filter.reset(reset_lag_aggregator);
         self.old_aggregated_lag = None;
         self.consistent_estimate_counter = 0;
+        self.low_render_blocks = 0;
+    }
+
+    fn render_gate_holding(&mut self, render_buffer: &DownsampledRenderBuffer) -> bool {
+        let render_energy = self.current_render_energy(render_buffer);
+        let energy_threshold = self.render_gate_power_threshold
+            * self.render_gate_power_threshold
+            * self.sub_block_size as f32;
+
+        if render_energy > energy_threshold {
+            self.low_render_blocks = 0;
+            return false;
+        }
+
+        self.low_render_blocks = self.low_render_blocks.saturating_add(1);
+        self.low_render_blocks >= self.render_gate_hold_blocks
+    }
+
+    fn current_render_energy(&self, render_buffer: &DownsampledRenderBuffer) -> f32 {
+        (0..self.sub_block_size)
+            .map(|offset| {
+                let index = render_buffer.offset_index(render_buffer.read, offset as i32);
+                let sample = render_buffer.buffer[index];
+                sample * sample
+            })
+            .sum()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn estimator_with_hold(hold_blocks: usize) -> EchoPathDelayEstimator {
+        let mut config = EchoCanceller3Config::default();
+        config.delay.delay_hold = true;
+        config.delay.render_gate_power_threshold = 100.0;
+        config.delay.render_gate_hold_blocks = hold_blocks;
+        EchoPathDelayEstimator::new(aec3_simd::SimdBackend::Scalar, &config, 1)
+    }
+
+    fn render_buffer_with_level(sub_block_size: usize, level: f32) -> DownsampledRenderBuffer {
+        let mut render_buffer = DownsampledRenderBuffer::new(sub_block_size * 2);
+        for sample in &mut render_buffer.buffer[..sub_block_size] {
+            *sample = level;
+        }
+        render_buffer
+    }
+
+    #[test]
+    fn render_gate_holds_after_configured_low_render_blocks() {
+        let mut estimator = estimator_with_hold(2);
+        let low_render = render_buffer_with_level(estimator.sub_block_size, 0.0);
+        let high_render = render_buffer_with_level(estimator.sub_block_size, 1000.0);
+
+        assert!(!estimator.render_gate_holding(&low_render));
+        assert!(estimator.render_gate_holding(&low_render));
+        assert!(!estimator.render_gate_holding(&high_render));
+        assert!(!estimator.render_gate_holding(&low_render));
+    }
+
+    #[test]
+    fn render_gate_freezes_lag_without_consistency_counter_growth() {
+        let mut estimator = estimator_with_hold(1);
+        let frozen_lag = DelayEstimate::new(DelayEstimateQuality::Refined, 64);
+        estimator.old_aggregated_lag = Some(frozen_lag);
+        estimator.consistent_estimate_counter = 7;
+
+        let low_render = render_buffer_with_level(estimator.sub_block_size, 0.0);
+        let capture = Block::new(1, 1);
+
+        assert_eq!(
+            estimator
+                .estimate_delay(&low_render, &capture)
+                .map(|d| d.delay),
+            Some(frozen_lag.delay)
+        );
+        assert_eq!(estimator.consistent_estimate_counter, 7);
+        assert_eq!(estimator.old_aggregated_lag.map(|d| d.delay), Some(64));
     }
 }

@@ -232,7 +232,8 @@ impl RenderDelayBuffer {
             self.increment_read_indices();
             // Incrementing the buffer index without increasing the low rate
             // buffer index means that the delay is reduced by one.
-            if let Some(d) = self.delay
+            if !self.config.delay.delay_hold
+                && let Some(d) = self.delay
                 && d > 0
             {
                 self.delay = Some(d - 1);
@@ -593,5 +594,32 @@ mod tests {
         let buf = RenderDelayBuffer::new(&config, 16000, 1);
         let expected_max = buf.blocks.buffer.len() - 1 - config.filter.refined.length_blocks;
         assert_eq!(buf.max_delay(), expected_max);
+    }
+
+    #[test]
+    fn delay_hold_preserves_delay_on_render_underrun() {
+        fn first_underrun(buf: &mut RenderDelayBuffer) -> BufferingEvent {
+            for _ in 0..10 {
+                let event = buf.prepare_capture_processing();
+                if event == BufferingEvent::RenderUnderrun {
+                    return event;
+                }
+            }
+            panic!("expected render underrun");
+        }
+
+        for (delay_hold, expected_delay) in [(false, Some(4)), (true, Some(5))] {
+            let mut config = EchoCanceller3Config::default();
+            config.delay.delay_hold = delay_hold;
+            let mut buf = RenderDelayBuffer::new(&config, 16000, 1);
+            let block = Block::new(1, 1);
+
+            buf.insert(&block);
+            buf.prepare_capture_processing();
+            assert!(buf.align_from_delay(5));
+
+            assert_eq!(first_underrun(&mut buf), BufferingEvent::RenderUnderrun);
+            assert_eq!(buf.delay, expected_delay, "delay_hold={delay_hold}");
+        }
     }
 }

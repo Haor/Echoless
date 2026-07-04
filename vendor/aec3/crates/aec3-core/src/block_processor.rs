@@ -164,6 +164,7 @@ impl BlockProcessor {
         let buffer_event = self.render_buffer.prepare_capture_processing();
         // Reset the delay controller at render buffer underrun.
         if buffer_event == BufferingEvent::RenderUnderrun
+            && !self.config.delay.delay_hold
             && let Some(ref mut dc) = self.delay_controller
         {
             dc.reset(false);
