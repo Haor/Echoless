@@ -311,6 +311,62 @@ const INITIAL_ENGINE_STATE: EngineState = {
   params: {},
 };
 
+// 引擎配置持久化:kind + pipeline(含 near_delay/output_level)+ 每引擎参数。
+// 模块加载时读一次;之后每次变更由 effect 写回。
+const ENGINE_STATE_KEY = "echoless.engine.v1";
+
+type SavedEngineState = {
+  kind?: string;
+  pipeline?: Partial<PipelineCfg>;
+  paramsByKind?: Record<string, Record<string, unknown>>;
+};
+
+function readSavedEngineState(): SavedEngineState {
+  try {
+    const raw = localStorage.getItem(ENGINE_STATE_KEY);
+    if (!raw) return {};
+    const p = JSON.parse(raw);
+    if (!p || typeof p !== "object") return {};
+    return {
+      kind: typeof p.kind === "string" ? p.kind : undefined,
+      pipeline:
+        p.pipeline && typeof p.pipeline === "object" ? p.pipeline : undefined,
+      paramsByKind:
+        p.paramsByKind && typeof p.paramsByKind === "object"
+          ? p.paramsByKind
+          : undefined,
+    };
+  } catch {
+    return {};
+  }
+}
+
+const SAVED_ENGINE = readSavedEngineState();
+
+function initEngineState(): EngineState {
+  const pl = SAVED_ENGINE.pipeline ?? {};
+  const kind = SAVED_ENGINE.kind ?? INITIAL_ENGINE_STATE.kind;
+  return {
+    kind,
+    pipeline: {
+      sample_rate:
+        typeof pl.sample_rate === "number"
+          ? pl.sample_rate
+          : INITIAL_PIPELINE.sample_rate,
+      frame_ms:
+        typeof pl.frame_ms === "number"
+          ? pl.frame_ms
+          : INITIAL_PIPELINE.frame_ms,
+      reference_channels: pl.reference_channels === "stereo" ? "stereo" : "mono",
+      near_delay_ms:
+        typeof pl.near_delay_ms === "number" ? pl.near_delay_ms : undefined,
+      output_level:
+        typeof pl.output_level === "number" ? pl.output_level : undefined,
+    },
+    params: SAVED_ENGINE.paramsByKind?.[kind] ?? {},
+  };
+}
+
 function initSelection(): SelectionState {
   const saved = readSavedDeviceSelection();
   return {
@@ -358,7 +414,8 @@ function useAppController() {
   );
   const [engineState, updateEngine] = useReducer(
     patchReducer<EngineState>,
-    INITIAL_ENGINE_STATE,
+    undefined,
+    initEngineState,
   );
   const {
     platform,
@@ -397,8 +454,10 @@ function useAppController() {
   pipelineRef.current = pipeline;
   const paramsRef = useRef(params);
   paramsRef.current = params;
-  // 记住每个引擎的参数(如 LocalVQE 选的模型),切换引擎再切回来不丢。
-  const paramsByKind = useRef<Record<string, Record<string, unknown>>>({});
+  // 记住每个引擎的参数(如 LocalVQE 选的模型),切换引擎再切回来不丢。跨重启持久化。
+  const paramsByKind = useRef<Record<string, Record<string, unknown>>>(
+    SAVED_ENGINE.paramsByKind ?? {},
+  );
   const recRef = useRef(rec);
   recRef.current = rec;
   const diagSecondsRef = useRef(diagSeconds);
@@ -479,15 +538,16 @@ function useAppController() {
       .then((m) => {
         updateApp({ processors: m.processors });
         const proc = m.processors.find((p) => p.kind === kindRef.current);
-        updateEngine((cur) =>
-          Object.keys(cur.params).length === 0
-            ? {
-                ...cur,
-                params:
-                  paramsByKind.current[kindRef.current] ?? defaultParams(proc),
-              }
-            : cur,
-        );
+        // manifest defaults 打底 + 持久化参数覆盖:新版本新增参数时老存档不缺键。
+        updateEngine((cur) => ({
+          ...cur,
+          params: {
+            ...defaultParams(proc),
+            ...(Object.keys(cur.params).length
+              ? cur.params
+              : (paramsByKind.current[kindRef.current] ?? {})),
+          },
+        }));
       })
       .catch((e) => noteError(String(e)));
     doctorAudio()
@@ -1167,6 +1227,20 @@ function useAppController() {
 
   // 运行五态(含 A4 防抖):状态盒 / srail 状态字 / zsub 共用同一判定。
   const statusKind = useRunStatusKind(powerOn, refSel, dev, bypassed);
+
+  // 引擎配置持久化:kind/pipeline/params 任一变更即写回(paramsByKind 随写,
+  // 切引擎再切回、重启 app 都不丢)。
+  useEffect(() => {
+    paramsByKind.current[kind] = params;
+    try {
+      localStorage.setItem(
+        ENGINE_STATE_KEY,
+        JSON.stringify({ kind, pipeline, paramsByKind: paramsByKind.current }),
+      );
+    } catch {
+      /* 持久化失败不阻塞 */
+    }
+  }, [kind, pipeline, params]);
 
   // Windows 托盘偏好:持久化 + 每次变更(含首个渲染 = 启动同步)推给 Rust。
   const [trayPrefs, updateTrayPrefs] = useState<TrayPrefsState>(readTrayPrefs);

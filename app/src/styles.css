@@ -479,8 +479,10 @@ body {
   color: var(--t);
   font: inherit;
   font-family: var(--mono);
-  font-size: 14px;
-  padding: 4px 6px;
+  /* 与 .segg .b 同字号/字距/纵向 padding —— 同排格子视觉同步(用户定案) */
+  font-size: 11px;
+  letter-spacing: 1.5px;
+  padding: 6px;
   width: 74px;
   text-align: center;
 }

@@ -280,7 +280,8 @@ const D: Record<string, { en: string; zh: string }> = {
   secHealth: { en: "Health", zh: "健康" },
   record: { en: "Record", zh: "录制" },
   maxSeconds: { en: "Max Seconds", zh: "最长秒数" },
-  unlimited: { en: "unlimited", zh: "不限" },
+  // 74px 输入框放不下 UNLIMITED(9 字符),用 NO MAX
+  unlimited: { en: "no max", zh: "不限" },
   recordDir: { en: "Output Dir", zh: "输出目录" },
   choose: { en: "choose…", zh: "选择…" },
   recording: { en: "recording…", zh: "录制中…" },

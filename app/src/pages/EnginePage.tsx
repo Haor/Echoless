@@ -58,7 +58,7 @@ const PROFILES: Profile[] = [
     echo: 8,
     voice: 6,
     cost: "CPU · neural",
-    sr: "16k · auto 48↔16", // A6:管线级自动重采样适配,如实标注
+    sr: "16k · auto 48 ↔ 16", // A6:管线级自动重采样适配,如实标注
     os: "Win · mac",
   },
   {

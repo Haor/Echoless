@@ -41,6 +41,7 @@ export function VolumeWheel({
     const text = ` · ${dbLabel(vRef.current)}`;
     if (animated && !shown.current) {
       shown.current = true;
+      utils.remove(el); // 停掉在飞的收回动画,从残余文本继续 scramble 到全文
       animate(el, {
         innerHTML: scrambleText({
           text,
@@ -57,12 +58,22 @@ export function VolumeWheel({
     }
   }, []);
 
+  // 收回与浮现镜像:scramble 到空串(自动从右侧收),不再瞬间消失。
   const hideDb = useCallback(() => {
     const el = dbRef.current;
     if (!el) return;
-    utils.remove(el); // 停掉在飞的 scramble,否则它继续写 innerHTML、移开不立即收起
-    el.textContent = "";
     shown.current = false;
+    utils.remove(el); // 停掉在飞的 scramble,否则它继续写 innerHTML
+    if (!el.textContent) return;
+    animate(el, {
+      innerHTML: scrambleText({
+        text: "",
+        duration: 320,
+        cursor: "░▒▓",
+        ease: "inOut",
+        override: false,
+      }),
+    } as never);
   }, []);
 
   useEffect(() => {
