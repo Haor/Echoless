@@ -1,4 +1,4 @@
-# Echoless Windows 朋友试用指南
+# Echoless Windows 试用指南
 
 这份指南面向非开发者试用。目标不是跑完整工程测试,而是确认 Windows 安装包能正常安装、真实通话软件能收到 Echoless 处理后的麦克风声音,以及 AEC3 在外放场景下是否明显减少回声。
 
