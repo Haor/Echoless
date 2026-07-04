@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use serde_json::Value;
+use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 #[cfg(target_os = "windows")]
 use tauri::{
@@ -1293,7 +1293,11 @@ fn start_run(
 /// 具体能力由 CLI started.supported_controls 上报。
 #[tauri::command]
 fn send_run_control(state: State<RunState>, line: String) -> Result<(), String> {
-    let mut guard = run_state_guard(&state);
+    write_run_control_line(&state, &line)
+}
+
+fn write_run_control_line(state: &RunState, line: &str) -> Result<(), String> {
+    let mut guard = run_state_guard(state);
     let rc = guard.as_mut().ok_or("not running")?;
     let stdin = rc.child.stdin.as_mut().ok_or("no stdin")?;
     stdin
@@ -1302,6 +1306,20 @@ fn send_run_control(state: State<RunState>, line: String) -> Result<(), String> 
     stdin.write_all(b"\n").map_err(|e| e.to_string())?;
     stdin.flush().map_err(|e| e.to_string())?;
     Ok(())
+}
+
+#[tauri::command]
+fn set_bypass(state: State<RunState>, enabled: bool) -> Result<(), String> {
+    let line = bypass_control_line(enabled);
+    write_run_control_line(&state, &line)
+}
+
+fn bypass_control_line(enabled: bool) -> String {
+    json!({
+        "cmd": "set_bypass",
+        "enabled": enabled,
+    })
+    .to_string()
 }
 
 #[tauri::command]
@@ -1348,6 +1366,7 @@ pub fn run() {
             validate_config,
             start_run,
             send_run_control,
+            set_bypass,
             stop_run,
             set_tray_prefs
         ])
@@ -1466,6 +1485,17 @@ mod tests {
         assert!(state.0.is_poisoned());
         let guard = run_state_guard(&state);
         assert!(guard.is_none());
+    }
+
+    #[test]
+    fn bypass_control_line_matches_runtime_contract() {
+        let enabled: Value = serde_json::from_str(&bypass_control_line(true)).unwrap();
+        assert_eq!(enabled["cmd"], "set_bypass");
+        assert_eq!(enabled["enabled"], true);
+
+        let disabled: Value = serde_json::from_str(&bypass_control_line(false)).unwrap();
+        assert_eq!(disabled["cmd"], "set_bypass");
+        assert_eq!(disabled["enabled"], false);
     }
 
     #[test]
