@@ -4,7 +4,8 @@
 // UI 停留在初始状态、不弹后端错误,布局/动效可正常核查。
 type AnyObj = Record<string, unknown>;
 const w = window as unknown as AnyObj;
-if (import.meta.env.DEV && !w.__TAURI_INTERNALS__) {
+// 真 Tauri 环境(dev 与打包产物)注入时机早于任何模块执行,此分支只会在纯浏览器进入。
+if (!w.__TAURI_INTERNALS__) {
   w.__TAURI_INTERNALS__ = {
     metadata: {
       currentWindow: { label: "main" },
