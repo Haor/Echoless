@@ -1273,13 +1273,13 @@ function useAppController() {
   }, []);
 
   // v14/v17:字标随电源亮灭 —— 熄→亮播 crton(磷光渐暖),亮→熄播 crtoff(衰减)。
+  // render 期 prev 比较(不走 useEffect):首帧不播动画,切换帧同 commit 内定类名。
   const [wordAnim, setWordAnim] = useState("");
   const prevPowerRef = useRef(uiOn);
-  useEffect(() => {
-    if (prevPowerRef.current === uiOn) return;
+  if (prevPowerRef.current !== uiOn) {
     prevPowerRef.current = uiOn;
     setWordAnim(uiOn ? "igniting" : "dying");
-  }, [uiOn]);
+  }
 
   return (
     <div
@@ -1856,20 +1856,25 @@ export default function App() {
 }
 
 // UPTIME 走表:开机从零计,关机冻结最后读数(v3 原则 #5)。
+// ref 直写 DOM:每秒走字不进 React 渲染;vdom 文本恒定,父级重渲不会覆写。
 function UptimeStamp({ powerOn }: { powerOn: boolean }) {
-  const [text, setText] = useState("UP 00:00:00");
+  const ref = useRef<HTMLSpanElement>(null);
   useEffect(() => {
     if (!powerOn) return; // 冻结显示,保留最后读数
     const start = performance.now();
-    setText("UP 00:00:00");
+    if (ref.current) ref.current.textContent = "UP 00:00:00";
     const iv = window.setInterval(() => {
       const s = Math.floor((performance.now() - start) / 1000);
       const hh = String(Math.floor(s / 3600)).padStart(2, "0");
       const mm = String(Math.floor(s / 60) % 60).padStart(2, "0");
       const ss = String(s % 60).padStart(2, "0");
-      setText(`UP ${hh}:${mm}:${ss}`);
+      if (ref.current) ref.current.textContent = `UP ${hh}:${mm}:${ss}`;
     }, 1000);
     return () => window.clearInterval(iv);
   }, [powerOn]);
-  return <span className="stamp">{text}</span>;
+  return (
+    <span className="stamp" ref={ref}>
+      UP 00:00:00
+    </span>
+  );
 }

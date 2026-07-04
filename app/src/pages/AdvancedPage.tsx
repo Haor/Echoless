@@ -32,6 +32,20 @@ const SELECT_LABELS: Record<string, string> = {
   veryhigh: "max",
 };
 
+// C3/C5 减参:专家级/与引擎页重复的字段不在高级页暴露 ——
+//   LocalVQE:model(引擎页模型清单管理)、library/backend/device(auto 即可);
+//   NVAFX:runtime_dir(引擎页 RUNTIME 行已有完整 UI)、model_path/
+//          use_default_gpu/disable_cuda_graph(专家字段,走配置文件)。
+const HIDDEN_PARAMS: Record<string, Set<string>> = {
+  localvqe: new Set(["model", "library", "backend", "device"]),
+  nvidia_afx_aec: new Set([
+    "runtime_dir",
+    "model_path",
+    "use_default_gpu",
+    "disable_cuda_graph",
+  ]),
+};
+
 const PROBE_BEEPS = 12;
 const PROBE_FIRST_MS = 4500;
 const PROBE_STEP_MS = 720;
@@ -372,19 +386,6 @@ export function AdvancedPage({
     !spec.requires ||
     Object.entries(spec.requires).every(([rk, rv]) => params[rk] === rv);
 
-  // C3/C5 减参:专家级/与引擎页重复的字段不在高级页暴露 ——
-  //   LocalVQE:model(引擎页模型清单管理)、library/backend/device(auto 即可);
-  //   NVAFX:runtime_dir(引擎页 RUNTIME 行已有完整 UI)、model_path/
-  //          use_default_gpu/disable_cuda_graph(专家字段,走配置文件)。
-  const HIDDEN_PARAMS: Record<string, Set<string>> = {
-    localvqe: new Set(["model", "library", "backend", "device"]),
-    nvidia_afx_aec: new Set([
-      "runtime_dir",
-      "model_path",
-      "use_default_gpu",
-      "disable_cuda_graph",
-    ]),
-  };
   const hidden = HIDDEN_PARAMS[kind];
 
   // 隐藏未满足 requires 的参数(如 ns 关闭时的 ns_level),而非置灰。

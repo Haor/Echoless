@@ -106,7 +106,16 @@ export function VolumeWheel({
     <span
       className="vol"
       title={t("volMuteHint")}
+      role="button"
+      tabIndex={0}
+      aria-label={t("volMuteHint")}
       onClick={toggleMute}
+      onKeyDown={(e) => {
+        if (e.key === "Enter" || e.key === " ") {
+          e.preventDefault();
+          toggleMute();
+        }
+      }}
       onMouseEnter={() => {
         hoverRef.current = true;
         showDb(true);
