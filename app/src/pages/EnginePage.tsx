@@ -23,9 +23,9 @@ const LVQE_MODELS: {
   size: string;
   def?: boolean;
 }[] = [
-  { file: "localvqe-v1.3-4.8M-f32.gguf", ver: "v1.3", params: "4.8M", size: "~18 MB", def: true },
-  { file: "localvqe-v1.2-1.3M-f32.gguf", ver: "v1.2", params: "1.3M", size: "~5 MB" },
-  { file: "localvqe-v1.1-1.3M-f32.gguf", ver: "v1.1", params: "1.3M", size: "~5 MB" },
+  { file: "localvqe-v1.4-aec-200K-f32.gguf", ver: "v1.4", params: "200K", size: "3MB" },
+  { file: "localvqe-v1.3-4.8M-f32.gguf", ver: "v1.3", params: "4.8M", size: "18MB", def: true },
+  { file: "localvqe-v1.2-1.3M-f32.gguf", ver: "v1.2", params: "1.3M", size: "5MB" },
 ];
 
 // 引擎能力画像(前端描述性数据,非配置 contract)。
@@ -396,7 +396,11 @@ export function EnginePage({
           {t("lvqeRuntimeMissing")}
         </div>
       )}
-      {lvErr && <div className="cdetail warn">{lvErr}</div>}
+      {lvErr && (
+        <div className="cdetail warn lverr" title={lvErr}>
+          {lvErr}
+        </div>
+      )}
     </div>
   );
 

@@ -600,6 +600,13 @@ fn command_status_error(label: &str, out: &Output) -> String {
     } else {
         stdout.trim()
     };
+    // 错误会直达前端状态条/卡片,截断防止长输出撑爆 UI。
+    let detail: String = if detail.chars().count() > 240 {
+        let head: String = detail.chars().take(240).collect();
+        format!("{head}…")
+    } else {
+        detail.to_string()
+    };
     format!(
         "{label} failed with status {}; output: {detail}",
         out.status
@@ -740,7 +747,9 @@ async fn probe_delay(
 }
 
 // ---- LocalVQE model/native management: brand data root + HF downloads ----
-const LOCALVQE_HF_REVISION: &str = "5760d09ce556750f76c1251c024e4a8c37231591";
+// revision 跟 main:完整性由每文件 sha256 pin 保证,新上传的文件无需改代码即可下载。
+// (曾 pin 具体 commit,但该 rev 在 HF 上不存在导致下载全挂。)
+const LOCALVQE_HF_REVISION: &str = "main";
 
 #[derive(Clone, Copy)]
 struct LocalVqeModelPin {
@@ -770,11 +779,6 @@ const LOCALVQE_MODEL_PINS: &[LocalVqeModelPin] = &[
         size: 5_162_720,
     },
     LocalVqeModelPin {
-        filename: "localvqe-v1.1-1.3M-f32.gguf",
-        sha256: "c118227c6b433d6aa36d9e4b993e0f31aa60787ea38d301d04db917a4a2b0a84",
-        size: 5_173_088,
-    },
-    LocalVqeModelPin {
         filename: "localvqe-v1.2-1.3M-f32.gguf",
         sha256: "4856ecf5f522b23fb2bc5caeac81f323c0ef1c4c156a9c7d40a6adbe092ba9ce",
         size: 5_173_088,
@@ -783,6 +787,11 @@ const LOCALVQE_MODEL_PINS: &[LocalVqeModelPin] = &[
         filename: "localvqe-v1.3-4.8M-f32.gguf",
         sha256: "c4f7912485c32cfc206c536f2f050b52513f2f613fdbc616391f6b26ab1d51ec",
         size: 19_268_160,
+    },
+    LocalVqeModelPin {
+        filename: "localvqe-v1.4-aec-200K-f32.gguf",
+        sha256: "b6e43138588a83bfe903ab5e143b4020b91c1e1629f5a575ac5855ff0003c731",
+        size: 2_924_224,
     },
 ];
 
@@ -1177,7 +1186,8 @@ fn download_localvqe_model_blocking(
         pin.filename
     );
     let mut curl = Command::new("curl");
-    curl.args(["-fL", "--retry", "2", "-o"]).arg(&tmp).arg(&url);
+    // -sS:去掉进度表(否则 curl 把整张进度表写进 stderr,报错时被原样灌进 UI)。
+    curl.args(["-sSfL", "--retry", "2", "-o"]).arg(&tmp).arg(&url);
     let out =
         command_output_with_timeout(&mut curl, MODEL_DOWNLOAD_TIMEOUT, "LocalVQE model download")?;
     if !out.status.success() {
@@ -1227,7 +1237,8 @@ fn download_localvqe_native_blocking(app: &tauri::AppHandle) -> Result<Value, St
         let _ = std::fs::remove_file(&tmp);
         let url = localvqe_native_asset_url(&package, asset);
         let mut curl = Command::new("curl");
-        curl.args(["-fL", "--retry", "2", "-o"]).arg(&tmp).arg(&url);
+        // -sS:去掉进度表(否则 curl 把整张进度表写进 stderr,报错时被原样灌进 UI)。
+    curl.args(["-sSfL", "--retry", "2", "-o"]).arg(&tmp).arg(&url);
         let out = command_output_with_timeout(
             &mut curl,
             MODEL_DOWNLOAD_TIMEOUT,
