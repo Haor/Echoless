@@ -30,12 +30,60 @@ struct RunChild {
 /// 当前运行中的 echoless run 子进程(同一时刻最多一个)。
 struct RunState(Mutex<Option<RunChild>>);
 
+/// Windows tray preferences pushed by the frontend at startup and on change.
+struct TrayPrefs {
+    minimize_to_tray: AtomicBool,
+    close_to_tray: AtomicBool,
+}
+
+impl Default for TrayPrefs {
+    fn default() -> Self {
+        Self {
+            minimize_to_tray: AtomicBool::new(false),
+            close_to_tray: AtomicBool::new(false),
+        }
+    }
+}
+
 fn run_state_guard(state: &RunState) -> MutexGuard<'_, Option<RunChild>> {
     // Keep the GUI backend recoverable after an unrelated panic while holding the run lock.
     state
         .0
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn terminate_run(state: &RunState) {
+    let child_opt = {
+        let mut guard = run_state_guard(state);
+        guard.take()
+    };
+    if let Some(mut rc) = child_opt {
+        rc.stopping.store(true, Ordering::SeqCst);
+        let _ = rc.child.kill();
+        let _ = rc.child.wait();
+        cleanup_run_config(&rc.config_path);
+    }
+}
+
+fn set_tray_prefs_inner(
+    prefs: &TrayPrefs,
+    minimize_to_tray: bool,
+    close_to_tray: bool,
+) {
+    #[cfg(target_os = "windows")]
+    {
+        prefs
+            .minimize_to_tray
+            .store(minimize_to_tray, Ordering::SeqCst);
+        prefs.close_to_tray.store(close_to_tray, Ordering::SeqCst);
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = (minimize_to_tray, close_to_tray);
+        prefs.minimize_to_tray.store(false, Ordering::SeqCst);
+        prefs.close_to_tray.store(false, Ordering::SeqCst);
+    }
 }
 
 const TAURI_TARGET_TRIPLE: &str = env!("TAURI_ENV_TARGET_TRIPLE");
@@ -1082,14 +1130,13 @@ fn send_run_control(state: State<RunState>, line: String) -> Result<(), String> 
 
 #[tauri::command]
 fn stop_run(state: State<RunState>) -> Result<(), String> {
-    let mut guard = run_state_guard(&state);
-    if let Some(mut rc) = guard.take() {
-        rc.stopping.store(true, Ordering::SeqCst); // 主动停 → 其 reader 退出判为 intentional
-        let _ = rc.child.kill();
-        let _ = rc.child.wait();
-        cleanup_run_config(&rc.config_path);
-    }
+    terminate_run(&state);
     Ok(())
+}
+
+#[tauri::command]
+fn set_tray_prefs(prefs: State<TrayPrefs>, minimize_to_tray: bool, close_to_tray: bool) {
+    set_tray_prefs_inner(&prefs, minimize_to_tray, close_to_tray);
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -1098,6 +1145,7 @@ pub fn run() {
         .plugin(tauri_plugin_decorum::init())
         .plugin(tauri_plugin_dialog::init())
         .manage(RunState(Mutex::new(None)))
+        .manage(TrayPrefs::default())
         .invoke_handler(tauri::generate_handler![
             get_platform,
             list_devices,
@@ -1116,7 +1164,8 @@ pub fn run() {
             validate_config,
             start_run,
             send_run_control,
-            stop_run
+            stop_run,
+            set_tray_prefs
         ])
         .setup(|app| {
             // 默认打开基线 1040×640(布局按此定稿);可缩放,设合理 min/max 防止过小/过大破版。
@@ -1224,6 +1273,48 @@ mod tests {
         assert!(state.0.is_poisoned());
         let guard = run_state_guard(&state);
         assert!(guard.is_none());
+    }
+
+    #[test]
+    fn terminate_run_marks_stopping_waits_and_cleans_config() {
+        let dir = unique_temp_dir("echoless-terminate-run");
+        let config_path = dir.join("run.toml");
+        std::fs::write(&config_path, "stub = true").unwrap();
+        let stopping = Arc::new(AtomicBool::new(false));
+        let child = slow_child_command().spawn().unwrap();
+        let state = RunState(Mutex::new(Some(RunChild {
+            child,
+            stopping: stopping.clone(),
+            config_path: config_path.clone(),
+        })));
+
+        terminate_run(&state);
+
+        assert!(stopping.load(Ordering::SeqCst));
+        assert!(run_state_guard(&state).is_none());
+        assert!(!config_path.exists());
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn tray_prefs_default_false_and_follow_platform_gate() {
+        let prefs = TrayPrefs::default();
+        assert!(!prefs.minimize_to_tray.load(Ordering::SeqCst));
+        assert!(!prefs.close_to_tray.load(Ordering::SeqCst));
+
+        set_tray_prefs_inner(&prefs, true, true);
+
+        #[cfg(target_os = "windows")]
+        {
+            assert!(prefs.minimize_to_tray.load(Ordering::SeqCst));
+            assert!(prefs.close_to_tray.load(Ordering::SeqCst));
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            assert!(!prefs.minimize_to_tray.load(Ordering::SeqCst));
+            assert!(!prefs.close_to_tray.load(Ordering::SeqCst));
+        }
     }
 
     #[test]
