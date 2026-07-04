@@ -1,5 +1,6 @@
 import { useEffect, useReducer, useRef } from "react";
 import type { ParamSpec, Platform, Processor } from "../types";
+import type { TrayPrefsState } from "../App";
 import { probeDelay, type NearDelayProbeResult, type PipelineCfg } from "../api";
 import { useI18n, type Lang } from "../i18n";
 import { Hint } from "../components/Hint";
@@ -19,6 +20,9 @@ interface Props {
   output: string;
   running: boolean;
   onSetRun: (on: boolean) => Promise<void>;
+  // Windows 托盘偏好(SESSION 段,仅 windows 平台渲染)。
+  trayPrefs: TrayPrefsState;
+  onTrayPrefs: (patch: Partial<TrayPrefsState>) => void;
 }
 
 // 蜂鸣节奏(对齐 CLI:startup 4s + pre-roll 0.5s,每声 70ms / 间隔 650ms ≈ 720ms,共 12 声)。
@@ -351,6 +355,8 @@ export function AdvancedPage({
   output,
   running,
   onSetRun,
+  trayPrefs,
+  onTrayPrefs,
 }: Props) {
   const { t, lang, setLang } = useI18n();
   const proc = processors.find((p) => p.kind === kind);
@@ -525,6 +531,41 @@ export function AdvancedPage({
             />
           </span>
         </div>
+        {/* P5 前端侧:托盘偏好(仅 Windows;Rust 端非 Windows 强制 false) */}
+        {platform === "windows" && (
+          <>
+            <div className="arow">
+              <Hint text={t("trayMinimizeHint")}>
+                <span className="alabel">{t("trayMinimize")}</span>
+              </Hint>
+              <span className="aval">
+                <SegButtons
+                  value={trayPrefs.minimizeToTray ? "on" : "off"}
+                  options={[
+                    { value: "on", label: "ON" },
+                    { value: "off", label: "OFF" },
+                  ]}
+                  onChange={(v) => onTrayPrefs({ minimizeToTray: v === "on" })}
+                />
+              </span>
+            </div>
+            <div className="arow">
+              <Hint text={t("trayCloseHint")}>
+                <span className="alabel">{t("trayClose")}</span>
+              </Hint>
+              <span className="aval">
+                <SegButtons
+                  value={trayPrefs.closeToTray ? "on" : "off"}
+                  options={[
+                    { value: "on", label: "ON" },
+                    { value: "off", label: "OFF" },
+                  ]}
+                  onChange={(v) => onTrayPrefs({ closeToTray: v === "on" })}
+                />
+              </span>
+            </div>
+          </>
+        )}
       </div>
     </div>
   );

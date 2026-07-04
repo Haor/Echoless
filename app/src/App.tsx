@@ -23,6 +23,7 @@ import {
   setLocalvqeNoiseGate,
   setNearDelayMs,
   setOutputLevel,
+  setTrayPrefs,
   startDiagnostics,
   startRun,
   stopDiagnostics,
@@ -86,6 +87,22 @@ const REQUIRED_RUN_CONTROLS = [
 ];
 
 const DEVICE_SELECTION_KEY = "echoless.deviceSelection.v1";
+
+// Windows 托盘偏好(P5 契约):持久化在前端,启动/变更时推给 Rust。
+const TRAY_PREFS_KEY = "echoless.trayPrefs.v1";
+export type TrayPrefsState = { minimizeToTray: boolean; closeToTray: boolean };
+function readTrayPrefs(): TrayPrefsState {
+  try {
+    const raw = localStorage.getItem(TRAY_PREFS_KEY);
+    const p = raw ? JSON.parse(raw) : null;
+    return {
+      minimizeToTray: Boolean(p?.minimizeToTray),
+      closeToTray: Boolean(p?.closeToTray),
+    };
+  } catch {
+    return { minimizeToTray: false, closeToTray: false };
+  }
+}
 
 // 设备选择值统一用 stable_id(跨重启稳定;mic/output 配置直接吃它)。
 // 选默认输出:优先虚拟声卡(VB-CABLE / BlackHole),否则系统默认。
@@ -1113,6 +1130,19 @@ function useAppController() {
   // 运行四态(含 A4 防抖):状态盒 / srail 状态字 / zsub 共用同一判定。
   const statusKind = useRunStatusKind(powerOn, refSel, dev);
 
+  // Windows 托盘偏好:持久化 + 每次变更(含首个渲染 = 启动同步)推给 Rust。
+  const [trayPrefs, updateTrayPrefs] = useState<TrayPrefsState>(readTrayPrefs);
+  useEffect(() => {
+    try {
+      localStorage.setItem(TRAY_PREFS_KEY, JSON.stringify(trayPrefs));
+    } catch {
+      /* 持久化失败不阻塞 */
+    }
+    setTrayPrefs(trayPrefs.minimizeToTray, trayPrefs.closeToTray).catch(
+      () => {},
+    );
+  }, [trayPrefs]);
+
   // zmeta 版本号(tauri.conf.json 为源)。
   const [appVersion, setAppVersion] = useState("");
   useEffect(() => {
@@ -1429,6 +1459,10 @@ function useAppController() {
             output={selOutput}
             running={powerOn}
             onSetRun={setRunForProbe}
+            trayPrefs={trayPrefs}
+            onTrayPrefs={(patch) =>
+              updateTrayPrefs((cur) => ({ ...cur, ...patch }))
+            }
           />
         )}
         {view === "diagnostics" && (
