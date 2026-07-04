@@ -63,7 +63,9 @@ Triage 表已附在 `docs/audit/UI_ISSUES_VERIFICATION_20260703.md` 末尾。结
 - vendor 有独立 `.git` 需先删除并入。
 - **先内化改名、后延迟魔改**(保持 diff 分离)。
 
-## P4 — AEC3 延迟魔改:惯性 + 负方向搜索(Codex,依赖 P3)
+## P4 — AEC3 延迟魔改:惯性 + 负方向搜索(Codex,依赖 P3)✅ 已合入 main(2026-07-05)
+
+> ⚠️ 遗留:>60s 长跑复现**轻度**收敛退化(41.1→38.1dB,ignored 测试,不及 §11.6 的 23→9.6dB),待单独调查。
 
 按 `docs/architecture/AEC3_DELAY_MOD_PLAN.md` 执行:
 
@@ -73,7 +75,7 @@ Triage 表已附在 `docs/audit/UI_ISSUES_VERIFICATION_20260703.md` 末尾。结
   probe 推荐公式改 `max(bias, -lag+safety)`),vendor 零改动、热更新。
 - 回归:非平稳激励 + >60s 长跑。
 
-## P5 — Windows 最小化进系统托盘
+## P5 — Windows 最小化进系统托盘 ✅ Rust 侧已合入 main、前端侧已在 ui-refactor(2026-07-05;待 Windows 实机手测)
 
 Tauri 2(已在用,启用 `tray-icon` feature):
 
@@ -103,7 +105,7 @@ Tauri 2(已在用,启用 `tray-icon` feature):
 
 后端/产品向,与 UI 换皮正交。按价值排序:
 
-1. **D1 OFF = passthrough 穿透模式(高优先)— 决策已定(2026-07-04 用户拍板)**:
+1. **D1 OFF = passthrough 穿透模式 ✅ 后端已合入 main、前端接线已在 ui-refactor(2026-07-05)**:
    **不搞三态,OFF 即穿透**——关了用户麦克风必须还能用,「完全停机」不作为用户级操作(退出应用=停机)。
    后端规格已写:`docs/codex-tasks/TASK_P8_OFF_PASSTHROUGH.md`(chain 级 bypass 热命令 + keep-warm
    保收敛 + crossfade,不换处理器;等 P3 合入后开工)。
