@@ -117,13 +117,13 @@ Tauri 2(已在用,启用 `tray-icon` feature):
    srail 停机文案 MONITOR HELD → 直通语义(如 AEC BYPASS),前端 OFF 不再调 stop_run 而是 set_bypass。
 2. **D2 一键 mute ✅ 已在 ui-refactor(2026-07-05)**:footer VOL 点按 toggle 0↔记忆值
    (`echoless.premuteVol.v1`),静音态显示 VOL MUTE,键盘可达,复用实时 `set_output_level`。
-3. **D6+D7+D8 localvqe 转 HF 下载 + 数据目录统一 ✅ 已合入 main(2026-07-05,Codex d33f464)**:
-   新 `crates/echoless-paths` 品牌根(`ECHOLESS_DATA_ROOT` 可覆盖);模型+native 落
-   `<品牌根>/localvqe/{models,native}`,旧目录 gguf 一次性迁移;v1.3 入 GET 下载清单,
-   native 走 manifest 驱动下载(mac 14 个库已算 sha256 入清单,Win dll 占位 unpublished);
-   删随包资源与打包拷贝步骤。⚠️ **待人工**:上传 HF `LocalAI-io/LocalVQE`——模型
-   `localvqe-v1.3-4.8M-f32.gguf` + mac native 14 文件到 `native/aarch64-apple-darwin/`、
-   Windows `localvqe.dll` 到 `native/x86_64-pc-windows-msvc/`(上传后把清单 published 翻真)。
+3. **D6+D7+D8 localvqe 数据目录统一 + 模型转 HF 下载 ✅(2026-07-05,Codex d33f464 +
+   19d2989 决策修正)**:新 `crates/echoless-paths` 品牌根(`ECHOLESS_DATA_ROOT` 可覆盖);
+   模型落 `<品牌根>/localvqe/models`,旧目录 gguf 一次性迁移;模型清单 v1.4/v1.3(STD)/v1.2
+   走 GET 下载(sha256 pin,revision=main)。**⚠️ 决策修正(用户 2026-07-05)**:
+   native runtime 恢复随包分发(resource 目录优先,品牌根仅作兜底),GET RUNTIME UI 删除,
+   prepare/smoke/CI 的 native 打包链路恢复(`--require-localvqe-assets` 只管 native)。
+   HF 无需再传 native;模型 v1.4 已在库上。
 4. **D4 Windows 虚拟麦向导闭环 ✅ 已在 ui-refactor(2026-07-05;待 Windows 真机走查)**:
    后端 needs_reboot 真值化(VB-CABLE 驱动残迹在 + 端点不在 = 装了没重启),向导加显式
    reboot 态、端点匹配放宽到 CABLE-A/B 等别名、Windows 隐藏死权限节点、dev 模拟可走查。
