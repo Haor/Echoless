@@ -58,7 +58,7 @@ const PROFILES: Profile[] = [
     echo: 8,
     voice: 6,
     cost: "CPU · neural",
-    sr: "16k only",
+    sr: "16k · auto 48↔16", // A6:管线级自动重采样适配,如实标注
     os: "Win · mac",
   },
   {
@@ -237,7 +237,12 @@ function NvafxCard({
                   className="dopen"
                   onClick={(e) => {
                     e.stopPropagation();
-                    onRecheck((params.runtime_dir as string) || undefined);
+                    // B8:与左侧 dpick 显示同源 —— 检查的就是展示的那个目录。
+                    onRecheck(
+                      (params.runtime_dir as string) ||
+                        nv?.runtime_dir ||
+                        undefined,
+                    );
                   }}
                 >
                   {t("engRecheck")} <span className="mk">↻</span>

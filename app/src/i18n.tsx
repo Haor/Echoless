@@ -248,7 +248,11 @@ const D: Record<string, { en: string; zh: string }> = {
   probeStable: { en: "stable", zh: "稳定" },
   probeUnstable: { en: "unstable", zh: "不稳定" },
   probeRec: { en: "set", zh: "建议" },
-  probeNoFix: { en: "no fix needed · 0ms", zh: "无需修正 · 0ms" },
+  probeNoFix: {
+    // v8/C6:去掉「no fix needed」歧义 —— 正 lag 由 AEC3 自行追踪,near_delay 不动。
+    en: "aligned · near_delay kept at 0ms",
+    zh: "已对齐 · 近端延迟保持 0ms",
+  },
   probeFilled: { en: "filled into Near Delay", zh: "已填入近端延迟" },
   probeInit: { en: "init", zh: "初始延迟" },
 

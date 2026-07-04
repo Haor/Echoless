@@ -72,13 +72,28 @@ const DESC: Record<string, { en: string; zh: string }> = {
   },
   model: { en: "GGUF model path (required).", zh: "GGUF 模型路径(必填)。" },
   library: { en: "LocalVQE dynamic library path (auto if empty).", zh: "LocalVQE 动态库路径(留空自动)。" },
-  threads: { en: "CPU threads (auto if empty).", zh: "CPU 线程数(留空自动)。" },
-  noise_gate: { en: "LocalVQE noise gate.", zh: "LocalVQE 噪声门。" },
-  noise_gate_threshold_dbfs: { en: "Noise gate threshold (dBFS).", zh: "噪声门阈值(dBFS)。" },
-  intensity_ratio: { en: "RTX AEC strength.", zh: "RTX AEC 强度。" },
+  threads: {
+    en: "CPU threads (auto if empty). 2-4 is plenty for realtime.",
+    zh: "CPU 线程数(留空自动)。实时推理 2-4 已足够。",
+  },
+  noise_gate: {
+    en: "LocalVQE noise gate: mutes output below the threshold. Off by default.",
+    zh: "LocalVQE 噪声门:低于阈值时静音输出。默认关闭。",
+  },
+  noise_gate_threshold_dbfs: {
+    en: "Gate threshold (dBFS). Default -45; raise toward -35 to cut more room noise.",
+    zh: "噪声门阈值(dBFS)。默认 -45;想压掉更多环境声可向 -35 提高。",
+  },
+  intensity_ratio: {
+    en: "RTX AEC strength (0-1). Default 1.0; lower it if voice sounds over-suppressed.",
+    zh: "RTX AEC 强度(0-1)。默认 1.0;人声被压过头时调低。",
+  },
   runtime_dir: { en: "NVIDIA AFX runtime dir (auto if empty).", zh: "NVIDIA AFX runtime 目录(留空自动)。" },
   model_path: { en: "RTX AEC model path (auto if empty).", zh: "RTX AEC 模型路径(留空自动)。" },
-  on_runtime_error: { en: "On backend runtime error: silence or bypass.", zh: "运行时出错时:静音或直通。" },
+  on_runtime_error: {
+    en: "On backend runtime error: silence (safe, no echo leak) or bypass (keeps mic alive but echo passes).",
+    zh: "运行时出错时:silence 安全不漏回声;bypass 保住麦克风但回声直通。",
+  },
   use_default_gpu: { en: "Use the default GPU.", zh: "使用默认 GPU。" },
   disable_cuda_graph: { en: "Disable CUDA graph.", zh: "关闭 CUDA graph。" },
 };
@@ -345,9 +360,28 @@ export function AdvancedPage({
     !spec.requires ||
     Object.entries(spec.requires).every(([rk, rv]) => params[rk] === rv);
 
+  // C3/C5 减参:专家级/与引擎页重复的字段不在高级页暴露 ——
+  //   LocalVQE:model(引擎页模型清单管理)、library/backend/device(auto 即可);
+  //   NVAFX:runtime_dir(引擎页 RUNTIME 行已有完整 UI)、model_path/
+  //          use_default_gpu/disable_cuda_graph(专家字段,走配置文件)。
+  const HIDDEN_PARAMS: Record<string, Set<string>> = {
+    localvqe: new Set(["model", "library", "backend", "device"]),
+    nvidia_afx_aec: new Set([
+      "runtime_dir",
+      "model_path",
+      "use_default_gpu",
+      "disable_cuda_graph",
+    ]),
+  };
+  const hidden = HIDDEN_PARAMS[kind];
+
   // 隐藏未满足 requires 的参数(如 ns 关闭时的 ns_level),而非置灰。
   const backendParams = Object.entries(proc?.params ?? {}).filter(
-    ([k, spec]) => k !== "reference_channels" && k !== "ns" && reqMet(spec),
+    ([k, spec]) =>
+      k !== "reference_channels" &&
+      k !== "ns" &&
+      !hidden?.has(k) &&
+      reqMet(spec),
   );
 
   const control = (key: string, spec: ParamSpec) => {
