@@ -62,13 +62,14 @@ CLI bin 解析(`echoless_bin()`):
 | `start_diagnostics` | `record_dir, max_seconds?` | write JSONL to run stdin | event |
 | `stop_diagnostics` | — | write JSONL to run stdin | event |
 | `set_output_level` | `level: 0..100` | write `{"cmd":"set_output_level","level":N}` to run stdin | `output_level_changed` event |
+| `set_bypass` | `enabled: boolean` | write `{"cmd":"set_bypass","enabled":B}` to run stdin | `bypass_changed` event |
 | `stop_run` | — | kill child | — |
 | `open_url` | `url` | OS 打开浏览器 | — |
 | `open_path` | `path` | OS 打开文件管理器(不存在则建目录) | — |
 | `default_diag_dir` | — | (temp dir,无 CLI) | string |
 
 Events:
-- `echoless://status` — `started` 事件(backend/sr/frame/session_dir)+ 此后每条 `status`(dBFS、波形、队列、drop、latency、diverged、diagnostics 录制态…)。启用 diagnostics 时还会收到 `diagnostics_started` / `diagnostics_stopping` / `diagnostics_done` / `control_error`;实时音量控制会收到 `output_level_changed`。字段见 `FRONTEND_AGENT_HANDOFF.md`。
+- `echoless://status` — `started` 事件(backend/sr/frame/session_dir)+ 此后每条 `status`(dBFS、波形、队列、drop、latency、diverged、diagnostics 录制态…)。启用 diagnostics 时还会收到 `diagnostics_started` / `diagnostics_stopping` / `diagnostics_done` / `control_error`;实时音量控制会收到 `output_level_changed`,OFF/穿透控制会收到 `bypass_changed`。字段见 `FRONTEND_AGENT_HANDOFF.md`。
 - `echoless://exit` — sidecar 退出。
 - `echoless://log` — stderr 行。
 
@@ -175,6 +176,38 @@ Persisted JSON shape:
 ```
 
 Startup contract: read `echoless.trayPrefs.v1` in the frontend startup effect and invoke `set_tray_prefs`; invoke it again whenever either preference changes. Rust defaults to `false/false`, so behavior remains the existing direct-close path until the frontend pushes persisted preferences. Non-Windows platforms ignore these preferences and keep the current window behavior.
+
+## 10. OFF passthrough / bypass contract
+
+Backend status: implemented in P8-D1 on `phase-2/off-bypass`.
+
+Runtime control:
+
+```json
+{"cmd":"set_bypass","enabled":true}
+```
+
+Success event on `echoless://status` JSONL:
+
+```json
+{"type":"bypass_changed","bypassed":true}
+```
+
+Status JSON now always includes:
+
+```json
+{"type":"status","bypassed":false}
+```
+
+Startup config accepts top-level TOML:
+
+```toml
+bypass = true
+```
+
+Default is `false`. When `bypassed=true`, realtime output is the raw mic signal, not AEC/NS output and not `near_delay` delayed; the existing `output_level` gain/soft limiter still applies. The processor chain stays warm by default so switching back to processed output does not require a fresh AEC convergence window. ON/OFF transitions crossfade over 15ms.
+
+Tauri Rust exposes direct command `set_bypass(enabled: bool)` and also keeps generic `send_run_control`. P1/frontend should add its own `api.ts` wrapper and stop using `stop_run` for the user-facing OFF state; reserve `stop_run` for actually terminating the run sidecar.
 
 ## 下一会话建议
 - 用真实 CI LocalVQE 产物 / Windows 机器跑 `pnpm prepare:tauri-assets --require-localvqe-assets`
