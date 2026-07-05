@@ -338,12 +338,14 @@ pub fn run_with_options(cfg: &PipelineConfig, options: RuntimeOptions) -> Result
         "mic",
         InputChannelMode::MonoDownmix,
         counters.mic_input_drops.clone(),
+        stream_error_handler("mic", running.clone(), options.status_json),
     )?;
     let output_stream = build_output_stream(
         &output_device.device,
         &output_config,
         out_cons,
         counters.output_underruns.clone(),
+        stream_error_handler("output", running.clone(), options.status_json),
     )?;
     let mut render_prod = render_prod;
     let render_stream = match (&reference_source, render_config.as_ref()) {
@@ -356,6 +358,7 @@ pub fn run_with_options(cfg: &PipelineConfig, options: RuntimeOptions) -> Result
                 "ref",
                 InputChannelMode::from_reference_channels(cfg.reference_channels),
                 counters.ref_input_drops.clone(),
+                stream_error_handler("reference", running.clone(), options.status_json),
             )?)
         }
         _ => None,
@@ -743,25 +746,55 @@ fn apply_near_delay(
 macro_rules! dispatch_format {
     ($fmt:expr, $build:ident, $($arg:expr),+) => {
         match $fmt {
-            SampleFormat::I16 => $build::<i16, _>($($arg),+),
-            SampleFormat::I32 => $build::<i32, _>($($arg),+),
-            SampleFormat::F32 => $build::<f32, _>($($arg),+),
-            SampleFormat::U16 => $build::<u16, _>($($arg),+),
+            SampleFormat::I16 => $build::<i16, _, _>($($arg),+),
+            SampleFormat::I32 => $build::<i32, _, _>($($arg),+),
+            SampleFormat::F32 => $build::<f32, _, _>($($arg),+),
+            SampleFormat::U16 => $build::<u16, _, _>($($arg),+),
             other => bail!("不支持的采样格式 {other}"),
         }
     };
 }
 
-fn build_input_stream<P>(
+/// 流错误回调(审计 B-03):结构化上报 + 致命错误(设备消失)置停机。
+/// 此前只 eprintln,设备拔出后进程带着死流装活:输出恒静音、GUI 无感知。
+/// 停机会让 GUI 收到非 intentional 的 exit 事件并给出明确提示。
+fn stream_error_handler(
+    label: &'static str,
+    running: Arc<AtomicBool>,
+    status_json: bool,
+) -> impl FnMut(cpal::StreamError) {
+    move |err| {
+        let fatal = matches!(err, cpal::StreamError::DeviceNotAvailable);
+        eprintln!("{label} 流错误: {err}");
+        if status_json {
+            emit::emit_stdout_line(
+                json!({
+                    "type": "stream_error",
+                    "stream": label,
+                    "message": err.to_string(),
+                    "fatal": fatal,
+                })
+                .to_string(),
+            );
+        }
+        if fatal {
+            running.store(false, Ordering::SeqCst);
+        }
+    }
+}
+
+fn build_input_stream<P, E>(
     device: &Device,
     config: &StreamConfigChoice,
     producer: P,
     label: &'static str,
     channel_mode: InputChannelMode,
     drops: Arc<AtomicU64>,
+    on_error: E,
 ) -> Result<Stream>
 where
     P: Producer<Item = f32> + Send + 'static,
+    E: FnMut(cpal::StreamError) + Send + 'static,
 {
     dispatch_format!(
         config.sample_format(),
@@ -771,22 +804,25 @@ where
         producer,
         label,
         channel_mode,
-        drops
+        drops,
+        on_error
     )
 }
 
-fn build_input_stream_t<T, P>(
+fn build_input_stream_t<T, P, E>(
     device: &Device,
     choice: &StreamConfigChoice,
     mut producer: P,
     label: &'static str,
     channel_mode: InputChannelMode,
     drops: Arc<AtomicU64>,
+    on_error: E,
 ) -> Result<Stream>
 where
     T: SizedSample + Copy + Send + 'static,
     f32: FromSample<T>,
     P: Producer<Item = f32> + Send + 'static,
+    E: FnMut(cpal::StreamError) + Send + 'static,
 {
     let config = choice.config();
     let channels = usize::from(config.channels);
@@ -818,7 +854,7 @@ where
                     }
                 }
             },
-            move |err| eprintln!("{label} 流错误: {err}"),
+            on_error,
             None,
         )
         .with_context(|| format!("构建 {label} 输入流失败"))
@@ -880,14 +916,16 @@ where
     }
 }
 
-fn build_output_stream<C>(
+fn build_output_stream<C, E>(
     device: &Device,
     config: &StreamConfigChoice,
     consumer: C,
     underruns: Arc<AtomicU64>,
+    on_error: E,
 ) -> Result<Stream>
 where
     C: Consumer<Item = f32> + Send + 'static,
+    E: FnMut(cpal::StreamError) + Send + 'static,
 {
     dispatch_format!(
         config.sample_format(),
@@ -895,19 +933,22 @@ where
         device,
         config,
         consumer,
-        underruns
+        underruns,
+        on_error
     )
 }
 
-fn build_output_stream_t<T, C>(
+fn build_output_stream_t<T, C, E>(
     device: &Device,
     choice: &StreamConfigChoice,
     mut consumer: C,
     underruns: Arc<AtomicU64>,
+    on_error: E,
 ) -> Result<Stream>
 where
     T: SizedSample + FromSample<f32> + Copy + Send + 'static,
     C: Consumer<Item = f32> + Send + 'static,
+    E: FnMut(cpal::StreamError) + Send + 'static,
 {
     let config = choice.config();
     let channels = usize::from(config.channels);
@@ -936,7 +977,7 @@ where
                     }
                 }
             },
-            |err| eprintln!("输出流错误: {err}"),
+            on_error,
             None,
         )
         .context("构建输出流失败")
