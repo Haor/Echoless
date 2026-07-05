@@ -27,7 +27,6 @@ interface Props {
   dev: boolean;
   devState: MicState;
   onDevState: (s: MicState) => void;
-  onBack: () => void;
   onRecheck: () => void;
 }
 

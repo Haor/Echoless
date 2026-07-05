@@ -1723,7 +1723,6 @@ function useAppController() {
             dev={dev}
             devState={devRtxState}
             onDevState={chooseDevRtxState}
-            onBack={() => gotoView("engine")}
             onRecheck={recheckNvafx}
             onInstall={installNvafx}
             onDownloadInstall={downloadInstallNvafx}
@@ -1773,7 +1772,6 @@ function useAppController() {
             dev={dev}
             devState={devMicState}
             onDevState={chooseDevMicState}
-            onBack={() => gotoView("diagnostics")}
             onRecheck={recheckAudio}
           />
         )}

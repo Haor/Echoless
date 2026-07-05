@@ -49,7 +49,6 @@ interface Props {
   dev: boolean;
   devState: RtxState;
   onDevState: (s: RtxState) => void;
-  onBack: () => void;
   onRecheck: (runtimeDir?: string) => void;
   onInstall: (commonZip: string, modelZip: string) => void;
   onDownloadInstall: () => void;
