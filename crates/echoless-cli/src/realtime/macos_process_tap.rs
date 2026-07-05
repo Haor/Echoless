@@ -5,6 +5,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
+use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use ringbuf::traits::Producer;
@@ -34,10 +35,28 @@ impl Drop for MacProcessTapStream {
     fn drop(&mut self) {
         self.running.store(false, Ordering::SeqCst);
         let _ = self.child.kill();
-        if let Some(reader) = self.reader.take() {
-            let _ = reader.join();
+        // kill 关闭 helper stdout 后,reader 的 read 返回 0 自然退出。但 helper
+        // 若陷入内核不可中断状态,SIGKILL 延迟生效,无限期 join 会拖住整个
+        // 停机(审计 B-19)。限时等待:超时则不 join 也不 wait(阻塞),reader
+        // 线程随本进程退出回收;孤儿 helper 由其 getppid 自愈兜底(B-01)。
+        let mut exited = false;
+        for _ in 0..20 {
+            match self.child.try_wait() {
+                Ok(Some(_)) => {
+                    exited = true;
+                    break;
+                }
+                Ok(None) => thread::sleep(Duration::from_millis(25)),
+                Err(_) => break,
+            }
         }
-        let _ = self.child.wait();
+        if exited {
+            if let Some(reader) = self.reader.take() {
+                let _ = reader.join();
+            }
+        } else {
+            eprintln!("macOS Process Tap helper 未及时退出,跳过 reader 回收(自愈兜底接管)");
+        }
     }
 }
 
