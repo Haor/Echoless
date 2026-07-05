@@ -458,7 +458,7 @@ fn find_localvqe_library_in_dir(dir: &Path) -> Option<PathBuf> {
             } else if cfg!(target_os = "macos") {
                 name.starts_with("liblocalvqe") && name.ends_with(".dylib")
             } else {
-                name.starts_with("liblocalvqe") && name.contains(".so")
+                name.starts_with("liblocalvqe") && has_shared_object_suffix(name)
             };
             if is_match {
                 matches.push(path);
@@ -467,6 +467,19 @@ fn find_localvqe_library_in_dir(dir: &Path) -> Option<PathBuf> {
     }
     matches.sort();
     matches.into_iter().next()
+}
+
+fn has_shared_object_suffix(name: &str) -> bool {
+    if name.ends_with(".so") {
+        return true;
+    }
+    let Some((_, version)) = name.rsplit_once(".so.") else {
+        return false;
+    };
+    !version.is_empty()
+        && version
+            .split('.')
+            .all(|part| !part.is_empty() && part.chars().all(|ch| ch.is_ascii_digit()))
 }
 
 fn localvqe_library_path(app: Option<&tauri::AppHandle>, cli: &Path) -> Option<PathBuf> {
@@ -1963,6 +1976,8 @@ mod tests {
         let expected = dir.join(name);
         std::fs::write(&expected, b"stub").unwrap();
         std::fs::write(dir.join("not-localvqe.txt"), b"stub").unwrap();
+        std::fs::write(dir.join("readme.solutions"), b"stub").unwrap();
+        std::fs::write(dir.join("liblocalvqe.so.notes"), b"stub").unwrap();
 
         assert_eq!(
             find_localvqe_library_in_dir(&dir).as_deref(),

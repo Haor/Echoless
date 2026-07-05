@@ -8,6 +8,7 @@ const scriptDir = path.dirname(fileURLToPath(import.meta.url));
 const appDir = path.resolve(scriptDir, "..");
 const repoRoot = path.resolve(appDir, "..");
 const srcTauriDir = path.join(appDir, "src-tauri");
+const sharedObjectSuffix = /\.so(\.\d+)*$/i;
 
 const args = process.argv.slice(2);
 const valueOf = (flag) => {
@@ -236,7 +237,7 @@ function smoke() {
       ? (f) => f.toLowerCase() === "localvqe.dll"
       : process.platform === "darwin"
         ? (f) => f.startsWith("liblocalvqe") && f.endsWith(".dylib")
-        : (f) => f.startsWith("liblocalvqe") && f.includes(".so");
+        : (f) => f.startsWith("liblocalvqe") && sharedObjectSuffix.test(f);
   const nativeLib = existsDir(nativeDir) && fs.readdirSync(nativeDir).some(libName);
   if (!nativeLib) {
     throw new Error(`LocalVQE native library missing under ${nativeDir}`);
