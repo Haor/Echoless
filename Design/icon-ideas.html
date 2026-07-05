@@ -351,11 +351,12 @@ const VARIANTS = [
       ];
       return plate() + rows.map((r, i) => rk(x0, y0 + i * (bh + gap), r.w, bh, r.f, r.op)).join("");
     } },
-  { id: "G4", name: "小写 e 条纹球", tags: ["球即字母", "本命提名"], note: "条纹球本身就是一个小写 e:中横加粗给橙(横杠),下半球右侧逐行收短(开口)。echoless 的 e、条纹球、参考风格,三合一。",
+  { id: "G4", name: "小写 e 条纹球", tags: ["球即字母", "本命提名"], note: "条纹球本身就是一个小写 e:中横加粗给橙(横杠),开口只挖中横下方两行(e 的字腔),底部两行保持整弦把碗底封住 —— 球的轮廓完整,不会读成吃豆人。",
     draw: (uid) => {
       const R = 330, pitch = 64, t = 30, cx = 512, cy = 512;
       let s = "";
-      const openFrac = { 1: 0.06, 2: 0.42, 3: 0.68, 4: 0.9 };
+      // f = 行末超过圆心的比例(1 = 整弦);只有紧贴中横的两行开口,底部收拢
+      const openFrac = { 1: -0.1, 2: 0.35, 3: 0.92 };
       for (let k = -4; k <= 4; k++) {
         const y = cy + k * pitch - 16, dy = Math.abs(y - cy);
         if (dy > R - 12) continue;
