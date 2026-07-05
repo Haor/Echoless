@@ -403,8 +403,8 @@ impl Aec3Engine {
                     "process_render_f32",
                     err,
                 );
-            }
-            if let Err(err) = self
+                self.inner.out_buf[..blk].copy_from_slice(&self.inner.near_buf[..blk]);
+            } else if let Err(err) = self
                 .inner
                 .apm
                 .process_capture_f32(&[&self.inner.near_buf], &mut [&mut self.inner.out_buf])
