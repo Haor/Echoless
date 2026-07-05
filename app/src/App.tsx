@@ -73,6 +73,15 @@ import { MicSetupPage } from "./pages/MicSetupPage";
 import { simNvafxDoctor, type RtxState } from "./nvafx";
 import { simMicDoctor, type MicState } from "./mic";
 import {
+  lvqeNoiseTargetFile,
+  lvqePureAec,
+  isNearDelayOnlyPatch,
+  hotInitialDelayValue,
+  hotLocalvqeNoiseGateValue,
+  platformNearDelayDefault,
+  createSerialQueue,
+} from "./engineLogic";
+import {
   publishRuntimeStatus,
   resetRuntimeHealth,
   resetRuntimeLive,
@@ -203,12 +212,6 @@ const MODELS: { kind: string; label: string }[] = [
   { kind: "nvidia_afx_aec", label: "NVAFX" },
 ];
 
-// LocalVQE 官方描述:v1.4 = 纯 AEC(无降噪),v1.3 = AEC + 降噪。
-// 首页 NOISE 开关在 LVQE 下的语义 = 在这两个版本间切换(文件名 "-aec-" 标记纯 AEC)。
-const LVQE_NS_ON_FILE = "localvqe-v1.3-4.8M-f32.gguf";
-const LVQE_NS_OFF_FILE = "localvqe-v1.4-aec-200K-f32.gguf";
-const lvqePureAec = (model: unknown) => String(model ?? "").includes("-aec-");
-
 function modelName(kind: string): string {
   return MODELS.find((m) => m.kind === kind)?.label ?? kind.toUpperCase();
 }
@@ -235,30 +238,6 @@ const EMPTY_DEVICES: DeviceList = {
   outputs: [],
   reference_sources: [],
 };
-
-function isNearDelayOnlyPatch(patch: Partial<PipelineCfg>): boolean {
-  const keys = Object.keys(patch);
-  return keys.length === 1 && keys[0] === "near_delay_ms";
-}
-
-function hotInitialDelayValue(value: unknown): number | null {
-  if (value == null || value === "") return 0;
-  const delayMs = Number(value);
-  if (!Number.isFinite(delayMs)) return null;
-  return Math.round(delayMs);
-}
-
-function hotLocalvqeNoiseGateValue(next: Record<string, unknown>): {
-  enabled: boolean;
-  thresholdDbfs: number;
-} | null {
-  const threshold =
-    next.noise_gate_threshold_dbfs == null || next.noise_gate_threshold_dbfs === ""
-      ? -45
-      : Number(next.noise_gate_threshold_dbfs);
-  if (!Number.isFinite(threshold)) return null;
-  return { enabled: Boolean(next.noise_gate), thresholdDbfs: threshold };
-}
 
 type View =
   | "overview"
@@ -1062,24 +1041,19 @@ function useAppController() {
   // Hot controls bypass this path to avoid an audio dropout.
   // 审计 B-04:手动切换与热插拔自动刷新(devicechange → applyChangeRef)可
   // 重叠,交错的 stop→start 可能终态「UI 显示 OFF 但 sidecar 仍在采集」。
-  // promise 链串行化;排队期间的多次请求合并 delta 只跑最后一次(执行时
-  // currentToml 读最新 state,中间态选择无需逐个重启)。
-  const applyChainRef = useRef<Promise<void>>(Promise.resolve());
-  const queuedOverrideRef = useRef<Override | null>(null);
+  // 串行队列合并 delta、只跑最后一次;run 经 ref 读最新 doApplyChange 避免闭包过期,
+  // 电源态在真正执行的时刻判定(排队期间可能已被关掉)。
+  const doApplyRef = useRef<(next: Override) => Promise<void>>(async () => {});
+  doApplyRef.current = doApplyChange;
+  const applyQueueRef = useRef(
+    createSerialQueue<Override>((merged) => {
+      if (!powerOnRef.current) return Promise.resolve();
+      return doApplyRef.current(merged);
+    }),
+  );
 
   function applyChange(next: Override) {
-    if (queuedOverrideRef.current) {
-      queuedOverrideRef.current = { ...queuedOverrideRef.current, ...next };
-      return;
-    }
-    queuedOverrideRef.current = next;
-    applyChainRef.current = applyChainRef.current.then(async () => {
-      const merged = queuedOverrideRef.current;
-      queuedOverrideRef.current = null;
-      // 电源态在真正执行的时刻判定(排队期间可能已被关掉)。
-      if (!merged || !powerOnRef.current) return;
-      await doApplyChange(merged);
-    });
+    applyQueueRef.current.enqueue(next);
   }
 
   async function doApplyChange(next: Override) {
@@ -1187,7 +1161,7 @@ function useAppController() {
   function setLvqeNoise(on: boolean) {
     const curOn = !lvqePureAec(paramsRef.current.model);
     if (on === curOn) return; // 已处于目标态
-    const target = on ? LVQE_NS_ON_FILE : LVQE_NS_OFF_FILE;
+    const target = lvqeNoiseTargetFile(on);
     localvqeAssets()
       .then((a) => {
         const found = a.models.find((m) => m.filename === target);
@@ -1208,7 +1182,7 @@ function useAppController() {
     applyChange({ kind: "localvqe", params: np });
   }
   function hotNearDelayValue(next: PipelineCfg): number {
-    return next.near_delay_ms ?? (platform === "macos" ? 25 : 0);
+    return next.near_delay_ms ?? platformNearDelayDefault(platform);
   }
   // 改管线项。near_delay_ms 可运行中热控;采样率/帧长/参考声道仍需重启。
   function changePipeline(patch: Partial<PipelineCfg>) {

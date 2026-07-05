@@ -104,6 +104,10 @@ jobs:
         working-directory: app
         run: pnpm exec tsc --noEmit
 
+      - name: Frontend tests
+        working-directory: app
+        run: pnpm test
+
       - name: Tauri build smoke
         working-directory: app
         run: pnpm tauri build --debug --no-bundle --ci
