@@ -62,7 +62,6 @@ use echoless_core::{
 };
 use echoless_processors::{chain_from_nodes, ProcessorChain};
 
-const BYPASS_KEEP_WARM: bool = true;
 const BYPASS_CROSSFADE_MS: u32 = 15;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -594,10 +593,7 @@ fn process_loop<M, R, O>(
                 processed: &mut processed,
                 out: &mut out,
             },
-            BypassFrameConfig {
-                bypassed: runtime.bypassed,
-                keep_warm: BYPASS_KEEP_WARM,
-            },
+            runtime.bypassed,
             &mut bypass_crossfade,
         );
         apply_output_level(&mut out, runtime.output_level);
@@ -643,12 +639,6 @@ fn process_loop<M, R, O>(
     }
 }
 
-#[derive(Clone, Copy, Debug)]
-struct BypassFrameConfig {
-    bypassed: bool,
-    keep_warm: bool,
-}
-
 struct BypassFrameInputs<'a> {
     near: &'a [f32],
     far: &'a [f32],
@@ -668,28 +658,24 @@ fn process_bypass_frame(
     chain: &mut ProcessorChain,
     inputs: BypassFrameInputs<'_>,
     outputs: BypassFrameOutputs<'_>,
-    config: BypassFrameConfig,
+    bypassed: bool,
     crossfade: &mut BypassCrossfade,
 ) {
-    if should_process_for_bypass(config.bypassed, config.keep_warm, crossfade.is_active()) {
-        chain.process(
-            inputs.near,
-            inputs.far,
-            outputs.processed,
-            outputs.out.len() as u32,
-        );
-    }
+    // bypass 时链也恒跑(keep-warm):AEC3 滤波器/有状态节点持续收敛,
+    // 解旁路瞬间无重收敛间隙;bypass 只决定输出选源(审计 B-09,DECISIONS #4)。
+    chain.process(
+        inputs.near,
+        inputs.far,
+        outputs.processed,
+        outputs.out.len() as u32,
+    );
     write_bypass_output(
         outputs.processed,
         inputs.raw_near,
         outputs.out,
-        config.bypassed,
+        bypassed,
         crossfade,
     );
-}
-
-fn should_process_for_bypass(bypassed: bool, keep_warm: bool, crossfade_active: bool) -> bool {
-    !bypassed || keep_warm || crossfade_active
 }
 
 fn write_bypass_output(
@@ -1225,10 +1211,7 @@ mod tests {
                 processed: &mut processed,
                 out: &mut out,
             },
-            BypassFrameConfig {
-                bypassed: true,
-                keep_warm: true,
-            },
+            true,
             &mut crossfade,
         );
         apply_output_level(&mut out, MAX_OUTPUT_LEVEL);
@@ -1237,18 +1220,15 @@ mod tests {
         approx_slice(&out, &[0.3, -0.6, 0.75, -0.75], 0.001);
     }
 
+    // 冷路径(bypass 期间停喂 chain)已随审计 B-09 删除:该路径解旁路后残差是
+    // 保温路径的 5 倍以上(重收敛间隙),产品语义要求 OFF=穿透时引擎恒保温。
     #[test]
-    fn keep_warm_adapts_processor_during_bypass_before_restore() {
-        let warm = restore_rms_after_bypass(true);
-        let cold = restore_rms_after_bypass(false);
+    fn bypass_keeps_chain_warm_for_clean_restore() {
+        let warm = restore_rms_after_bypass();
 
         assert!(
             warm < 0.03,
             "keep-warm restore residual too high: {warm:.4}"
-        );
-        assert!(
-            cold > warm * 5.0,
-            "non-warm path should show a clear reconvergence gap: warm={warm:.4} cold={cold:.4}"
         );
     }
 
@@ -1301,10 +1281,7 @@ mod tests {
                     processed: &mut processed,
                     out: &mut out,
                 },
-                BypassFrameConfig {
-                    bypassed: true,
-                    keep_warm: false,
-                },
+                true,
                 &mut inactive_crossfade,
             );
             process_bypass_frame(
@@ -1318,10 +1295,7 @@ mod tests {
                     processed: &mut processed,
                     out: &mut out,
                 },
-                BypassFrameConfig {
-                    bypassed: true,
-                    keep_warm: false,
-                },
+                true,
                 &mut active_crossfade,
             );
             apply_output_level(&mut out, MAX_OUTPUT_LEVEL);
@@ -1330,7 +1304,7 @@ mod tests {
         assert_eq!(allocations, 0);
     }
 
-    fn restore_rms_after_bypass(keep_warm: bool) -> f32 {
+    fn restore_rms_after_bypass() -> f32 {
         const FRAME: usize = 480;
         let mut chain = ProcessorChain::new(48_000, 1);
         chain.push(Box::new(AdaptiveEchoSuppressor {
@@ -1357,10 +1331,7 @@ mod tests {
                     processed: &mut processed,
                     out: &mut out,
                 },
-                BypassFrameConfig {
-                    bypassed: false,
-                    keep_warm,
-                },
+                false,
                 &mut crossfade,
             );
             frame_index += 1;
@@ -1380,10 +1351,7 @@ mod tests {
                     processed: &mut processed,
                     out: &mut out,
                 },
-                BypassFrameConfig {
-                    bypassed: true,
-                    keep_warm,
-                },
+                true,
                 &mut crossfade,
             );
             frame_index += 1;
@@ -1402,10 +1370,7 @@ mod tests {
                 processed: &mut processed,
                 out: &mut out,
             },
-            BypassFrameConfig {
-                bypassed: false,
-                keep_warm,
-            },
+            false,
             &mut crossfade,
         );
         frame_index += 1;
@@ -1422,10 +1387,7 @@ mod tests {
                 processed: &mut processed,
                 out: &mut out,
             },
-            BypassFrameConfig {
-                bypassed: false,
-                keep_warm,
-            },
+            false,
             &mut crossfade,
         );
 
