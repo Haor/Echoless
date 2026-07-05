@@ -46,6 +46,10 @@ const D: Record<string, { en: string; zh: string }> = {
   noLoopback: { en: "No Loopback", zh: "No Loopback" },
   installCable: { en: "install virtual cable", zh: "安装虚拟声卡" },
   reduceNoise: { en: "Reduce background noise", zh: "抑制背景噪声" },
+  lvqeNsHint: {
+    en: "on = v1.3 · off = v1.4 pure aec",
+    zh: "开 = v1.3 · 关 = v1.4 纯回声消除",
+  },
 
   signal: { en: "Signal", zh: "Signal" },
   sigFlow: {
@@ -177,6 +181,15 @@ const D: Record<string, { en: string; zh: string }> = {
   micPickInApp: { en: "In your call app pick mic:", zh: "在通话软件里把麦克风选成:" },
   micMissing: { en: "Virtual audio not installed", zh: "未安装虚拟声卡" },
   micInstallHint: { en: "Install a virtual audio device:", zh: "安装一个虚拟声卡:" },
+  micLinuxMissing: { en: "PipeWire null sink not found", zh: "未检测到 PipeWire null sink" },
+  micLinuxInstallHint: {
+    en: "Create the Echoless null sink in a terminal:",
+    zh: "在终端创建 Echoless null sink:",
+  },
+  micLinuxMonitorHint: {
+    en: 'In GNOME/KDE sound settings and your call app, choose "Monitor of Echoless-Output" as the microphone.',
+    zh: '在 GNOME/KDE 声音设置与通话软件里,把麦克风选成 "Monitor of Echoless-Output"。',
+  },
   micRebootAfter: { en: "reboot after install", zh: "装完需重启" },
   micIncomplete: { en: "Route incomplete", zh: "路由不完整" },
   micIncompleteHint: {
@@ -259,12 +272,7 @@ const D: Record<string, { en: string; zh: string }> = {
   probeFilled: { en: "filled into Near Delay", zh: "已填入近端延迟" },
   probeInit: { en: "init", zh: "初始延迟" },
 
-  // Session · Windows 托盘偏好(P5)
-  trayMinimize: { en: "Minimize to Tray", zh: "最小化到托盘" },
-  trayMinimizeHint: {
-    en: "Minimizing hides the window into the system tray; audio keeps running.",
-    zh: "最小化时窗口收进系统托盘,音频链路不中断。",
-  },
+  // Session · Windows 托盘偏好(P5;只留「关闭到托盘」,最小化开关退役 2026-07-05)
   trayClose: { en: "Close to Tray", zh: "关闭到托盘" },
   trayCloseHint: {
     en: "Closing hides to tray instead of quitting. Quit via tray menu.",

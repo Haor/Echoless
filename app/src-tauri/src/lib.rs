@@ -3,7 +3,7 @@
 //   - 把 `echoless` CLI 作为 sidecar 调用,只消费 JSON / JSONL 契约
 //   - run 的 --status-json 以 JSONL 流式解析,经事件推给前端
 //
-// 契约真理源:echoless/docs/frontend/*.md + CLI 实测。
+// 契约真理源:docs/CLI.md + CLI `--json` 实测。
 use std::fs::OpenOptions;
 use std::io::ErrorKind;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -19,7 +19,7 @@ use sha2::{Digest, Sha256};
 use tauri::{
     menu::{Menu, MenuItem, PredefinedMenuItem},
     tray::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent},
-    AppHandle, WebviewWindow,
+    AppHandle,
 };
 use tauri::{Emitter, Manager, State, WebviewUrl, WebviewWindowBuilder, WindowEvent};
 #[cfg(target_os = "macos")]
@@ -39,30 +39,15 @@ struct RunState(Mutex<Option<RunChild>>);
 #[cfg(target_os = "windows")]
 struct TrayIconState(Mutex<Option<TrayIcon>>);
 
-#[cfg(target_os = "windows")]
-struct TrayWindowState {
-    minimizing_to_tray: AtomicBool,
-}
-
-#[cfg(target_os = "windows")]
-impl Default for TrayWindowState {
-    fn default() -> Self {
-        Self {
-            minimizing_to_tray: AtomicBool::new(false),
-        }
-    }
-}
-
 /// Windows tray preferences pushed by the frontend at startup and on change.
+/// 只剩「关闭到托盘」——最小化到托盘已退役(用户定案 2026-07-05)。
 struct TrayPrefs {
-    minimize_to_tray: AtomicBool,
     close_to_tray: AtomicBool,
 }
 
 impl Default for TrayPrefs {
     fn default() -> Self {
         Self {
-            minimize_to_tray: AtomicBool::new(false),
             close_to_tray: AtomicBool::new(false),
         }
     }
@@ -117,18 +102,14 @@ fn mark_run_exited(state: &RunState, config_path: &Path) {
     }
 }
 
-fn set_tray_prefs_inner(prefs: &TrayPrefs, minimize_to_tray: bool, close_to_tray: bool) {
+fn set_tray_prefs_inner(prefs: &TrayPrefs, close_to_tray: bool) {
     #[cfg(target_os = "windows")]
     {
-        prefs
-            .minimize_to_tray
-            .store(minimize_to_tray, Ordering::SeqCst);
         prefs.close_to_tray.store(close_to_tray, Ordering::SeqCst);
     }
     #[cfg(not(target_os = "windows"))]
     {
-        let _ = (minimize_to_tray, close_to_tray);
-        prefs.minimize_to_tray.store(false, Ordering::SeqCst);
+        let _ = close_to_tray;
         prefs.close_to_tray.store(false, Ordering::SeqCst);
     }
 }
@@ -144,11 +125,6 @@ fn tray_pref_enabled(value: &AtomicBool) -> bool {
         let _ = stored;
         false
     }
-}
-
-#[cfg(target_os = "windows")]
-fn minimize_to_tray_enabled(prefs: &TrayPrefs) -> bool {
-    tray_pref_enabled(&prefs.minimize_to_tray)
 }
 
 fn close_to_tray_enabled(prefs: &TrayPrefs) -> bool {
@@ -235,28 +211,6 @@ fn register_windows_tray(app: &mut tauri::App) -> tauri::Result<()> {
     let tray_state = app.state::<TrayIconState>();
     *tray_icon_state_guard(&tray_state) = Some(tray);
     Ok(())
-}
-
-#[cfg(target_os = "windows")]
-fn handle_minimize_to_tray(window: &WebviewWindow) {
-    let prefs = window.state::<TrayPrefs>();
-    if !minimize_to_tray_enabled(&prefs) || !window.is_minimized().unwrap_or(false) {
-        return;
-    }
-
-    let tray_window_state = window.state::<TrayWindowState>();
-    if tray_window_state
-        .minimizing_to_tray
-        .swap(true, Ordering::SeqCst)
-    {
-        return;
-    }
-
-    let _ = window.unminimize();
-    let _ = window.hide();
-    tray_window_state
-        .minimizing_to_tray
-        .store(false, Ordering::SeqCst);
 }
 
 const TAURI_TARGET_TRIPLE: &str = env!("TAURI_ENV_TARGET_TRIPLE");
@@ -732,6 +686,81 @@ async fn request_system_audio(app: tauri::AppHandle) -> Result<Value, String> {
 }
 
 /// 主动近端延迟侦测 / AEC 链路诊断。shell `echoless probe-delay --json`:播放一串蜂鸣、
+/// probe-delay 专用 runner:stderr 的 JSONL 进度行实时转发为
+/// `echoless://probe-progress` 事件(前端用 beep_train_start 把进度灯对齐真实播放时刻),
+/// stdout 仍在进程结束后整体解析为最终 JSON 结果。
+fn run_probe_streaming(
+    app: &tauri::AppHandle,
+    args: &[&str],
+    timeout: Duration,
+) -> Result<Value, String> {
+    let label = "probe-delay";
+    let mut command = echoless_command(Some(app))?;
+    command.args(args);
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    suppress_child_console(&mut command);
+    let mut child = command
+        .spawn()
+        .map_err(|e| format!("spawn {label} failed: {e}"))?;
+    let stderr = child.stderr.take().ok_or("probe stderr not captured")?;
+    let app_ev = app.clone();
+    // stderr 尾巴留存:CLI 失败时错误原因在 stderr(stdout 无 JSON)。
+    let stderr_tail = Arc::new(Mutex::new(String::new()));
+    let tail_writer = stderr_tail.clone();
+    let reader = std::thread::spawn(move || {
+        for line in BufReader::new(stderr).lines() {
+            let Ok(line) = line else { break };
+            if let Ok(v) = serde_json::from_str::<Value>(&line) {
+                let _ = app_ev.emit("echoless://probe-progress", v);
+            }
+            let mut tail = tail_writer.lock().unwrap();
+            tail.push_str(&line);
+            tail.push('\n');
+            if tail.len() > 4096 {
+                let cut = tail.len() - 4096;
+                tail.drain(..cut);
+            }
+        }
+    });
+    let started = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if started.elapsed() >= timeout => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = reader.join();
+                let tail = stderr_tail.lock().unwrap().trim().to_string();
+                return Err(format!(
+                    "{label} timed out after {}s; stderr: {tail}",
+                    timeout.as_secs()
+                ));
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(50)),
+            Err(e) => return Err(format!("wait {label} failed: {e}")),
+        }
+    }
+    let out = child
+        .wait_with_output()
+        .map_err(|e| format!("read {label} output failed: {e}"))?;
+    let _ = reader.join();
+    if !out.status.success() {
+        let tail = stderr_tail.lock().unwrap().trim().to_string();
+        // 与 command_status_error 相同的 240 字符截断(错误直达前端 UI)。
+        let detail: String = if tail.chars().count() > 240 {
+            format!("{}…", tail.chars().take(240).collect::<String>())
+        } else {
+            tail
+        };
+        return Err(format!(
+            "{label} failed with status {}; output: {detail}",
+            out.status
+        ));
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    serde_json::from_str(&stdout).map_err(|e| format!("parse json failed: {e}; raw: {stdout}"))
+}
+
 /// 同时录 ref/mic、分析两路相对到达时差,返回 NearDelayProbeResult(含 recommended_near_delay_ms)。
 /// 约 15 秒、会外放蜂鸣 —— 故必须先停掉主 run(probe 内部自起子进程占用设备),由前端 gating。
 /// 当前后端只支持 macOS Process Tap;其它平台 CLI 会非 0 退出,错误经 stderr 透传给前端。
@@ -755,7 +784,7 @@ async fn probe_delay(
         opt("--reference", &reference, &mut args);
         opt("--output", &output, &mut args);
         let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-        run_json_blocking(Some(&app), &arg_refs, PROBE_DELAY_TIMEOUT, "probe-delay")
+        run_probe_streaming(&app, &arg_refs, PROBE_DELAY_TIMEOUT)
     })
     .await
     .map_err(|e| format!("probe task join failed: {e}"))?
@@ -1033,7 +1062,9 @@ fn download_localvqe_model_blocking(
     );
     let mut curl = Command::new("curl");
     // -sS:去掉进度表(否则 curl 把整张进度表写进 stderr,报错时被原样灌进 UI)。
-    curl.args(["-sSfL", "--retry", "2", "-o"]).arg(&tmp).arg(&url);
+    curl.args(["-sSfL", "--retry", "2", "-o"])
+        .arg(&tmp)
+        .arg(&url);
     let out =
         command_output_with_timeout(&mut curl, MODEL_DOWNLOAD_TIMEOUT, "LocalVQE model download")?;
     if !out.status.success() {
@@ -1151,6 +1182,11 @@ fn validate_browser_url(url: &str) -> Result<String, String> {
         .any(|ch| ch.is_control() || ch.is_whitespace())
     {
         return Err("URL 不能包含空白或控制字符".to_string());
+    }
+    // 系统设置深链(隐私面板跳转):固定 scheme 白名单。此前被 http(s) 门拒掉,
+    // 「授予系统音频权限」按钮点了毫无反应(2026-07-05 修)。
+    if trimmed.starts_with("x-apple.systempreferences:") {
+        return Ok(trimmed.to_string());
     }
     if !(trimmed.starts_with("https://") || trimmed.starts_with("http://")) {
         return Err("仅允许打开 http(s) URL".to_string());
@@ -1403,8 +1439,72 @@ fn stop_run(app: tauri::AppHandle, state: State<RunState>) -> Result<(), String>
 }
 
 #[tauri::command]
-fn set_tray_prefs(prefs: State<TrayPrefs>, minimize_to_tray: bool, close_to_tray: bool) {
-    set_tray_prefs_inner(&prefs, minimize_to_tray, close_to_tray);
+fn set_tray_prefs(prefs: State<TrayPrefs>, close_to_tray: bool) {
+    set_tray_prefs_inner(&prefs, close_to_tray);
+}
+
+// macOS 设备热插拔监听:CoreAudio 设备列表('dev#')变更即推事件给前端刷新。
+// WKWebView 不触发 navigator.mediaDevices 的 devicechange,只能原生侧监听;
+// Windows 的 WebView2(Chromium)会触发,前端已挂 devicechange,无需原生监听。
+#[cfg(target_os = "macos")]
+mod device_watch {
+    use std::ffi::c_void;
+    use tauri::Emitter;
+
+    // CoreAudio/AudioHardware.h
+    #[repr(C)]
+    struct AudioObjectPropertyAddress {
+        selector: u32,
+        scope: u32,
+        element: u32,
+    }
+
+    const SYSTEM_OBJECT: u32 = 1; // kAudioObjectSystemObject
+    const DEVICES_ADDRESS: AudioObjectPropertyAddress = AudioObjectPropertyAddress {
+        selector: u32::from_be_bytes(*b"dev#"), // kAudioHardwarePropertyDevices
+        scope: u32::from_be_bytes(*b"glob"),    // kAudioObjectPropertyScopeGlobal
+        element: 0,                             // kAudioObjectPropertyElementMain
+    };
+
+    type Listener = extern "C" fn(u32, u32, *const AudioObjectPropertyAddress, *mut c_void) -> i32;
+
+    #[link(name = "CoreAudio", kind = "framework")]
+    extern "C" {
+        fn AudioObjectAddPropertyListener(
+            object_id: u32,
+            address: *const AudioObjectPropertyAddress,
+            listener: Listener,
+            client_data: *mut c_void,
+        ) -> i32;
+    }
+
+    // HAL 通知线程回调:只透传「变了」,枚举仍由前端调 list_devices 完成。
+    extern "C" fn on_devices_changed(
+        _object_id: u32,
+        _num_addresses: u32,
+        _addresses: *const AudioObjectPropertyAddress,
+        client_data: *mut c_void,
+    ) -> i32 {
+        let app = unsafe { &*(client_data as *const tauri::AppHandle) };
+        let _ = app.emit("echoless://devices-changed", ());
+        0
+    }
+
+    pub fn start(app: &tauri::AppHandle) {
+        // AppHandle 有意泄漏成 'static:监听与进程同生命周期,不注销。
+        let client = Box::into_raw(Box::new(app.clone()));
+        let status = unsafe {
+            AudioObjectAddPropertyListener(
+                SYSTEM_OBJECT,
+                &DEVICES_ADDRESS,
+                on_devices_changed,
+                client as *mut c_void,
+            )
+        };
+        if status != 0 {
+            eprintln!("device watch: AudioObjectAddPropertyListener failed ({status})");
+        }
+    }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -1416,9 +1516,7 @@ pub fn run() {
         .manage(TrayPrefs::default());
 
     #[cfg(target_os = "windows")]
-    let builder = builder
-        .manage(TrayIconState(Mutex::new(None)))
-        .manage(TrayWindowState::default());
+    let builder = builder.manage(TrayIconState(Mutex::new(None)));
 
     builder
         .invoke_handler(tauri::generate_handler![
@@ -1482,11 +1580,13 @@ pub fn run() {
             {
                 register_windows_tray(app)?;
             }
+            #[cfg(target_os = "macos")]
+            device_watch::start(app.handle());
             let _ = &window;
             Ok(())
         })
-        .on_window_event(|window, event| match event {
-            WindowEvent::CloseRequested { api, .. } => {
+        .on_window_event(|window, event| {
+            if let WindowEvent::CloseRequested { api, .. } = event {
                 let prefs = window.state::<TrayPrefs>();
                 if close_to_tray_enabled(&prefs) {
                     api.prevent_close();
@@ -1496,11 +1596,6 @@ pub fn run() {
                     terminate_run(&state);
                 }
             }
-            WindowEvent::Resized(_) => {
-                #[cfg(target_os = "windows")]
-                handle_minimize_to_tray(window);
-            }
-            _ => {}
         })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -1596,21 +1691,14 @@ mod tests {
     #[test]
     fn tray_prefs_default_false_and_follow_platform_gate() {
         let prefs = TrayPrefs::default();
-        assert!(!prefs.minimize_to_tray.load(Ordering::SeqCst));
         assert!(!prefs.close_to_tray.load(Ordering::SeqCst));
 
-        set_tray_prefs_inner(&prefs, true, true);
+        set_tray_prefs_inner(&prefs, true);
 
         #[cfg(target_os = "windows")]
-        {
-            assert!(prefs.minimize_to_tray.load(Ordering::SeqCst));
-            assert!(prefs.close_to_tray.load(Ordering::SeqCst));
-        }
+        assert!(prefs.close_to_tray.load(Ordering::SeqCst));
         #[cfg(not(target_os = "windows"))]
-        {
-            assert!(!prefs.minimize_to_tray.load(Ordering::SeqCst));
-            assert!(!prefs.close_to_tray.load(Ordering::SeqCst));
-        }
+        assert!(!prefs.close_to_tray.load(Ordering::SeqCst));
     }
 
     #[test]
@@ -1644,6 +1732,14 @@ mod tests {
         assert_eq!(
             validate_browser_url("http://example.com/#drivers").unwrap(),
             "http://example.com/#drivers"
+        );
+        // 系统设置深链白名单(隐私面板跳转)。
+        assert_eq!(
+            validate_browser_url(
+                "x-apple.systempreferences:com.apple.preference.security?Privacy_AudioCapture"
+            )
+            .unwrap(),
+            "x-apple.systempreferences:com.apple.preference.security?Privacy_AudioCapture"
         );
 
         for bad in [

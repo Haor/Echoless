@@ -1,4 +1,3 @@
-
 pub mod adaptive_digital_gain_controller;
 pub mod biquad_filter;
 pub mod clipping_predictor;

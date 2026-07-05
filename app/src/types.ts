@@ -1,5 +1,5 @@
 // Echoless 后端 JSON 契约的 TS 镜像。
-// 形状以 `echoless <cmd> --json` 实测为准(见 docs/frontend/*.md)。
+// 形状以 `echoless <cmd> --json` 实测为准(见 docs/CLI.md)。
 
 export type Platform = "windows" | "macos" | "linux";
 
@@ -259,6 +259,13 @@ export interface DoctorAudio {
   // 系统音频录制权限(mac Process Tap reference 用)。helper 可发现=undetermined;
   // 缺失/非 mac=unknown。普通 doctor 不主动触发系统弹窗(首次启动 tap 录制才触发)。
   system_audio_permission?: "granted" | "denied" | "undetermined" | "unknown";
+  // --request-system-audio 时回传:probe 结果与失败原因(detail 直达 UI 错误条)。
+  system_audio_permission_probe?: {
+    state: string;
+    ok: boolean;
+    requested?: boolean;
+    detail?: string;
+  } | null;
   hint?: string;
   reference_sources: ReferenceSource[];
 

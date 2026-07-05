@@ -49,24 +49,24 @@ const PROFILES: Profile[] = [
     voice: 6,
     cost: "CPU · light",
     sr: "48k / 16k",
-    os: "Win · mac",
+    os: "Win · mac · Linux",
   },
   {
     kind: "localvqe",
     name: "LOCALVQE",
     tier: { en: "EXPERIMENTAL", zh: "试验" },
-    echo: 8,
-    voice: 6,
+    echo: 9,
+    voice: 5,
     cost: "CPU · neural",
     sr: "16k · auto 48 ↔ 16", // A6:管线级自动重采样适配,如实标注
-    os: "Win · mac",
+    os: "Win · mac · Linux",
   },
   {
     kind: "nvidia_afx_aec",
     name: "NVAFX",
     tier: { en: "CLEANEST VOICE", zh: "人声最干净" },
     echo: 7,
-    voice: 10,
+    voice: 9,
     cost: "GPU · Tensor Core",
     sr: "16k / 48k",
     os: "Win · only",
@@ -198,8 +198,11 @@ function NvafxCard({
           <div className="epair">
             <span className="mk">»</span> {t("engPair")}
           </div>
+          {/* Maxine SDK 许可要求:集成应用须在应用内做品牌归属(README/release 已有,
+              这里是 UI 侧唯一归属点)。 */}
+          <div className="epair">powered by NVIDIA Maxine</div>
         </div>
-        <div className="ecol nvcol">
+        <div className={`ecol nvcol ${nvSupported ? "" : "nvna"}`}>
           {!nvSupported ? (
             <div className="cdetail na">{t("engWinOnly")}</div>
           ) : (

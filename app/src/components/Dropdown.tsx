@@ -11,6 +11,7 @@ export function Dropdown({
   value,
   options,
   onChange,
+  onOpen,
   align = "left",
   compact = false,
   warn = false,
@@ -18,6 +19,7 @@ export function Dropdown({
   value: string;
   options: DropdownOption[];
   onChange: (v: string) => void;
+  onOpen?: () => void;
   align?: "left" | "right";
   compact?: boolean;
   warn?: boolean;
@@ -46,7 +48,10 @@ export function Dropdown({
     <div className={`dd ${compact ? "dd-sm" : ""}`} ref={rootRef}>
       <button
         className={`dd-trigger ${warn ? "warn" : ""}`}
-        onClick={() => setOpen((v) => !v)}
+        onClick={() => {
+          if (!open) onOpen?.(); // 展开瞬间刷新选项来源(设备热插拔兜底)
+          setOpen(!open);
+        }}
         type="button"
       >
         <span className="lbl">

@@ -26,7 +26,7 @@ use std::sync::mpsc::Receiver;
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 use std::time::Instant;
 
 use anyhow::{bail, Context, Result};
@@ -45,9 +45,9 @@ pub use self::devices::{
     AudioDoctorOptions, DeviceListOptions,
 };
 use self::devices::{
-    config_choice_summary, mic_selector,
-    output_selector, pick_config, select_device, select_reference_source, selected_device_label,
-    DeviceKind, ReferenceSource, StreamConfigChoice,
+    config_choice_summary, mic_selector, output_selector, pick_config, select_device,
+    select_reference_source, selected_device_label, DeviceKind, ReferenceSource,
+    StreamConfigChoice,
 };
 #[cfg(test)]
 use self::devices::{
@@ -215,8 +215,8 @@ pub fn run_with_options(cfg: &PipelineConfig, options: RuntimeOptions) -> Result
     }
     let near_delay_samples = delay_ms_to_samples(cfg.near_delay_ms, sample_rate);
     let ring_size = frame_size * 12 + near_delay_samples; // ~120ms plus explicit near delay
-    // A5:tap 采样率由 helper 流头上报,与管线不一致时 reader 侧线性重采样,
-    // 不再要求管线锁 48k。
+                                                          // A5:tap 采样率由 helper 流头上报,与管线不一致时 reader 侧线性重采样,
+                                                          // 不再要求管线锁 48k。
 
     let reference_channels = if reference_source.has_reference() {
         usize::from(cfg.reference_channels.channel_count())
@@ -952,7 +952,7 @@ where
         .context("构建输出流失败")
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 pub(crate) fn play_mono_samples_to_output(
     selector: Option<&str>,
     sample_rate: u32,
@@ -1011,7 +1011,7 @@ pub(crate) fn play_mono_samples_to_output(
     Ok(())
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 fn build_mono_sample_player_stream<T>(
     device: &Device,
     choice: &StreamConfigChoice,
@@ -1052,7 +1052,7 @@ where
         .context("构建蜂鸣输出流失败")
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 fn interpolated_sample(samples: &[f32], position: f64) -> f32 {
     let i = position.floor() as usize;
     let frac = (position - i as f64) as f32;

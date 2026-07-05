@@ -1,7 +1,12 @@
 import { useEffect, useReducer, useRef } from "react";
 import type { ParamSpec, Platform, Processor } from "../types";
 import type { TrayPrefsState } from "../App";
-import { probeDelay, type NearDelayProbeResult, type PipelineCfg } from "../api";
+import {
+  onProbeProgress,
+  probeDelay,
+  type NearDelayProbeResult,
+  type PipelineCfg,
+} from "../api";
 import { useI18n, type Lang } from "../i18n";
 import { Hint } from "../components/Hint";
 import { Field, SegButtons } from "../components/Controls";
@@ -49,6 +54,8 @@ const HIDDEN_PARAMS: Record<string, Set<string>> = {
 const PROBE_BEEPS = 12;
 const PROBE_FIRST_MS = 4500;
 const PROBE_STEP_MS = 720;
+// afplay / cpal 输出流从 spawn 到出声的经验常量(进度灯对齐用,无需精确)。
+const PROBE_PLAYER_OPEN_MS = 150;
 // 信号判定阈值:dBFS 低于此视为没收到。
 const PROBE_SIG_DBFS = -55;
 // mac 上 near_delay 被侦测设非零时,顺带给 AEC3 一个 8ms 初始延迟 hint,
@@ -214,17 +221,37 @@ function ProbeSection({
         await onSetRun(false);
       }
       updateProbe({ phase: "probing" });
-      const t0 = Date.now();
+      // 进度灯节奏:默认按墙钟估计(旧 CLI 无进度事件的回退);收到 CLI 的
+      // beep_train_start 事件后改以真实开播时刻为基准 —— 蜂鸣要等子进程起好
+      // 设备 + 4s 稳定期才响,纯墙钟估计会让灯超前声音(音画不同步)。
+      let t0 = Date.now();
+      let firstMs = PROBE_FIRST_MS;
+      let stepMs = PROBE_STEP_MS;
+      let beeps = PROBE_BEEPS;
       if (timer.current != null) window.clearInterval(timer.current);
       timer.current = window.setInterval(() => {
         const el = Date.now() - t0;
         const n = Math.max(
           0,
-          Math.min(PROBE_BEEPS, Math.floor((el - PROBE_FIRST_MS) / PROBE_STEP_MS) + 1),
+          Math.min(beeps, Math.floor((el - firstMs) / stepMs) + 1),
         );
         updateProbe({ lit: n });
       }, 100);
-      const r = await probeDelay({ mic, reference, output });
+      const unProgress = await onProbeProgress((p) => {
+        if (p.stage !== "beep_train_start") return;
+        // 首响 = 事件时刻 + WAV 前导静音 + 播放器打开的经验常量。
+        t0 = Date.now();
+        firstMs = (p.pre_roll_ms ?? 500) + PROBE_PLAYER_OPEN_MS;
+        stepMs = (p.beep_ms ?? 70) + (p.gap_ms ?? 650);
+        beeps = p.beeps ?? PROBE_BEEPS;
+        updateProbe({ lit: 0 });
+      });
+      let r: NearDelayProbeResult;
+      try {
+        r = await probeDelay({ mic, reference, output });
+      } finally {
+        unProgress();
+      }
       updateProbe({ probe: r });
       // 自动把实测推荐值填进 near_delay_ms(含 8ms AEC 安全余量,后端已算好)。
       onPipeline({ near_delay_ms: r.recommended_near_delay_ms });
@@ -541,40 +568,24 @@ export function AdvancedPage({
             />
           </span>
         </div>
-        {/* P5 前端侧:托盘偏好(仅 Windows;Rust 端非 Windows 强制 false) */}
+        {/* P5 前端侧:托盘偏好(仅 Windows;Rust 端非 Windows 强制 false)。
+            只留「关闭到托盘」一个开关 —— 最小化到托盘退役(用户定案 2026-07-05) */}
         {platform === "windows" && (
-          <>
-            <div className="arow">
-              <Hint text={t("trayMinimizeHint")}>
-                <span className="alabel">{t("trayMinimize")}</span>
-              </Hint>
-              <span className="aval">
-                <SegButtons
-                  value={trayPrefs.minimizeToTray ? "on" : "off"}
-                  options={[
-                    { value: "on", label: "ON" },
-                    { value: "off", label: "OFF" },
-                  ]}
-                  onChange={(v) => onTrayPrefs({ minimizeToTray: v === "on" })}
-                />
-              </span>
-            </div>
-            <div className="arow">
-              <Hint text={t("trayCloseHint")}>
-                <span className="alabel">{t("trayClose")}</span>
-              </Hint>
-              <span className="aval">
-                <SegButtons
-                  value={trayPrefs.closeToTray ? "on" : "off"}
-                  options={[
-                    { value: "on", label: "ON" },
-                    { value: "off", label: "OFF" },
-                  ]}
-                  onChange={(v) => onTrayPrefs({ closeToTray: v === "on" })}
-                />
-              </span>
-            </div>
-          </>
+          <div className="arow">
+            <Hint text={t("trayCloseHint")}>
+              <span className="alabel">{t("trayClose")}</span>
+            </Hint>
+            <span className="aval">
+              <SegButtons
+                value={trayPrefs.closeToTray ? "on" : "off"}
+                options={[
+                  { value: "on", label: "ON" },
+                  { value: "off", label: "OFF" },
+                ]}
+                onChange={(v) => onTrayPrefs({ closeToTray: v === "on" })}
+              />
+            </span>
+          </div>
         )}
       </div>
     </div>

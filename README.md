@@ -1,94 +1,180 @@
-# Echoless — 外放场景的实时回声消除
+# Echoless
 
-**用音箱外放打语音,对面听不到你的回声。**
+[![Build](https://github.com/Haor/echoless/actions/workflows/build.yml/badge.svg)](https://github.com/Haor/echoless/actions/workflows/build.yml)
 
-Echoless 把「系统正在播放的声音」作为参考信号,从麦克风采到的声音里实时
-消掉音箱回声,再把干净人声送进一个虚拟麦克风 —— Discord / VRChat 等语音
-应用把那个虚拟麦克风当作输入即可。
+**Real-time acoustic echo cancellation for open-speaker setups.**
+Echoless removes what your speakers are playing from what your microphone
+hears, and hands the clean voice to Discord / VRChat / any voice app through a
+virtual microphone — so the people on the other end never hear themselves (or
+your game audio) echoed back.
 
 ```
-系统播放(far-end reference,loopback / Process Tap)
-        ↘
-麦克风(人声 + 音箱回声) → AEC 引擎 → 干净人声 → 虚拟麦克风 → 语音应用
+far-end reference   system audio loopback (what your speakers play)
+near-end capture    microphone (your voice + speaker echo + room)
+output              echo-cancelled voice → virtual mic → voice app
 ```
 
-- **平台**:Windows 10/11、macOS 14.4+
-- **形态**:Tauri 桌面应用(`app/`)+ 同一后端的 CLI(`echoless`)
-- **引擎**:AEC3(默认,WebRTC AEC3 的内化 Rust 移植,见 `aec3/`)、
-  LocalVQE(神经后处理,试验)、NVAFX / RTX AEC(Windows + RTX 显卡)
+No special hardware required: a USB or built-in mic, ordinary speakers, and a
+virtual audio device.
 
-## 安装
+## Features
 
-1. 从 GitHub Actions 构建产物取对应平台的包:macOS 是 `.dmg`,Windows 是
-   NSIS 安装器(见下方「构建」;暂无公开 release 页)。
-2. **装一个虚拟声卡**(Echoless 不创建系统级虚拟麦克风,需要外部设备桥接):
-   - Windows:[VB-CABLE](https://vb-audio.com/Cable/)。装完**重启**。
-   - macOS:[BlackHole 2ch](https://github.com/ExistentialAudio/BlackHole)
-     或 VB-CABLE MAC。
-   - 应用内「MIC SETUP」向导会检测安装状态并逐步引导(未装 → 装了没重启 →
-     路由就绪)。
-3. macOS 首次启动会请求**麦克风**与**系统音频录制**两个权限。
+- **Three interchangeable AEC engines** — switch live, per taste and hardware
+  (see [Engines](#engines) below)
+- **System-audio reference with no extra cabling** — WASAPI loopback
+  (Windows), Core Audio Process Tap (macOS 14.4+), PipeWire monitor (Linux)
+- **Delay probe** — plays a short beep train and measures your actual
+  mic-to-reference delay, then applies it (cross-correlation, ~ms accuracy)
+- **Power-off = bypass, not mute** — the mic path never dies; turning AEC off
+  keeps your voice flowing untouched
+- **Diagnostics recording** — capture mic / reference / output tracks to WAV
+  for troubleshooting
+- **Desktop app + standalone CLI** — the Tauri GUI drives the same `echoless`
+  CLI you can script yourself ([CLI guide](docs/CLI.md))
 
-## 快速上手
+## Engines
 
-1. **01 INPUT**:选你的物理麦克风。
-2. **02 MODEL**:默认 AEC3 即可。LocalVQE 首次使用需在 Engine 页下载模型
-   (~3-18 MB,来自 [HuggingFace](https://huggingface.co/LocalAI-io/LocalVQE));
-   NVAFX 需要 Windows + RTX 显卡并按向导装 runtime。
-3. **03 OUTPUT**:选虚拟声卡的写入端(Windows `CABLE Input`,mac `BlackHole 2ch`)。
-4. 开 **POWER**,然后在 Discord/VRChat 里把麦克风选成虚拟声卡的输入端
-   (Windows `CABLE Output`,mac `BlackHole 2ch`)。
-5. 效果不好时:Advanced 页跑一次 **RUN PROBE**(约 15 秒蜂鸣,自动校准
-   near/far 对齐延迟);footer 的 VOL 滚轮调输出音量、点按静音。
+### AEC3 (default)
 
-电源 OFF = 直通模式:AEC 旁路但麦克风链路不断,语音应用不会失去输入。
+The echo canceller from the [WebRTC](https://webrtc.googlesource.com/src/)
+audio processing module — the same algorithm family used by Chrome and Meet.
+Adaptive linear filtering with delay estimation, non-linear residual
+suppression, and optional noise suppression / AGC. CPU-light, 48 kHz native.
 
-## 故障排查
+Echoless ships a Rust port of AEC3 (in [`aec3/`](aec3/), BSD-3-Clause) with
+small modifications for the open-speaker use case: the estimated delay is
+held once confidence is reached instead of being re-searched during silence,
+which measurably improves long-session stability on loopback-style paths.
 
-- **对面还是听到回声**:先跑 RUN PROBE;确认 02 的 REFERENCE 是系统音频
-  (mac 用 Process Tap,需要系统音频录制权限)而不是 none。
-- **状态条显示 NO REFERENCE**:系统当前没有在放声音属正常;持续如此则检查
-  参考源选择与权限。
-- **LocalVQE 报错 / 不可用**:Engine 页确认模型已下载;`v1.4` 需要新版
-  runtime(包内自带,老构建升级后需重装)。
-- **虚拟声卡检测不到**:Windows 装完 VB-CABLE 必须重启;mac 可按向导提示
-  重启 CoreAudio(`sudo killall coreaudiod`)。
-- Windows 测试者完整流程见
-  [`docs/windows-testing/WINDOWS_FRIEND_INSTALL_TEST_GUIDE.md`](docs/windows-testing/WINDOWS_FRIEND_INSTALL_TEST_GUIDE.md)。
+### LocalVQE (neural, experimental)
 
-## 构建(开发者)
+[LocalVQE](https://huggingface.co/LocalAI-io/LocalVQE) (Apache-2.0, by Richard
+Palethorpe and Claude) is a family of compact neural models for echo
+cancellation, noise suppression and dereverberation of 16 kHz speech, running
+in real time on ordinary CPUs. It is a streaming, CPU-tuned derivative of
+Microsoft's **DeepVQE** at roughly a tenth of the parameter count. Echoless
+resamples its 48 kHz pipeline to 16 kHz and back around the model
+automatically.
+
+| Model | Does | Params |
+|---|---|---:|
+| v1.3 *(default)* | AEC + noise suppression + dereverb | 4.8 M |
+| v1.2 | AEC + NS + dereverb, ~¼ the CPU cost | 1.3 M |
+| v1.4-AEC | echo removal only — keeps voice, noise and room | 203 K |
+
+The inference runtime ships inside the app; model weights are downloaded from
+Hugging Face on demand (SHA-256 verified). The overview page's NOISE switch
+maps to the model choice: **on = v1.3, off = v1.4** (pure AEC).
+
+### NVAFX / RTX AEC (Windows + RTX GPU)
+
+Acoustic echo cancellation from the
+[NVIDIA Maxine](https://developer.nvidia.com/maxine) Audio Effects SDK,
+accelerated on RTX Tensor Cores. In our testing it produces the cleanest
+voice of the three engines. Requires Windows and a Turing-or-newer RTX GPU;
+the runtime (~1 GB) and per-architecture models are downloaded on first
+setup. *AEC powered by NVIDIA Maxine.*
+
+## Platforms
+
+| OS | Reference capture | Virtual mic | Status |
+|---|---|---|---|
+| Windows 10 / 11 | WASAPI loopback | [VB-CABLE](https://vb-audio.com/Cable/) | supported |
+| macOS 14.4+ | Core Audio Process Tap | [BlackHole 2ch](https://github.com/ExistentialAudio/BlackHole) | supported |
+| Linux | monitor source | `pactl` null sink — no driver needed | experimental, not yet verified on hardware |
+
+## Install
+
+Grab the installer for your OS from
+[Releases](https://github.com/Haor/echoless/releases), or
+[build from source](#building-from-source).
+
+You also need a virtual audio device (see the table above). The app's
+**MIC SETUP** wizard checks for one and walks you through installing it.
+
+## Quick start
+
+1. Install a virtual audio device (VB-CABLE / BlackHole; on Linux one
+   `pactl load-module module-null-sink …` command — the wizard shows it).
+2. In Echoless: **INPUT** = your microphone, **OUTPUT** = the virtual device.
+   The reference defaults to system audio.
+3. Flip **POWER** on. On macOS, grant system-audio recording when prompted.
+4. In your voice app, select the virtual device as the microphone
+   (`CABLE Output` / `BlackHole 2ch` / `Monitor of Echoless-Output`).
+5. If echo remains, run **RUN PROBE** on the Advanced page (~15 s of beeps)
+   to measure and apply your exact device delay.
+
+Power **OFF** is a bypass: AEC is skipped but your mic keeps flowing, so the
+voice app never loses its input.
+
+## CLI
+
+Everything the GUI does goes through the `echoless` CLI, which works
+standalone — `devices`, `run`, `probe-delay`, `offline` (WAV-in/WAV-out),
+`doctor`, all with `--json` for scripting:
 
 ```bash
-# 后端 workspace(CLI + 引擎)
-cargo build --release
-cargo test --workspace
-(cd aec3 && cargo test)          # 内化 AEC3 引擎子 workspace
-
-# 桌面应用(需要 Node 22 + pnpm)
-cd app
-pnpm install
-pnpm prepare:tauri-assets        # 构建 CLI sidecar + 打包 LocalVQE native runtime
-pnpm tauri dev                   # 开发
-pnpm tauri build                 # 打包(发布加 --require-localvqe-assets 缺库即 fail)
+echoless devices --json
+echoless run --mic default --reference system --output "CABLE Input"
+echoless offline --mic mic.wav --reference ref.wav --out clean.wav --chain aec3
 ```
 
-CLI 可独立使用:`echoless devices` / `run --config` / `probe-delay` /
-`offline` / `doctor audio` / `nvafx doctor`,均有 `--json` 输出供集成。
-示例配置见 `configs/example.toml`。
+See **[docs/CLI.md](docs/CLI.md)** for the full command reference, the
+runtime-control protocol, and configuration format. Architecture notes live
+in **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)**.
 
-推送 `main` 触发 `.github/workflows/build.yml`:双平台测试 + clippy +
-LocalVQE 上游 regression + FFI smoke + 打包产物(dmg / NSIS)与 bundle smoke。
+## Building from source
 
-## 仓库结构
+Prereqs: Rust (stable), Node 22 + pnpm, and on macOS Xcode CLT + Swift
+(for the Process Tap helper).
 
-| 路径 | 内容 |
-|---|---|
-| `aec3/` | 内化的 AEC3 引擎(独立子 workspace,含延迟魔改,见其 README) |
-| `crates/` | `echoless-cli` / `-core` / `-processors` / `-audio-io` / `-paths` |
-| `app/` | Tauri 桌面应用(React 前端 + Rust 壳) |
-| `docs/` | 架构方案、前端交接、Windows 测试指南、审计记录 |
-| `tools/macos-process-tap-poc/` | mac 系统音频采集 helper(Swift) |
+```bash
+# CLI
+cargo build --release                    # target/release/echoless
 
-分发约定:LocalVQE **native runtime 随包**,**模型走 HF 按需下载**
-(`~/Library/Application Support/Echoless` / `%LOCALAPPDATA%\Echoless`);
-NVAFX runtime 按需下载(~1 GB,不随包)。
+# macOS system-audio helper
+tools/macos-process-tap-poc/build.sh
+
+# Desktop app (dev)
+cd app && pnpm install && pnpm tauri dev
+
+# Desktop app (bundle)
+cd app && pnpm tauri build
+```
+
+`cargo test --workspace` runs the test suite; the AEC3 fork has its own
+workspace (`cd aec3 && cargo test`).
+
+## Citing
+
+If you use the LocalVQE engine in academic work, please cite LocalVQE via its
+[`CITATION.cff`](https://github.com/localai-org/LocalVQE) and the upstream
+DeepVQE paper:
+
+```bibtex
+@inproceedings{indenbom2023deepvqe,
+  title     = {DeepVQE: Real Time Deep Voice Quality Enhancement for Joint
+               Acoustic Echo Cancellation, Noise Suppression and Dereverberation},
+  author    = {Indenbom, Evgenii and Beltr{\'a}n, Nicolae-C{\u{a}}t{\u{a}}lin
+               and Chernov, Mykola and Aichner, Robert},
+  booktitle = {Interspeech}, year = {2023},
+  doi       = {10.21437/Interspeech.2023-2176}
+}
+```
+
+## Acknowledgements & licenses
+
+- **Echoless** is MIT licensed ([LICENSE](LICENSE)).
+- **AEC3** (`aec3/`) derives from the
+  [WebRTC project](https://webrtc.org)'s audio processing module —
+  BSD-3-Clause ([aec3/LICENSE](aec3/LICENSE)).
+- **LocalVQE** models and runtime are Apache-2.0, © Richard Palethorpe and
+  Claude (Anthropic). Not for emergency or safety-critical use (see the
+  [model card](https://huggingface.co/LocalAI-io/LocalVQE)).
+- **NVAFX** uses the NVIDIA Maxine Audio Effects SDK under the
+  [NVIDIA SDK License](https://developer.nvidia.com/downloads/maxine-sdk-license);
+  the redistributed runtime/model packages are for installation by Echoless
+  only. NVIDIA and Maxine are trademarks of NVIDIA Corporation.
+- Virtual audio thanks: [VB-CABLE](https://vb-audio.com/Cable/) (donationware)
+  and [BlackHole](https://github.com/ExistentialAudio/BlackHole) (GPL-3.0,
+  used as an external device, not linked).

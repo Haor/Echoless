@@ -9,9 +9,11 @@ import {
   getPlatform,
   listDevices,
   listProcessors,
+  localvqeAssets,
   nvafxDoctor,
   nvafxDownloadInstall,
   nvafxInstall,
+  onDevicesChanged,
   onRunEvent,
   onRunExit,
   onRunLog,
@@ -91,25 +93,24 @@ const REQUIRED_RUN_CONTROLS = [
 const DEVICE_SELECTION_KEY = "echoless.deviceSelection.v1";
 
 // Windows 托盘偏好(P5 契约):持久化在前端,启动/变更时推给 Rust。
+// UI 只留「关闭到托盘」一个开关(用户定案 2026-07-05:符合一般使用习惯);
+// 最小化到托盘退役,Rust 端恒收 false(旧存档里的 minimizeToTray 忽略)。
 const TRAY_PREFS_KEY = "echoless.trayPrefs.v1";
-export type TrayPrefsState = { minimizeToTray: boolean; closeToTray: boolean };
+export type TrayPrefsState = { closeToTray: boolean };
 function readTrayPrefs(): TrayPrefsState {
   try {
     const raw = localStorage.getItem(TRAY_PREFS_KEY);
     const p = raw ? JSON.parse(raw) : null;
-    return {
-      minimizeToTray: Boolean(p?.minimizeToTray),
-      closeToTray: Boolean(p?.closeToTray),
-    };
+    return { closeToTray: Boolean(p?.closeToTray) };
   } catch {
-    return { minimizeToTray: false, closeToTray: false };
+    return { closeToTray: false };
   }
 }
 
 // 设备选择值统一用 stable_id(跨重启稳定;mic/output 配置直接吃它)。
 // 选默认输出:优先虚拟声卡(VB-CABLE / BlackHole),否则系统默认。
 function pickDefaultOutput(outs: AudioDevice[]): string {
-  const virt = outs.find((d) => /cable|blackhole|vb-?audio/i.test(d.name));
+  const virt = outs.find((d) => /cable|blackhole|vb-?audio|echoless|null/i.test(d.name));
   if (virt) return virt.stable_id;
   return (
     outs.find((d) => d.is_default)?.stable_id ?? outs[0]?.stable_id ?? "default"
@@ -164,14 +165,49 @@ function pickReference(devices: DeviceList, current: string): string {
   if (referenceSelectionStillExists(devices, current)) return current;
   const sys = devices.reference_sources.find((r) => r.id === "system");
   if (sys?.available) return "system";
+  const monitor = devices.reference_sources.find(
+    (r) => r.available && r.kind === "input" && /monitor/i.test(r.label),
+  );
+  if (monitor) return monitor.selector ?? monitor.id;
   return "none";
+}
+
+function parseDevPlatform(value: string | null): Platform | null {
+  if (value === "win" || value === "windows") return "windows";
+  if (value === "mac" || value === "macos") return "macos";
+  if (value === "linux") return "linux";
+  return null;
+}
+
+function cycleDevPlatform(current: Platform | null): Platform | null {
+  if (current === null || current === "macos") return "windows";
+  if (current === "windows") return "linux";
+  return null;
+}
+
+function platformTag(platform: Platform): string {
+  if (platform === "windows") return "WIN";
+  if (platform === "linux") return "LINUX";
+  return "MAC";
+}
+
+function ioBackendLabel(platform: Platform): string {
+  if (platform === "macos") return "COREAUDIO";
+  if (platform === "linux") return "PIPEWIRE";
+  return "WASAPI";
 }
 
 const MODELS: { kind: string; label: string }[] = [
   { kind: "aec3", label: "AEC3" },
-  { kind: "localvqe", label: "LOCALVQE" },
+  { kind: "localvqe", label: "LVQE" },
   { kind: "nvidia_afx_aec", label: "NVAFX" },
 ];
+
+// LocalVQE 官方描述:v1.4 = 纯 AEC(无降噪),v1.3 = AEC + 降噪。
+// 首页 NOISE 开关在 LVQE 下的语义 = 在这两个版本间切换(文件名 "-aec-" 标记纯 AEC)。
+const LVQE_NS_ON_FILE = "localvqe-v1.3-4.8M-f32.gguf";
+const LVQE_NS_OFF_FILE = "localvqe-v1.4-aec-200K-f32.gguf";
+const lvqePureAec = (model: unknown) => String(model ?? "").includes("-aec-");
 
 function modelName(kind: string): string {
   return MODELS.find((m) => m.kind === kind)?.label ?? kind.toUpperCase();
@@ -251,7 +287,7 @@ type AppState = {
   dev: boolean;
   devRtxState: RtxState;
   devMicState: MicState;
-  devWin: boolean;
+  devPlatform: Platform | null;
   io: IoResamplingState;
   rec: boolean;
   // P8-D1:穿透中(sidecar 活着,mic 直通,AEC 保温)。UI 的「电源 OFF」= 此态。
@@ -298,7 +334,7 @@ const INITIAL_APP_STATE: AppState = {
   dev: false,
   devRtxState: "runtime_not_installed",
   devMicState: "missing",
-  devWin: false,
+  devPlatform: null,
   io: null,
   rec: false,
   bypassed: false,
@@ -377,7 +413,7 @@ function initSelection(): SelectionState {
   };
 }
 
-// 浏览器预览直达(设计稿 hash 直链的 app 版):?view=advanced&dev=1&os=win。
+// 浏览器预览直达(设计稿 hash 直链的 app 版):?view=advanced&dev=1&os=linux。
 // Tauri 里没有 query,恒回落初始值。
 function initAppState(): AppState {
   try {
@@ -394,8 +430,8 @@ function initAppState(): AppState {
     return {
       ...INITIAL_APP_STATE,
       view: views.includes(v as View) ? (v as View) : "overview",
-      dev: q.has("dev"),
-      devWin: q.get("os") === "win",
+      dev: import.meta.env.DEV && q.has("dev"),
+      devPlatform: parseDevPlatform(q.get("os")),
     };
   } catch {
     return INITIAL_APP_STATE;
@@ -432,7 +468,7 @@ function useAppController() {
     dev,
     devRtxState,
     devMicState,
-    devWin,
+    devPlatform,
     io,
     rec,
     bypassed,
@@ -451,6 +487,14 @@ function useAppController() {
   const lastLogRef = useRef<string>("");
   const powerOnRef = useRef(powerOn);
   powerOnRef.current = powerOn;
+  // 供 refreshDevices(mount 时创建的稳定回调)读到最新选择 / 触发最新 applyChange,
+  // 避免闭包里的陈旧 selection 把用户后来改过的设备写回 toml。
+  const selectionRef = useRef(selection);
+  selectionRef.current = selection;
+  const applyChangeRef = useRef(applyChange);
+  applyChangeRef.current = applyChange;
+  const doctorRef = useRef(doctor);
+  doctorRef.current = doctor;
   const pipelineRef = useRef(pipeline);
   pipelineRef.current = pipeline;
   const paramsRef = useRef(params);
@@ -513,7 +557,8 @@ function useAppController() {
     listDevices()
       .then((d) => {
         updateApp({ devices: d });
-        updateSelection((cur) => ({
+        const cur = selectionRef.current;
+        const next: SelectionState = {
           selInput: deviceSelectionStillExists(d.inputs, cur.selInput)
             ? cur.selInput
             : pickDefaultInput(d.inputs),
@@ -522,7 +567,44 @@ function useAppController() {
             : pickDefaultOutput(d.outputs),
           // 默认 reference:system 可用就用 system,否则退到 none;用户改过则保留。
           reference: pickReference(d, cur.reference),
-        }));
+        };
+        // 立即同步 ref:一次插拔常连发多个 devicechange,防止后续 refresh
+        // 用陈旧选择重复判定、重复重启。
+        selectionRef.current = next;
+        updateSelection(next);
+        // 运行中设备被拔,选择被迫回退 → 把新设备真正应用到管线(重启 run)。
+        // 只改选中值不重启的话,sidecar 仍抱着已死的输入流:波形冻结、
+        // 采样率徽标停留在旧设备,直到用户手动重选。
+        const override: Override = {};
+        if (next.selInput !== cur.selInput) override.mic = next.selInput;
+        if (next.selOutput !== cur.selOutput) override.output = next.selOutput;
+        if (next.reference !== cur.reference)
+          override.reference = next.reference;
+        if (Object.keys(override).length > 0) applyChangeRef.current(override);
+
+        // 系统音频权限是外部可变状态(用户随时可在系统设置里改;dev 下 TCC 把授权
+        // 记在 responsible process 头上,终端/Cursor 更新即被重置)——doctor 只在
+        // mount 查一次会让「授予权限」按钮在授予后仍挂着。未授予期间搭设备刷新的
+        // 车重查;已授予则零开销。
+        const perm = doctorRef.current?.system_audio_permission;
+        if (perm === "denied" || perm === "undetermined") {
+          doctorAudio()
+            .then((doc) => {
+              updateApp({ doctor: doc });
+              // 授权前创建的 Process Tap 永远输出静音(CoreAudio 不给旧 tap 补活),
+              // 而 P8 电源开关只是 bypass 不重建管线 —— 刚授予 + 正在跑 + 参考静音
+              // 就自动重启一次管线,让 tap 带着新权限重建。
+              if (
+                doc.system_audio_permission === "granted" &&
+                powerOnRef.current &&
+                selectionRef.current.reference === "system" &&
+                telRef.current.ref <= -100
+              ) {
+                applyChangeRef.current({});
+              }
+            })
+            .catch(() => {});
+        }
       })
       .catch((e) => noteError(String(e)));
   }, [noteError]);
@@ -561,8 +643,25 @@ function useAppController() {
       .then((diagDir) => updateApp({ diagDir }))
       .catch(() => {});
 
+    // 设备热插拔:三路触发 → 同一个防抖刷新。
+    //   ① 原生 CoreAudio 监听(macOS;WKWebView 不触发 devicechange)
+    //   ② webview devicechange(Windows WebView2 可靠)
+    //   ③ 窗口聚焦 + 下拉展开(兜底)
+    // 300ms 防抖合并连发——一次插拔常触发多个事件,每次刷新都 spawn 一次 CLI 枚举。
+    let devChangeTimer = 0;
+    const refreshDevicesSoon = () => {
+      window.clearTimeout(devChangeTimer);
+      devChangeTimer = window.setTimeout(refreshDevices, 300);
+    };
+    navigator.mediaDevices?.addEventListener?.(
+      "devicechange",
+      refreshDevicesSoon,
+    );
+    window.addEventListener("focus", refreshDevicesSoon);
+
     const uns: UnlistenFn[] = [];
     (async () => {
+      uns.push(await onDevicesChanged(refreshDevicesSoon));
       uns.push(
         await onRunEvent((ev) => {
           if (ev.type === "started") {
@@ -713,7 +812,15 @@ function useAppController() {
         }),
       );
     })();
-    return () => uns.forEach((u) => u());
+    return () => {
+      window.clearTimeout(devChangeTimer);
+      navigator.mediaDevices?.removeEventListener?.(
+        "devicechange",
+        refreshDevicesSoon,
+      );
+      window.removeEventListener("focus", refreshDevicesSoon);
+      uns.forEach((u) => u());
+    };
   }, [hasRunControl, noteError, refreshDevices, startDiag]);
 
   // Esc 始终有意义:在次级页按 Esc 返回 Overview。
@@ -744,7 +851,10 @@ function useAppController() {
   }, []);
 
   // 开发态快捷键:按 ~ 切换(在输入框里则正常输入,不触发)。
+  // 仅 dev 构建存在:正式包 import.meta.env.DEV=false,快捷键与 dev 模式
+  // 一并从产物里消失(?dev=1 直链在 Tauri 里本就没有 query,双保险)。
   useEffect(() => {
+    if (!import.meta.env.DEV) return;
     const onTilde = (e: KeyboardEvent) => {
       if (e.key !== "~") return;
       const el = document.activeElement;
@@ -756,15 +866,19 @@ function useAppController() {
     return () => window.removeEventListener("keydown", onTilde);
   }, []);
 
-  // 开发态下按 `(同一物理键不按 Shift)在 Windows / macOS 模拟平台间切换。
+  // 开发态下按 `(同一物理键不按 Shift)在 当前平台 / Windows / Linux 间切换。
   useEffect(() => {
+    if (!import.meta.env.DEV) return;
     const onBacktick = (e: KeyboardEvent) => {
       if (e.key !== "`") return;
       const el = document.activeElement;
       if (el && /^(INPUT|TEXTAREA)$/.test(el.tagName)) return;
       if (!dev) return;
       e.preventDefault();
-      updateApp((state) => ({ ...state, devWin: !state.devWin }));
+      updateApp((state) => ({
+        ...state,
+        devPlatform: cycleDevPlatform(state.devPlatform),
+      }));
     };
     window.addEventListener("keydown", onBacktick);
     return () => window.removeEventListener("keydown", onBacktick);
@@ -784,11 +898,18 @@ function useAppController() {
       .catch(() => {});
   }
 
-  // 用户主动请求系统音频录制权限:触发一次 Process Tap probe(macOS 弹窗),回传更新 doctor。
+  // 用户主动请求系统音频录制权限:helper 显式调 TCCAccessRequest 弹窗,回传更新 doctor。
+  // 未授予时不再自动跳设置(用户否决 2026-07-05),把 CLI 的失败原因如实显示。
   const probeSystemAudio = useCallback(() => {
     noteError(null);
     requestSystemAudio()
-      .then((doctor) => updateApp({ doctor }))
+      .then((doctor) => {
+        updateApp({ doctor });
+        if (doctor.system_audio_permission !== "granted") {
+          const detail = doctor.system_audio_permission_probe?.detail;
+          noteError(detail || "system audio permission was not granted");
+        }
+      })
       .catch((e) => noteError(String(e)));
   }, [noteError]);
 
@@ -1040,6 +1161,20 @@ function useAppController() {
     }
     applyChange({ params: np });
   }
+  // LVQE 下的 NOISE 开关 = 切模型版本(ON→v1.3 AEC+降噪,OFF→v1.4 纯 AEC)。
+  // 目标版本未下载时跳 Engine 页(那里有下载入口),不生成缺文件的配置。
+  function setLvqeNoise(on: boolean) {
+    const curOn = !lvqePureAec(paramsRef.current.model);
+    if (on === curOn) return; // 已处于目标态
+    const target = on ? LVQE_NS_ON_FILE : LVQE_NS_OFF_FILE;
+    localvqeAssets()
+      .then((a) => {
+        const found = a.models.find((m) => m.filename === target);
+        if (found) pickLocalvqeModel(found.path);
+        else gotoView("engine");
+      })
+      .catch((e) => noteError(String(e)));
+  }
   // 选 LocalVQE 模型(清单常驻):原子地切到 localvqe 引擎并设 model,避免把 model 写到当前引擎上。
   function pickLocalvqeModel(path: string) {
     const base =
@@ -1115,10 +1250,12 @@ function useAppController() {
     if (powerOnRef.current && recRef.current) startDiag();
   }, [startDiag]);
 
+  const platformView: Platform = dev && devPlatform ? devPlatform : platform;
+
   // dev 模拟 Windows 时,系统 render loopback 原生可用 → 注入一个 system 参考源,
   // 让 win 预览忠实(真实 win 上后端本就返回 system available;mac 才退 none)。
   const refSources =
-    dev && devWin
+    dev && platformView === "windows"
       ? [
           {
             id: "system",
@@ -1131,12 +1268,18 @@ function useAppController() {
           ...(devices?.reference_sources ?? []).filter((r) => r.id !== "system"),
         ]
       : devices?.reference_sources ?? [];
-  // dev win 下默认就选 system(否则沿用真实选择)。
-  const referenceView = dev && devWin ? "system" : reference;
+  // dev win 下默认就选 system;dev linux 没有 system 项,默认退到 none。
+  const referenceView =
+    dev && platformView === "windows"
+      ? "system"
+      : dev && platformView === "linux"
+        ? "none"
+        : reference;
   // reference 概念 = 系统正在播放的声音(输出内容)。只保留有意义的参考源:
   //   system(Process Tap / loopback)、none、output 设备回环、以及承载系统声的虚拟声卡输入
   //   (BlackHole / VB-CABLE)。隐藏物理麦克风等(选它们当参考无意义)。
-  const VIRTUAL_REF = /blackhole|vb-?cable|vb-?audio|cable|loopback|stereo\s*mix|soundflower/i;
+  const VIRTUAL_REF =
+    /blackhole|vb-?cable|vb-?audio|cable|loopback|stereo\s*mix|soundflower|monitor|echoless|null/i;
   // A2:排除自环 —— Echoless 自己的输出设备(及其同名输入侧,如 BlackHole 的 in 口)
   // 作参考会把处理后的输出再喂回来,形成回授;从候选里剔掉。
   const selOutDevName = devices?.outputs.find(
@@ -1176,15 +1319,15 @@ function useAppController() {
     };
   });
 
-  // dev 下可把平台模拟成 Windows(按 `),让 mac 也能预览 win 全流程(标题栏/引擎/虚拟麦)。
-  const platformView: Platform = dev && devWin ? "windows" : platform;
   const isMac = platformView === "macos";
   const refSel = dev ? referenceView : reference;
-  const ns = Boolean(params.ns);
-  // 降噪是 AEC3 管线独有(其它 backend 无 ns 参数)→ 不支持时置灰。
-  const nsSupported = Boolean(
-    processors.find((p) => p.kind === kind)?.params?.ns,
-  );
+  // NOISE 开关三种语义:aec3 = ns 参数;localvqe = 模型版本(v1.3 带降噪 / v1.4 纯 AEC);
+  // nvafx 无对应 → 置灰。
+  const isLvqe = kind === "localvqe";
+  const ns = isLvqe ? !lvqePureAec(params.model) : Boolean(params.ns);
+  const nsSupported =
+    isLvqe ||
+    Boolean(processors.find((p) => p.kind === kind)?.params?.ns);
   // 通话 app 里要选的"麦克风"名:由所选输出设备名推导(CABLE Input→CABLE Output;其余同名)。
   const outDev = devices?.outputs.find((d) => d.stable_id === selOutput);
   const cableName = outDev
@@ -1251,9 +1394,7 @@ function useAppController() {
     } catch {
       /* 持久化失败不阻塞 */
     }
-    setTrayPrefs(trayPrefs.minimizeToTray, trayPrefs.closeToTray).catch(
-      () => {},
-    );
+    setTrayPrefs(trayPrefs.closeToTray).catch(() => {});
   }, [trayPrefs]);
 
   // zmeta 版本号(tauri.conf.json 为源)。
@@ -1286,7 +1427,7 @@ function useAppController() {
         <span className="hatch" />
         {dev && (
           <span className="devtag">
-            DEV · {platformView === "windows" ? "WIN" : "MAC"}
+            DEV · {platformTag(platformView)}
           </span>
         )}
         <span className="uid">{modelName(kind)}</span>
@@ -1334,7 +1475,7 @@ function useAppController() {
             · {pipeline.sample_rate / 1000} KHZ / {pipeline.frame_ms} MS BLOCK
             · I/O{" "}
             <b>
-              <ScrambleText text={isMac ? "COREAUDIO" : "WASAPI"} />
+              <ScrambleText text={ioBackendLabel(platformView)} />
             </b>
             {appVersion ? ` · ECHOLESS V${appVersion}` : ""}
           </div>
@@ -1364,6 +1505,7 @@ function useAppController() {
             <span className="v">
               <Dropdown
                 value={selInput}
+                onOpen={refreshDevices}
                 options={(devices?.inputs ?? []).map((d) => ({
                   value: d.stable_id,
                   label: d.name,
@@ -1398,15 +1540,14 @@ function useAppController() {
                 const proc = processors.find((p) => p.kind === m.kind);
                 const supported =
                   !proc || proc.platforms.includes(platform) || dev;
-                const exp = proc?.experimental;
                 const rdy = engineReady(m.kind);
                 return (
                   <button
                     type="button"
                     key={m.kind}
                     className={`b ${kind === m.kind ? "active" : ""} ${
-                      exp ? "exp" : ""
-                    } ${supported && !rdy ? "unready" : ""}`}
+                      supported && !rdy ? "unready" : ""
+                    }`}
                     disabled={!supported}
                     onClick={() => {
                       // 未就绪(LocalVQE 无模型 / NVAFX doctor 未过):跳 Engine 配置,不生成非法配置。
@@ -1431,6 +1572,7 @@ function useAppController() {
                 align="right"
                 warn={referenceView === "none"}
                 value={referenceView}
+                onOpen={refreshDevices}
                 options={refOptions}
                 onChange={(v) => {
                   updateSelection({ reference: v });
@@ -1450,6 +1592,7 @@ function useAppController() {
             <span className="v">
               <Dropdown
                 value={selOutput}
+                onOpen={refreshDevices}
                 options={(devices?.outputs ?? []).map((d) => ({
                   value: d.stable_id,
                   label: d.name,
@@ -1485,21 +1628,29 @@ function useAppController() {
               <button
                 type="button"
                 className={`b ${ns ? "active" : ""}`}
-                onClick={() => setParam("ns", true)}
+                onClick={() =>
+                  isLvqe ? setLvqeNoise(true) : setParam("ns", true)
+                }
               >
                 ON
               </button>
               <button
                 type="button"
                 className={`b ${!ns ? "active" : ""}`}
-                onClick={() => setParam("ns", false)}
+                onClick={() =>
+                  isLvqe ? setLvqeNoise(false) : setParam("ns", false)
+                }
               >
                 OFF
               </button>
             </div>
             <span className="sp" />
             <span className="meta">
-              {nsSupported ? t("reduceNoise") : "AEC3 only"}
+              {isLvqe
+                ? t("lvqeNsHint")
+                : nsSupported
+                  ? t("reduceNoise")
+                  : "AEC3 only"}
             </span>
             <span className="ico">
               <IcoNoise />

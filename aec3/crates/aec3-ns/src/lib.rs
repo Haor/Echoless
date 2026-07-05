@@ -1,4 +1,3 @@
-
 pub mod config;
 pub(crate) mod fast_math;
 pub(crate) mod histograms;

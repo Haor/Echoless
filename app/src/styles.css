@@ -1029,6 +1029,15 @@ button.ecard:disabled {
   border-left: 1px solid var(--line-soft);
   padding-left: 22px;
 }
+/* NVAFX 不可用(mac):右列只有一行注记,随 .ewrap 垂直居中会悬在负空间正中 ——
+   拉通列高让分隔线贯穿卡片(与 LOCALVQE 卡对称),注记沉到列底,
+   与左列末行(建议后接…)同基线,读作脚注(用户定位优化 2026-07-05) */
+.ecard .ecol.nvcol.nvna {
+  align-self: stretch;
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-end;
+}
 /* v3:B5 修正 — tips 改中性色(不再琥珀) */
 .epair {
   margin-top: 11px;
@@ -1609,16 +1618,16 @@ button.ecard:disabled {
 .power.on:hover .slider {
   color: #ffa477;
 }
-/* v9:OFF 态招领 beacon —— 全页安静时每 4s 斜纹滑一拍+文字亮一下,引导开机 */
+/* v9:OFF 态招领 beacon —— 全页安静时每 3s 斜纹滑一拍+文字亮一下,引导开机 */
 .power:not(.on)::before {
-  animation: offdrift 4s linear infinite;
+  animation: offdrift 3s linear infinite;
 }
 @keyframes offdrift {
   0%, 74% { background-position: 0 0; }
   100% { background-position: 12px 0; } /* 12px=2 tile,循环无缝 */
 }
 .power:not(.on) .slider {
-  animation: offbeacon 4s ease-in-out infinite;
+  animation: offbeacon 3s ease-in-out infinite;
 }
 @keyframes offbeacon {
   0%, 72%, 100% { color: var(--t-mut); }
@@ -1957,14 +1966,16 @@ hr.hair {
 }
 /* v3.1:选中段=反白(截图诊断:整页多个橙块成胡椒面,违反唯一强调纪律。
    橙只留给「动作」(INSTALL/SET UP/REC/GET/probe 热点/选中标)与「告警热态」) */
+/* 未配置(LocalVQE 无模型 / NVAFX doctor 未过)才置灰;配置好与 aec3 同色。
+   放在 .active 之前:选中反白优先于置灰(用户定案 2026-07-05)。 */
+.segg .b.unready {
+  color: var(--t-faint);
+}
 .segg .b.active {
   background: var(--t-strong);
   color: var(--ink);
   border-color: var(--t-strong);
   font-weight: 600;
-}
-.segg .b.exp {
-  color: var(--t-faint);
 }
 .segg .b:disabled {
   cursor: default;
@@ -1977,8 +1988,11 @@ hr.hair {
   padding-right: 0;
   text-align: center;
 }
+/* 02 MODEL 三钮等宽(LOCALVQE 简写 LVQE 后可等宽);04 NOISE 双钮同宽 74px,
+   ON|OFF 接缝正对上排 AEC3|LVQE 接缝、右缘对齐 LVQE|NVAFX 接缝(用户定案 2026-07-05) */
+#models .b,
 #ns .b {
-  min-width: 48px;
+  width: 74px;
   padding-left: 0;
   padding-right: 0;
   text-align: center;
