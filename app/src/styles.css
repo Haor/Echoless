@@ -1029,6 +1029,15 @@ button.ecard:disabled {
   border-left: 1px solid var(--line-soft);
   padding-left: 22px;
 }
+/* NVAFX 不可用(mac):右列只有一行注记,随 .ewrap 垂直居中会悬在负空间正中 ——
+   拉通列高让分隔线贯穿卡片(与 LOCALVQE 卡对称),注记沉到列底,
+   与左列末行(建议后接…)同基线,读作脚注(用户定位优化 2026-07-05) */
+.ecard .ecol.nvcol.nvna {
+  align-self: stretch;
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-end;
+}
 /* v3:B5 修正 — tips 改中性色(不再琥珀) */
 .epair {
   margin-top: 11px;

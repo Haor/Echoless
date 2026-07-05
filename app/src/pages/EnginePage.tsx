@@ -199,7 +199,7 @@ function NvafxCard({
             <span className="mk">»</span> {t("engPair")}
           </div>
         </div>
-        <div className="ecol nvcol">
+        <div className={`ecol nvcol ${nvSupported ? "" : "nvna"}`}>
           {!nvSupported ? (
             <div className="cdetail na">{t("engWinOnly")}</div>
           ) : (
