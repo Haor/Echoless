@@ -58,7 +58,7 @@ export function downloadLocalvqeModel(filename: string): Promise<string> {
 }
 
 // 主动近端延迟侦测 / AEC 链路诊断。后端 shell `echoless probe-delay --json`,约 15 秒,
-// 会外放一串蜂鸣 —— 调用前必须先停掉主 run。结果字段见 docs/frontend/NEAR_DELAY_PROBE_HANDOFF.md。
+// 会外放一串蜂鸣 —— 调用前必须先停掉主 run。结果字段见 docs/frontend/archive/NEAR_DELAY_PROBE_HANDOFF.md。
 export interface NearDelayProbeResult {
   session_dir: string;
   session_retained: boolean;

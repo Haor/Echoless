@@ -4,7 +4,7 @@
 调研真理来源:`docs/architecture/` 两份方案 + `AEC/research/windows_aec_research.md`。
 
 > **2026-07-04 更新**:P3/P4/P5 的 Codex 任务规格已写成自包含文档(现状锚点已逐项核实校准),
-> 见 `docs/codex-tasks/`(README 含派发方式与合并纪律)。派发时以规格文档为准,本文件只管优先级。
+> 见 `docs/audit/archive/codex-tasks/`(已归档)(README 含派发方式与合并纪律)。派发时以规格文档为准,本文件只管优先级。
 
 ## 执行规划(worktree + 分工)
 
@@ -113,7 +113,7 @@ Tauri 2(已在用,启用 `tray-icon` feature):
 
 1. **D1 OFF = passthrough 穿透模式 ✅ 后端已合入 main、前端接线已在 ui-refactor(2026-07-05)**:
    **不搞三态,OFF 即穿透**——关了用户麦克风必须还能用,「完全停机」不作为用户级操作(退出应用=停机)。
-   后端规格已写:`docs/codex-tasks/TASK_P8_OFF_PASSTHROUGH.md`(chain 级 bypass 热命令 + keep-warm
+   后端规格已写:`docs/audit/archive/codex-tasks/TASK_P8_OFF_PASSTHROUGH.md`(chain 级 bypass 热命令 + keep-warm
    保收敛 + crossfade,不换处理器;等 P3 合入后开工)。
    **P1 联动**:电源 OFF 的 UI 语义从「整机停转」改为「AEC 旁路」——sysoff 调暗保留,
    srail 停机文案 MONITOR HELD → 直通语义(如 AEC BYPASS),前端 OFF 不再调 stop_run 而是 set_bypass。
