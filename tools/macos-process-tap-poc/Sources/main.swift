@@ -482,6 +482,19 @@ func preflightAudioCapturePermission() -> String {
     }
 }
 
+func currentExecutablePath() -> String? {
+    var size: UInt32 = 0
+    _ = _NSGetExecutablePath(nil, &size)
+    let buffer = UnsafeMutablePointer<CChar>.allocate(capacity: Int(size))
+    defer { buffer.deallocate() }
+    guard _NSGetExecutablePath(buffer, &size) == 0 else { return nil }
+    guard let resolved = realpath(buffer, nil) else {
+        return String(cString: buffer)
+    }
+    defer { free(resolved) }
+    return String(cString: resolved)
+}
+
 // TCC 责任人自立(disclaim,AudioCap 同款架构)。不做这步时,授权归属启动链
 // 上层的 responsible process —— dev 下就是终端 App(Cursor/Warp/Terminal):
 // 终端一自动更新记录即失效(面板里开关还开着但签名失配),Warp 这类缺
@@ -507,8 +520,11 @@ func selfDisclaimIfNeeded() {
     else { return }
 
     // SETEXEC:用带 disclaim 的自身镜像原地替换当前进程(pid/stdio 不变),
-    // 环境标记防循环;posix_spawn 成功即不返回,失败则以未 disclaim 状态继续。
-    let exePath = Bundle.main.executablePath ?? CommandLine.arguments[0]
+    // 环境标记防循环;posix_spawn 成功即不返回,失败会明确打到 stderr。
+    guard let exePath = currentExecutablePath() else {
+        fputs("self-disclaim: failed to resolve executable path\n", stderr)
+        return
+    }
     var argv: [UnsafeMutablePointer<CChar>?] = CommandLine.arguments.map { strdup($0) }
     argv.append(nil)
     var envs: [UnsafeMutablePointer<CChar>?] = ProcessInfo.processInfo.environment.map {
@@ -516,7 +532,18 @@ func selfDisclaimIfNeeded() {
     }
     envs.append(strdup("\(marker)=1"))
     envs.append(nil)
-    _ = posix_spawn(nil, exePath, nil, &attr, argv, envs)
+    defer {
+        for ptr in argv {
+            if let ptr { free(ptr) }
+        }
+        for ptr in envs {
+            if let ptr { free(ptr) }
+        }
+    }
+    let status = posix_spawn(nil, exePath, nil, &attr, argv, envs)
+    if status != 0 {
+        fputs("self-disclaim: posix_spawn failed: \(String(cString: strerror(status)))\n", stderr)
+    }
 }
 selfDisclaimIfNeeded()
 
