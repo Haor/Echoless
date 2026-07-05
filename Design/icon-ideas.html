@@ -298,18 +298,20 @@ const VARIANTS = [
       }
       return plate() + s + `<rect x="${cx - 24}" y="150" width="48" height="724" rx="24" fill="${ACC}"/>`;
     } },
-  { id: "F6", name: "衰减球 · 碳面", tags: ["E4 归队"], note: "上一组的 E4 翻回炭黑底:橙色第一声 + 纸灰回声在球里熄灭。如果就想要碳色版的衰减球,选这张。",
+  { id: "F6", name: "衰减球 · 碳面", tags: ["E4 归队"], note: "碳面衰减球的精修版:起振一小格 → 橙色峰值(离开圆缘,不再被切头)→ 混响长尾一路衰到右缘不断气。橙杠连同它的细芯整根点亮。",
     draw: (uid) => {
       const R = 340, pitch = 64, cx = 512, cy = 512;
+      // 半高包络:起振 → 峰(k=-3, 橙) → 指数长尾(抬高地板,纹理延续到右缘)
+      const H = [0, 40, 260, 187, 135, 97, 70, 50, 36, 26, 19];
       let s = "";
       for (let k = -5; k <= 5; k++) {
         const x = cx + k * pitch, dx = Math.abs(x - cx);
         if (dx > R - 8) continue;
         const vo = Math.sqrt(R * R - dx * dx);
-        const h = Math.min(300 * Math.pow(0.72, k + 5), vo - 6);
-        const hot = k === -4;
+        const h = Math.min(H[k + 5], vo - 8);
+        const hot = k === -3;
         s += rk(x - 8, cy - vo, 16, 2 * vo, hot ? ACC : PAPER);
-        if (h > 12) s += rk(x - 22, cy - h, 44, 2 * h, hot ? ACC : PAPER);
+        if (h > 10) s += rk(x - 22, cy - h, 44, 2 * h, hot ? ACC : PAPER);
       }
       return plate() + `<g clip-path="url(#f6${uid})">${s}</g>` +
         `<defs><clipPath id="f6${uid}"><circle cx="512" cy="512" r="${R}"/></clipPath></defs>`;
