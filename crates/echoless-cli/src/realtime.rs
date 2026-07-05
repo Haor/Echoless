@@ -1070,6 +1070,12 @@ where
     let config = choice.config();
     let channels = usize::from(config.channels);
     let stream_sample_rate = choice.stream_sample_rate();
+    let done_after_stream_frame = player_done_after_stream_frame(
+        samples.len(),
+        source_sample_rate,
+        stream_sample_rate,
+        stream_sample_rate / 10,
+    );
     let mut stream_frame = 0u64;
     device
         .build_output_stream(
@@ -1081,10 +1087,12 @@ where
                     let sample = if source_pos < samples.len() as f64 {
                         interpolated_sample(&samples, source_pos).clamp(-1.0, 1.0)
                     } else {
-                        done.store(true, Ordering::Relaxed);
                         0.0
                     };
                     stream_frame += 1;
+                    if stream_frame >= done_after_stream_frame {
+                        done.store(true, Ordering::Relaxed);
+                    }
                     let out_sample = T::from_sample(sample);
                     for out in frame {
                         *out = out_sample;
@@ -1095,6 +1103,23 @@ where
             None,
         )
         .context("构建蜂鸣输出流失败")
+}
+
+#[cfg(any(test, windows, target_os = "linux"))]
+fn player_done_after_stream_frame(
+    source_samples: usize,
+    source_sample_rate: u32,
+    stream_sample_rate: u32,
+    drain_frames: u32,
+) -> u64 {
+    if source_sample_rate == 0 || stream_sample_rate == 0 {
+        return source_samples as u64;
+    }
+    let source_samples = source_samples as u128;
+    let stream_sample_rate = stream_sample_rate as u128;
+    let source_sample_rate = source_sample_rate as u128;
+    let source_end = (source_samples * stream_sample_rate).div_ceil(source_sample_rate) as u64;
+    source_end + u64::from(drain_frames.max(1))
 }
 
 #[cfg(any(windows, target_os = "linux"))]
@@ -1339,10 +1364,29 @@ mod tests {
     }
 
     #[test]
+    fn beep_player_done_frame_includes_drain() {
+        assert_eq!(
+            player_done_after_stream_frame(48_000, 48_000, 48_000, 4_800),
+            52_800
+        );
+        assert_eq!(
+            player_done_after_stream_frame(16_000, 16_000, 48_000, 4_800),
+            52_800
+        );
+        assert_eq!(
+            player_done_after_stream_frame(16_000, 0, 48_000, 4_800),
+            16_000
+        );
+        assert_eq!(
+            player_done_after_stream_frame(16_000, 16_000, 48_000, 0),
+            48_001
+        );
+    }
+
+    #[test]
     fn bypass_selection_and_crossfade_allocate_no_heap() {
         let near = [0.1f32; 16];
         let far = [0.0f32; 16];
-        let raw = [0.2f32; 16];
         let mut processed = [0.0f32; 16];
         let mut out = [0.0f32; 16];
         let mut chain = ProcessorChain::new(48_000, 1);
