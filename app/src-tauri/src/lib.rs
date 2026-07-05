@@ -1494,13 +1494,40 @@ fn send_run_control(state: State<RunState>, line: String) -> Result<(), String> 
 
 fn write_run_control_line(state: &RunState, line: &str) -> Result<(), String> {
     let mut guard = run_state_guard(state);
-    let rc = guard.as_mut().ok_or("not running")?;
-    let stdin = rc.child.stdin.as_mut().ok_or("no stdin")?;
-    stdin
-        .write_all(line.as_bytes())
-        .map_err(|e| e.to_string())?;
-    stdin.write_all(b"\n").map_err(|e| e.to_string())?;
-    stdin.flush().map_err(|e| e.to_string())?;
+    let write_result = {
+        let rc = guard.as_mut().ok_or("not running")?;
+        let stdin = rc.child.stdin.as_mut().ok_or("no stdin")?;
+        stdin
+            .write_all(line.as_bytes())
+            .and_then(|_| stdin.write_all(b"\n"))
+            .and_then(|_| stdin.flush())
+            .map_err(|e| e.to_string())
+    };
+    if let Err(err) = write_result {
+        let status = guard
+            .as_mut()
+            .and_then(|rc| rc.child.try_wait().ok().flatten());
+        if let Some(status) = status {
+            drop(guard.take());
+            return Err(format!(
+                "run process exited before control command was applied: {status}"
+            ));
+        }
+        return Err(err);
+    }
+
+    let status = {
+        let rc = guard.as_mut().ok_or("not running")?;
+        rc.child
+            .try_wait()
+            .map_err(|e| format!("failed to check run process after control command: {e}"))?
+    };
+    if let Some(status) = status {
+        drop(guard.take());
+        return Err(format!(
+            "run process exited before control command was applied: {status}"
+        ));
+    }
     Ok(())
 }
 
@@ -1739,6 +1766,14 @@ mod tests {
         command
     }
 
+    #[cfg(unix)]
+    fn exited_child_with_open_stdin_command() -> Command {
+        let mut command = Command::new("sh");
+        command.args(["-c", "cat >/dev/null & exit 0"]);
+        command.stdin(Stdio::piped());
+        command
+    }
+
     #[test]
     fn command_timeout_kills_hung_child() {
         let mut command = slow_child_command();
@@ -1799,6 +1834,44 @@ mod tests {
 
         terminate_run(&state);
 
+        assert!(stopping.load(Ordering::SeqCst));
+        assert!(run_state_guard(&state).is_none());
+        assert!(!config_path.exists());
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_run_control_line_reaps_exited_child_after_successful_write() {
+        let dir = unique_temp_dir("echoless-run-control-exited");
+        let config_path = dir.join("run.toml");
+        std::fs::write(&config_path, "stub = true").unwrap();
+        let stopping = Arc::new(AtomicBool::new(false));
+        let child = exited_child_with_open_stdin_command().spawn().unwrap();
+        let state = RunState(Mutex::new(Some(RunChild {
+            child,
+            stopping: stopping.clone(),
+            config_path: config_path.clone(),
+        })));
+
+        for _ in 0..50 {
+            let exited = run_state_guard(&state)
+                .as_mut()
+                .and_then(|rc| rc.child.try_wait().ok().flatten())
+                .is_some();
+            if exited {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        let err = write_run_control_line(&state, &bypass_control_line(true)).unwrap_err();
+
+        assert!(
+            err.contains("exited before control command was applied"),
+            "{err}"
+        );
         assert!(stopping.load(Ordering::SeqCst));
         assert!(run_state_guard(&state).is_none());
         assert!(!config_path.exists());

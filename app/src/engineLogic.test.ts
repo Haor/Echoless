@@ -8,6 +8,9 @@ import {
   hotInitialDelayValue,
   hotLocalvqeNoiseGateValue,
   platformNearDelayDefault,
+  bypassToggleTarget,
+  settleBypassObservation,
+  clearBypassPending,
   createSerialQueue,
 } from "./engineLogic";
 
@@ -83,6 +86,35 @@ describe("isNearDelayOnlyPatch / platformNearDelayDefault", () => {
     expect(platformNearDelayDefault("macos")).toBe(25);
     expect(platformNearDelayDefault("windows")).toBe(0);
     expect(platformNearDelayDefault("linux")).toBe(0);
+  });
+});
+
+describe("bypass pending state", () => {
+  it("only allows one in-flight bypass toggle", () => {
+    expect(bypassToggleTarget({ bypassed: false, bypassPending: null })).toBe(
+      true,
+    );
+    expect(bypassToggleTarget({ bypassed: false, bypassPending: true })).toBe(
+      null,
+    );
+  });
+
+  it("settles pending only when observation reaches the target", () => {
+    expect(
+      settleBypassObservation({ bypassed: false, bypassPending: true }, false),
+    ).toEqual({ bypassed: false, bypassPending: true });
+    expect(
+      settleBypassObservation({ bypassed: false, bypassPending: true }, true),
+    ).toEqual({ bypassed: true, bypassPending: null });
+  });
+
+  it("clears pending for matching send failures only", () => {
+    expect(
+      clearBypassPending({ bypassed: false, bypassPending: true }, false),
+    ).toEqual({ bypassed: false, bypassPending: true });
+    expect(
+      clearBypassPending({ bypassed: false, bypassPending: true }, true),
+    ).toEqual({ bypassed: false, bypassPending: null });
   });
 });
 

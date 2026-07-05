@@ -80,6 +80,9 @@ import {
   hotLocalvqeNoiseGateValue,
   platformNearDelayDefault,
   createSerialQueue,
+  bypassToggleTarget,
+  settleBypassObservation,
+  clearBypassPending,
 } from "./engineLogic";
 import {
   publishRuntimeStatus,
@@ -271,6 +274,7 @@ type AppState = {
   rec: boolean;
   // P8-D1:穿透中(sidecar 活着,mic 直通,AEC 保温)。UI 的「电源 OFF」= 此态。
   bypassed: boolean;
+  bypassPending: boolean | null;
   diagSeconds: number | null;
   diagDir: string;
 };
@@ -317,6 +321,7 @@ const INITIAL_APP_STATE: AppState = {
   io: null,
   rec: false,
   bypassed: false,
+  bypassPending: null,
   diagSeconds: null,
   diagDir: "",
 };
@@ -451,6 +456,7 @@ function useAppController() {
     io,
     rec,
     bypassed,
+    bypassPending,
     diagSeconds,
     diagDir,
   } = appState;
@@ -678,6 +684,12 @@ function useAppController() {
             return; // 等 diagnostics_done 收尾
           }
           if (ev.type === "control_error") {
+            if (ev.cmd === "set_bypass") {
+              updateApp((state) => ({
+                ...state,
+                ...clearBypassPending(state),
+              }));
+            }
             noteError(`${ev.cmd}: ${ev.message}`);
             return;
           }
@@ -699,13 +711,12 @@ function useAppController() {
           if (ev.type === "localvqe_noise_gate_changed") {
             return;
           }
-          // 穿透回执:以后端为准校准(乐观更新失败时会被拉回)。
+          // 穿透回执:pending 只由后端回执/status 落定,避免写入竞态把假状态钉死。
           if (ev.type === "bypass_changed") {
-            updateApp((state) =>
-              state.bypassed === ev.bypassed
-                ? state
-                : { ...state, bypassed: ev.bypassed },
-            );
+            updateApp((state) => ({
+              ...state,
+              ...settleBypassObservation(state, ev.bypassed),
+            }));
             return;
           }
           // 诊断录制收尾:writer 已 finalize 文件。「录满 max_seconds」和
@@ -747,9 +758,10 @@ function useAppController() {
           // status 常驻 bypassed 字段:兜底同步(如回执丢失/前端重载)。
           if (typeof s.bypassed === "boolean") {
             const sb = s.bypassed;
-            updateApp((state) =>
-              state.bypassed === sb ? state : { ...state, bypassed: sb },
-            );
+            updateApp((state) => ({
+              ...state,
+              ...settleBypassObservation(state, sb),
+            }));
           }
           const tel = telRef.current;
           tel.mic = s.mic_dbfs;
@@ -766,7 +778,7 @@ function useAppController() {
         await onRunExit((ev) => {
           telRef.current.on = false;
           resetRuntimeLive(); // 清掉停机后残留的 dBFS / 延迟读数
-          updateApp({ io: null, bypassed: false });
+          updateApp({ io: null, bypassed: false, bypassPending: null });
           refSourceRef.current = null;
           cliVersionRef.current = null;
           runControlsRef.current = null;
@@ -982,7 +994,7 @@ function useAppController() {
       telRef.current.on = true;
       await startRun(toml, 80);
       // 启动即 AEC on(toml 不写 bypass,后端默认 false)。
-      updateApp({ powerOn: true, bypassed: false });
+      updateApp({ powerOn: true, bypassed: false, bypassPending: null });
     } catch (e) {
       noteError(String(e));
       telRef.current.on = false;
@@ -999,7 +1011,12 @@ function useAppController() {
       noteError(String(e));
     } finally {
       telRef.current.on = false;
-      updateApp({ powerOn: false, bypassed: false, busy: false });
+      updateApp({
+        powerOn: false,
+        bypassed: false,
+        bypassPending: null,
+        busy: false,
+      });
     }
   }
 
@@ -1023,9 +1040,16 @@ function useAppController() {
         await stop();
         return;
       }
-      const next = !bypassed;
-      updateApp({ bypassed: next }); // 乐观更新,回执/status 会再校准
-      setBypass(next).catch((e) => noteError(String(e)));
+      const next = bypassToggleTarget({ bypassed, bypassPending });
+      if (next == null) return;
+      updateApp({ bypassPending: next });
+      setBypass(next).catch((e) => {
+        updateApp((state) => ({
+          ...state,
+          ...clearBypassPending(state, next),
+        }));
+        noteError(String(e));
+      });
       return;
     }
     // 引擎未就绪(无模型 / doctor 未过)→ 先去 Engine 配置,避免启动即失败。
@@ -1066,17 +1090,20 @@ function useAppController() {
         updateApp({
           err: v.errors.map((e) => `${e.path}: ${e.message}`).join("; "),
           powerOn: false,
+          bypassed: false,
+          bypassPending: null,
         });
         telRef.current.on = false;
         return;
       }
       telRef.current.on = true;
       await startRun(toml, 80);
+      updateApp({ powerOn: true, bypassed: false, bypassPending: null });
       noteError(null);
     } catch (e) {
       noteError(String(e));
       telRef.current.on = false;
-      updateApp({ powerOn: false });
+      updateApp({ powerOn: false, bypassed: false, bypassPending: null });
     } finally {
       updateApp({ busy: false });
     }
@@ -1478,7 +1505,11 @@ function useAppController() {
 
         <section className="zone zb">
           <div className="zhead">Power</div>
-          <SlideSwitch on={uiOn} onToggle={togglePower} disabled={busy} />
+          <SlideSwitch
+            on={uiOn}
+            onToggle={togglePower}
+            disabled={busy || bypassPending != null}
+          />
           <RuntimeStatusStrip statusKind={statusKind} />
           <RuntimeSubline
             statusKind={statusKind}

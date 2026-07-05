@@ -47,6 +47,36 @@ export function platformNearDelayDefault(platform: string): number {
   return platform === "macos" ? 25 : 0;
 }
 
+export interface BypassControlSnapshot {
+  bypassed: boolean;
+  bypassPending: boolean | null;
+}
+
+export function bypassToggleTarget(
+  state: BypassControlSnapshot,
+): boolean | null {
+  return state.bypassPending == null ? !state.bypassed : null;
+}
+
+export function settleBypassObservation(
+  state: BypassControlSnapshot,
+  observed: boolean,
+): BypassControlSnapshot {
+  return {
+    bypassed: observed,
+    bypassPending: state.bypassPending === observed ? null : state.bypassPending,
+  };
+}
+
+export function clearBypassPending(
+  state: BypassControlSnapshot,
+  target?: boolean,
+): BypassControlSnapshot {
+  if (target != null && state.bypassPending !== target) return state;
+  if (state.bypassPending == null) return state;
+  return { ...state, bypassPending: null };
+}
+
 export interface SerialQueue<T> {
   /** 入队一个 delta;若已有排队项则合并,只在当前执行结束后跑一次合并结果。 */
   enqueue(delta: Partial<T>): void;
