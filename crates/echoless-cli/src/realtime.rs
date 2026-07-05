@@ -174,9 +174,9 @@ impl BypassCrossfade {
         if !self.is_active() {
             return None;
         }
-        self.position += 1;
         let alpha = (self.position as f32 / self.total_samples as f32).min(1.0);
         let sample = (self.from_bypassed, self.to_bypassed, alpha);
+        self.position += 1;
         if self.position >= self.total_samples {
             self.position = self.total_samples;
         }
@@ -1289,9 +1289,9 @@ mod tests {
         write_bypass_output(&processed, &raw, &mut out_a, true, &mut crossfade);
         write_bypass_output(&processed, &raw, &mut out_b, true, &mut crossfade);
 
-        approx_eq(out_a[0], 0.125, 0.001);
-        approx_eq(out_a[3], 0.5, 0.001);
-        approx_eq(out_b[3], 1.0, 0.001);
+        approx_eq(out_a[0], 0.0, 0.001);
+        approx_eq(out_a[3], 0.375, 0.001);
+        approx_eq(out_b[3], 0.875, 0.001);
         let mut previous = 0.0;
         for sample in out_a.into_iter().chain(out_b) {
             assert!(
