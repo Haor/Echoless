@@ -35,6 +35,25 @@ const BAND_SPLIT_RATE: usize = 16000;
 /// Maximum number of frames to buffer in render queues.
 const MAX_NUM_FRAMES_TO_BUFFER: usize = 100;
 
+fn create_multichannel_config_from_base(base: &EchoCanceller3Config) -> EchoCanceller3Config {
+    let multichannel_defaults = EchoCanceller3Config::create_default_multichannel_config();
+    let mut config = base.clone();
+    config.filter.coarse.length_blocks = multichannel_defaults.filter.coarse.length_blocks;
+    config.filter.coarse.rate = multichannel_defaults.filter.coarse.rate;
+    config.filter.coarse_initial.length_blocks =
+        multichannel_defaults.filter.coarse_initial.length_blocks;
+    config.filter.coarse_initial.rate = multichannel_defaults.filter.coarse_initial.rate;
+    config.suppressor.normal_tuning.max_dec_factor_lf = multichannel_defaults
+        .suppressor
+        .normal_tuning
+        .max_dec_factor_lf;
+    config.suppressor.normal_tuning.max_inc_factor = multichannel_defaults
+        .suppressor
+        .normal_tuning
+        .max_inc_factor;
+    config
+}
+
 /// Describes the four audio streams handled by the processing pipeline.
 #[derive(Debug, Clone)]
 pub(crate) struct ProcessingConfig {
@@ -1292,7 +1311,7 @@ impl AudioProcessingImpl {
             Some(cfg) => {
                 let mut c = cfg.clone();
                 c.echo_removal_control.transparent_mode = ec.transparent_mode;
-                (c.clone(), Some(c))
+                (c.clone(), Some(create_multichannel_config_from_base(&c)))
             }
             None => {
                 let mut c = EchoCanceller3Config::default();
@@ -1501,6 +1520,8 @@ fn sample_rate_supports_multi_band(sample_rate_hz: u32) -> bool {
 mod tests {
     use super::*;
     use crate::config::{CaptureLevelAdjustment, EchoCanceller, GainController2, NoiseSuppression};
+    use crate::config_selector::ConfigSelector;
+    use aec3_core::multi_channel_content_detector::MultiChannelContentDetector;
 
     #[test]
     fn suitable_process_rate_basic() {
@@ -1540,6 +1561,87 @@ mod tests {
         };
         let apm = AudioProcessingImpl::with_config(config);
         assert!(apm.submodules.echo_controller.is_some());
+    }
+
+    #[test]
+    fn multichannel_config_derives_from_custom_base() {
+        let mut base = EchoCanceller3Config::default();
+        base.delay.fixed_capture_delay_samples = 96;
+        base.delay.default_delay = 7;
+        base.filter.coarse.length_blocks = 31;
+        base.filter.coarse.rate = 0.13;
+        base.filter.coarse_initial.length_blocks = 29;
+        base.filter.coarse_initial.rate = 0.17;
+        base.suppressor.normal_tuning.max_dec_factor_lf = 0.89;
+        base.suppressor.normal_tuning.max_inc_factor = 2.7;
+
+        let multichannel = create_multichannel_config_from_base(&base);
+        let defaults = EchoCanceller3Config::create_default_multichannel_config();
+
+        assert_eq!(
+            multichannel.delay.fixed_capture_delay_samples,
+            base.delay.fixed_capture_delay_samples
+        );
+        assert_eq!(multichannel.delay.default_delay, base.delay.default_delay);
+        assert_eq!(
+            multichannel.filter.coarse.length_blocks,
+            defaults.filter.coarse.length_blocks
+        );
+        assert_eq!(multichannel.filter.coarse.rate, defaults.filter.coarse.rate);
+        assert_eq!(
+            multichannel.filter.coarse_initial.length_blocks,
+            defaults.filter.coarse_initial.length_blocks
+        );
+        assert_eq!(
+            multichannel.filter.coarse_initial.rate,
+            defaults.filter.coarse_initial.rate
+        );
+        assert_eq!(
+            multichannel.suppressor.normal_tuning.max_dec_factor_lf,
+            defaults.suppressor.normal_tuning.max_dec_factor_lf
+        );
+        assert_eq!(
+            multichannel.suppressor.normal_tuning.max_inc_factor,
+            defaults.suppressor.normal_tuning.max_inc_factor
+        );
+    }
+
+    #[test]
+    fn decorrelated_stereo_render_selects_derived_multichannel_config() {
+        let mut base = EchoCanceller3Config::default();
+        base.multi_channel.detect_stereo_content = true;
+        base.multi_channel.stereo_detection_hysteresis_seconds = 0.0;
+        base.delay.default_delay = 7;
+        base.filter.coarse.length_blocks = 31;
+        base.filter.coarse.rate = 0.13;
+
+        let multichannel = create_multichannel_config_from_base(&base);
+        let defaults = EchoCanceller3Config::create_default_multichannel_config();
+        let mut selector = ConfigSelector::new(base.clone(), Some(multichannel), 2);
+
+        assert_eq!(
+            selector.active_config().filter.coarse.length_blocks,
+            base.filter.coarse.length_blocks
+        );
+
+        let render_frame = vec![vec![vec![0.75_f32; 64], vec![-0.25_f32; 64]]];
+        let mut detector = MultiChannelContentDetector::new(
+            base.multi_channel.detect_stereo_content,
+            2,
+            base.multi_channel.stereo_detection_threshold,
+            base.multi_channel
+                .stereo_detection_timeout_threshold_seconds,
+            base.multi_channel.stereo_detection_hysteresis_seconds,
+        );
+
+        assert!(detector.update_detection(&render_frame));
+        selector.update(detector.is_proper_multi_channel_content_detected());
+
+        assert_eq!(
+            selector.active_config().filter.coarse.length_blocks,
+            defaults.filter.coarse.length_blocks
+        );
+        assert_eq!(selector.active_config().delay.default_delay, 7);
     }
 
     #[test]
