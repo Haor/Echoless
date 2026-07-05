@@ -451,6 +451,12 @@ function useAppController() {
   const lastLogRef = useRef<string>("");
   const powerOnRef = useRef(powerOn);
   powerOnRef.current = powerOn;
+  // 供 refreshDevices(mount 时创建的稳定回调)读到最新选择 / 触发最新 applyChange,
+  // 避免闭包里的陈旧 selection 把用户后来改过的设备写回 toml。
+  const selectionRef = useRef(selection);
+  selectionRef.current = selection;
+  const applyChangeRef = useRef(applyChange);
+  applyChangeRef.current = applyChange;
   const pipelineRef = useRef(pipeline);
   pipelineRef.current = pipeline;
   const paramsRef = useRef(params);
@@ -513,7 +519,8 @@ function useAppController() {
     listDevices()
       .then((d) => {
         updateApp({ devices: d });
-        updateSelection((cur) => ({
+        const cur = selectionRef.current;
+        const next: SelectionState = {
           selInput: deviceSelectionStillExists(d.inputs, cur.selInput)
             ? cur.selInput
             : pickDefaultInput(d.inputs),
@@ -522,7 +529,20 @@ function useAppController() {
             : pickDefaultOutput(d.outputs),
           // 默认 reference:system 可用就用 system,否则退到 none;用户改过则保留。
           reference: pickReference(d, cur.reference),
-        }));
+        };
+        // 立即同步 ref:一次插拔常连发多个 devicechange,防止后续 refresh
+        // 用陈旧选择重复判定、重复重启。
+        selectionRef.current = next;
+        updateSelection(next);
+        // 运行中设备被拔,选择被迫回退 → 把新设备真正应用到管线(重启 run)。
+        // 只改选中值不重启的话,sidecar 仍抱着已死的输入流:波形冻结、
+        // 采样率徽标停留在旧设备,直到用户手动重选。
+        const override: Override = {};
+        if (next.selInput !== cur.selInput) override.mic = next.selInput;
+        if (next.selOutput !== cur.selOutput) override.output = next.selOutput;
+        if (next.reference !== cur.reference)
+          override.reference = next.reference;
+        if (Object.keys(override).length > 0) applyChangeRef.current(override);
       })
       .catch((e) => noteError(String(e)));
   }, [noteError]);
