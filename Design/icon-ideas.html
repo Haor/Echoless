@@ -68,7 +68,7 @@
 <body data-dock="dark">
 <header>
   <h1>ECHOLESS <span class="no">/</span> ICON PROPOSALS</h1>
-  <p class="sub">24 个方向 · 同一主题语汇(炭黑 #1d1d1b · 纸灰 #d6d5cd · 橙 #ff7235)· 每卡含 128 / 64 / 32 / 16 px。选中报编号即可。</p>
+  <p class="sub">30 个方向 · 同一主题语汇(炭黑 #1d1d1b · 纸灰 #d6d5cd · 橙 #ff7235)· 每卡含 128 / 64 / 32 / 16 px。选中报编号即可。</p>
 </header>
 <div class="controls">
   dock 背景
@@ -207,6 +207,113 @@ const VARIANTS = [
     } },
   { id: "E7", name: "暗面栅格", tags: ["杂交", "接现有主题"], note: "E1 翻回炭黑底:纸灰杠 + 正中一根橙杠,和 App 界面同一张脸。op-art 结构留下,配色归队。",
     draw: (uid) => plate() + knurl(uid, PAPER, 5) },
+]},
+{ group: "F · 碳面 × AEC 原理 — 把算法画进条纹球", items: [
+  { id: "F1", name: "相消缝", tags: ["双端相消", "对称构图"], note: "远端参考和近端回声从两侧涌来,右半球条纹刻意错开半拍(反相)。两个声场相遇的正中间:一道干净的静默缝 —— 相消发生的地方什么都不剩。",
+    draw: (uid) => {
+      const R = 340, pitch = 72, t = 34, cx = 512, cy = 512, v = 36;
+      let s = "";
+      for (let k = -4; k <= 4; k++) {
+        const yl = cy + k * pitch, dyl = Math.abs(yl - cy);
+        if (dyl < R - 12) {
+          const wo = Math.sqrt(R * R - dyl * dyl);
+          if (wo > v + 20) s += rk(cx - wo, yl - t / 2, wo - v, t, PAPER);
+        }
+        const yr = cy + k * pitch + pitch / 2, dyr = Math.abs(yr - cy);
+        if (dyr < R - 12) {
+          const wo = Math.sqrt(R * R - dyr * dyr);
+          if (wo > v + 20) s += rk(cx + v, yr - t / 2, wo - v, t, PAPER);
+        }
+      }
+      return plate() + `<g clip-path="url(#f1${uid})">${s}</g>` +
+        `<defs><clipPath id="f1${uid}"><circle cx="512" cy="512" r="${R}"/></clipPath></defs>`;
+    } },
+  { id: "F2", name: "减去残影", tags: ["e = d − ŷ", "最像论文"], note: "AEC 的核心公式画成图:条纹球是麦克风收到的一切,橙圈是滤波器估计出的回声 ŷ —— 圈到之处条纹被整块减掉,剩下的月牙就是干净人声 e。",
+    draw: (uid) => {
+      const R = 290, Rg = 268, gx = 672, pitch = 62, t = 30, cx = 432, cy = 512;
+      let s = "";
+      for (let k = -4; k <= 4; k++) {
+        const y = cy + k * pitch, dy = Math.abs(y - cy);
+        if (dy > R - 10) continue;
+        const w = Math.sqrt(R * R - dy * dy);
+        s += rk(cx - w, y - t / 2, 2 * w, t, PAPER);
+      }
+      return plate() +
+        `<defs><mask id="f2${uid}"><rect width="1024" height="1024" fill="black"/>` +
+        `<circle cx="${cx}" cy="${cy}" r="${R}" fill="white"/><circle cx="${gx}" cy="512" r="${Rg}" fill="black"/></mask>` +
+        `<clipPath id="f2p${uid}"><rect x="100" y="100" width="824" height="824" rx="224"/></clipPath></defs>` +
+        `<g mask="url(#f2${uid})">${s}</g>` +
+        `<g clip-path="url(#f2p${uid})"><circle cx="${gx}" cy="512" r="${Rg}" fill="none" stroke="${ACC}" stroke-width="13"/></g>`;
+    } },
+  { id: "F3", name: "冲激响应球", tags: ["echo path", "给懂行的"], note: "球里锁的不是随便的衰减,是一条房间冲激响应:橙色直达声最高,后面两个凸起是墙面早期反射,再往后是混响长尾 —— AEC 要辨认的正是这条 h(t)。",
+    draw: (uid) => {
+      const R = 340, pitch = 64, cx = 512, cy = 512;
+      const H = [40, 300, 150, 205, 115, 142, 76, 48, 30, 18, 10];
+      let s = "";
+      for (let k = -5; k <= 5; k++) {
+        const x = cx + k * pitch, dx = Math.abs(x - cx);
+        if (dx > R - 8) continue;
+        const vo = Math.sqrt(R * R - dx * dx);
+        const hot = k === -4;
+        s += rk(x - 8, cy - vo, 16, 2 * vo, hot ? ACC : PAPER);
+        const h = Math.min(H[k + 5], vo - 6);
+        if (h > 12 && k > -5) s += rk(x - 22, cy - h, 44, 2 * h, hot ? ACC : PAPER);
+      }
+      return plate() + `<g clip-path="url(#f3${uid})">${s}</g>` +
+        `<defs><clipPath id="f3${uid}"><circle cx="512" cy="512" r="${R}"/></clipPath></defs>`;
+    } },
+  { id: "F4", name: "自适应收敛", tags: ["NLMS 之魂"], note: "橙 = 滤波器估计,灰 = 真实回声。左边刚起步:两根杠明显没对上;越往右估计越贴住真相,贴住的瞬间输出归零 —— 杠也就消失了。整颗球是一次收敛过程。",
+    draw: (uid) => {
+      const R = 330, pitch = 62, cx = 512, cy = 512;
+      let s = "";
+      for (let k = -5; k <= 5; k++) {
+        const i = k + 5, x = cx + k * pitch, dx = Math.abs(x - cx);
+        if (dx > R - 8) continue;
+        const vo = Math.sqrt(R * R - dx * dx);
+        const d = 34 * Math.pow(0.62, i);
+        const h = Math.min(270 * Math.pow(0.76, i), vo - 8);
+        if (h < 8) continue;
+        s += rk(x - d - 13, cy - h, 26, 2 * h, PAPER);
+        s += rk(x + d - 13, cy - h, 26, 2 * h, ACC);
+      }
+      return plate() + `<g clip-path="url(#f4${uid})">${s}</g>` +
+        `<defs><clipPath id="f4${uid}"><circle cx="512" cy="512" r="${R}"/></clipPath></defs>`;
+    } },
+  { id: "F5", name: "滤波闸门", tags: ["前 / 后对照"], note: "橙闸就是滤波器。左半球:人声条纹之间夹满暗色回声条;穿过闸门之后,夹层被扣下,只有人声条纹走了出去。",
+    draw: () => {
+      const R = 330, pitch = 76, t = 32, cx = 512, cy = 512, g = 54;
+      let s = "";
+      for (let k = -4; k <= 4; k++) {
+        const y = cy + k * pitch, dy = Math.abs(y - cy);
+        if (dy < R - 12) {
+          const w = Math.sqrt(R * R - dy * dy);
+          s += rk(cx - w, y - t / 2, w - g, t, PAPER);
+          s += rk(cx + g, y - t / 2, w - g, t, PAPER);
+        }
+        const ye = y + pitch / 2, dye = Math.abs(ye - cy);
+        if (dye < R - 12) {
+          const we = Math.sqrt(R * R - dye * dye);
+          s += rk(cx - we, ye - 11, we - g, 22, PAPER, 0.38);
+        }
+      }
+      return plate() + s + `<rect x="${cx - 24}" y="150" width="48" height="724" rx="24" fill="${ACC}"/>`;
+    } },
+  { id: "F6", name: "衰减球 · 碳面", tags: ["E4 归队"], note: "上一组的 E4 翻回炭黑底:橙色第一声 + 纸灰回声在球里熄灭。如果就想要碳色版的衰减球,选这张。",
+    draw: (uid) => {
+      const R = 340, pitch = 64, cx = 512, cy = 512;
+      let s = "";
+      for (let k = -5; k <= 5; k++) {
+        const x = cx + k * pitch, dx = Math.abs(x - cx);
+        if (dx > R - 8) continue;
+        const vo = Math.sqrt(R * R - dx * dx);
+        const h = Math.min(300 * Math.pow(0.72, k + 5), vo - 6);
+        const hot = k === -4;
+        s += rk(x - 8, cy - vo, 16, 2 * vo, hot ? ACC : PAPER);
+        if (h > 12) s += rk(x - 22, cy - h, 44, 2 * h, hot ? ACC : PAPER);
+      }
+      return plate() + `<g clip-path="url(#f6${uid})">${s}</g>` +
+        `<defs><clipPath id="f6${uid}"><circle cx="512" cy="512" r="${R}"/></clipPath></defs>`;
+    } },
 ]},
 { group: "A · 衰减 — 回声正在死去", items: [
   { id: "A1", name: "衰减杠(现行)", tags: ["线上", "32px 稳"], note: "首杠橙 = 活人声,四道纸灰回声逐级熄灭。已上线的基准方案。",
