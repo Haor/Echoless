@@ -68,7 +68,7 @@
 <body data-dock="dark">
 <header>
   <h1>ECHOLESS <span class="no">/</span> ICON PROPOSALS</h1>
-  <p class="sub">42 个方向 · 同一主题语汇(炭黑 #1d1d1b · 纸灰 #d6d5cd · 橙 #ff7235)· 每卡含 128 / 64 / 32 / 16 px。选中报编号即可。</p>
+  <p class="sub">43 个方向 · 同一主题语汇(炭黑 #1d1d1b · 纸灰 #d6d5cd · 橙 #ff7235)· 每卡含 128 / 64 / 32 / 16 px。选中报编号即可。</p>
 </header>
 <div class="controls">
   dock 背景
@@ -454,6 +454,29 @@ const VARIANTS = [
       draw: () => plate() + waveTail(PAPER, ACC) },
     { id: "I3", name: "纸面纹身版", tags: ["最接近参考"], note: "同一几何落回纹身的原生语境:米白纸面 + 墨色条纹,橙线贯穿。像一枚印在纸上的声音戳记。",
       draw: () => plate(OFFW, OFFL) + waveTail(INKD, ACC) },
+    { id: "I4", name: "STAR-1 翻转 · 波形星", tags: ["翻转参考直系", "橙中线"], note: "严格照翻转后的 Star-1 语法:团块实心(条纹在包络内连续填充,轮廓即波形),每行向右伸出变细的错落拖尾 —— 越靠中线拖得越远;橙色中线带左尖头,贯穿全图最远。星星换成了声音。",
+      draw: () => {
+        const pitch = 44, t = 26, t2 = 12, cy = 512, x0 = 176, x1 = 648, tailMax = 884;
+        let s = "";
+        for (let k = -7; k <= 7; k++) {
+          const dy = Math.abs(k) * pitch;
+          let xL = null, xR = null;
+          for (let x = x0; x <= x1; x += 2) {
+            if (envAt(x) >= dy) { if (xL === null) xL = x; xR = x; }
+          }
+          if (k === 0) {
+            s += rk(140, cy - t2 / 2, x0 - 140, t2, ACC);              // 左尖头引线
+            s += rk(x0, cy - t / 2, x1 - x0, t, ACC);                  // 团块内厚线
+            s += rk(x1, cy - t2 / 2, tailMax - x1, t2, ACC);           // 最长拖尾
+            continue;
+          }
+          if (xL === null) continue;
+          s += rk(xL, cy + k * pitch - t / 2, Math.max(xR - xL, 10), t, PAPER);
+          const len = 250 * Math.pow(Math.max(1 - Math.abs(k) / 7.5, 0), 1.8) * (k % 2 ? 1.14 : 0.86);
+          if (len > 14) s += rk(xR, cy + k * pitch - t2 / 2, Math.min(len, tailMax - 40 - xR), t2, PAPER);
+        }
+        return plate() + s;
+      } },
   ];
 })() },
 { group: "A · 衰减 — 回声正在死去", items: [
