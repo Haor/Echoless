@@ -102,6 +102,11 @@ echoless offline --mic mic.wav --reference ref.wav --out clean.wav --chain aec3
 echoless offline --mic mic.wav --reference ref.wav --out clean.wav --config my.toml
 ```
 
+`offline` validates processor topology and WAV-in/WAV-out behavior. It does not
+simulate the realtime device boundary, `near_delay_ms`, bypass crossfade, queue
+backpressure, or device sample-rate conversion path, so it should not be used as
+an exact live-latency or live-routing benchmark.
+
 ## doctor / processors / config
 
 ```bash
