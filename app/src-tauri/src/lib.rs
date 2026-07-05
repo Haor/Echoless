@@ -3,7 +3,7 @@
 //   - 把 `echoless` CLI 作为 sidecar 调用,只消费 JSON / JSONL 契约
 //   - run 的 --status-json 以 JSONL 流式解析,经事件推给前端
 //
-// 契约真理源:echoless/docs/frontend/*.md + CLI 实测。
+// 契约真理源:docs/CLI.md + CLI `--json` 实测。
 use std::fs::OpenOptions;
 use std::io::ErrorKind;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -1580,8 +1580,8 @@ pub fn run() {
             let _ = &window;
             Ok(())
         })
-        .on_window_event(|window, event| match event {
-            WindowEvent::CloseRequested { api, .. } => {
+        .on_window_event(|window, event| {
+            if let WindowEvent::CloseRequested { api, .. } = event {
                 let prefs = window.state::<TrayPrefs>();
                 if close_to_tray_enabled(&prefs) {
                     api.prevent_close();
@@ -1591,7 +1591,6 @@ pub fn run() {
                     terminate_run(&state);
                 }
             }
-            _ => {}
         })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

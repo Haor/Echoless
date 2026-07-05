@@ -58,7 +58,7 @@ export function downloadLocalvqeModel(filename: string): Promise<string> {
 }
 
 // 主动近端延迟侦测 / AEC 链路诊断。后端 shell `echoless probe-delay --json`,约 15 秒,
-// 会外放一串蜂鸣 —— 调用前必须先停掉主 run。结果字段见 docs/frontend/archive/NEAR_DELAY_PROBE_HANDOFF.md。
+// 会外放一串蜂鸣 —— 调用前必须先停掉主 run。字段以 CLI `probe-delay --json` 实测为准(docs/CLI.md)。
 export interface NearDelayProbeResult {
   session_dir: string;
   session_retained: boolean;
@@ -187,7 +187,7 @@ export function setAec3Agc(agc: boolean): Promise<void> {
 export function setBypass(enabled: boolean): Promise<void> {
   return sendRunControl(JSON.stringify({ cmd: "set_bypass", enabled }));
 }
-// Windows 托盘偏好(P5 契约,docs/frontend/FRONTEND_STATE_HANDOFF.md §9):
+// Windows 托盘偏好(P5 契约):
 // 启动时与每次变更时同步到 Rust;非 Windows 平台后端忽略。
 export function setTrayPrefs(closeToTray: boolean): Promise<void> {
   return invoke("set_tray_prefs", { closeToTray });

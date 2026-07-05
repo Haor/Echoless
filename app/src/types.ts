@@ -1,5 +1,5 @@
 // Echoless 后端 JSON 契约的 TS 镜像。
-// 形状以 `echoless <cmd> --json` 实测为准(见 docs/frontend/*.md)。
+// 形状以 `echoless <cmd> --json` 实测为准(见 docs/CLI.md)。
 
 export type Platform = "windows" | "macos" | "linux";
 
