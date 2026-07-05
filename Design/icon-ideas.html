@@ -68,7 +68,7 @@
 <body data-dock="dark">
 <header>
   <h1>ECHOLESS <span class="no">/</span> ICON PROPOSALS</h1>
-  <p class="sub">30 个方向 · 同一主题语汇(炭黑 #1d1d1b · 纸灰 #d6d5cd · 橙 #ff7235)· 每卡含 128 / 64 / 32 / 16 px。选中报编号即可。</p>
+  <p class="sub">36 个方向 · 同一主题语汇(炭黑 #1d1d1b · 纸灰 #d6d5cd · 橙 #ff7235)· 每卡含 128 / 64 / 32 / 16 px。选中报编号即可。</p>
 </header>
 <div class="controls">
   dock 背景
@@ -313,6 +313,84 @@ const VARIANTS = [
       }
       return plate() + `<g clip-path="url(#f6${uid})">${s}</g>` +
         `<defs><clipPath id="f6${uid}"><circle cx="512" cy="512" r="${R}"/></clipPath></defs>`;
+    } },
+]},
+{ group: "G · 字母 E — 刚好三个横", items: [
+  { id: "G1", name: "条纹 E", tags: ["IBM 同宗", "字标"], note: "E 本来就是条纹字母:三条长横(臂)夹四条短横(脊),整个字母用横条纹拼出来 —— 和 IBM 八条纹标同一个祖宗。纯字标,最耐用。",
+    draw: () => {
+      const widths = [420, 130, 130, 372, 130, 130, 420];
+      const bh = 58, gap = 34, x0 = 302;
+      const y0 = (1024 - (7 * bh + 6 * gap)) / 2;
+      return plate() + widths.map((w, i) => rk(x0, y0 + i * (bh + gap), w, bh, PAPER)).join("");
+    } },
+  { id: "G2", name: "球内浮现 E", tags: ["op-art 直系", "中横橙"], note: "参考稿配方 + 字母:横纹球体,E 从条纹的增厚处浮现,中横给橙。远看是球,近看是 E,再近看全是条纹。",
+    draw: () => {
+      const R = 350, pitch = 78, t = 26, T = 62, cx = 512, cy = 512, xL = cx - 190;
+      let s = "";
+      for (let k = -4; k <= 4; k++) {
+        const y = cy + k * pitch, dy = Math.abs(y - cy);
+        if (dy > R - 10) continue;
+        const wo = Math.sqrt(R * R - dy * dy);
+        s += rk(cx - wo, y - t / 2, 2 * wo, t, PAPER);
+        if (Math.abs(k) === 3) s += rk(xL, y - T / 2, 380, T, PAPER);
+        else if (k === 0) s += rk(xL, y - T / 2, 380, T, ACC);
+        else if (Math.abs(k) <= 2) s += rk(xL, y - T / 2, 120, T, PAPER);
+      }
+      return plate() + s;
+    } },
+  { id: "G3", name: "衰减 E", tags: ["三横 = 原声+回声", "语义最巧"], note: "把三条横读成时间轴:第一横是橙色原声,下面两横是它的回声 —— 一次比一次短、一次比一次淡。字母 E 本身就是一次衰减。",
+    draw: () => {
+      const bh = 58, gap = 34, x0 = 302;
+      const y0 = (1024 - (7 * bh + 6 * gap)) / 2;
+      const rows = [
+        { w: 420, f: ACC, op: null },
+        { w: 130, f: PAPER, op: null }, { w: 130, f: PAPER, op: null },
+        { w: 330, f: PAPER, op: 0.62 },
+        { w: 130, f: PAPER, op: null }, { w: 130, f: PAPER, op: null },
+        { w: 252, f: PAPER, op: 0.32 },
+      ];
+      return plate() + rows.map((r, i) => rk(x0, y0 + i * (bh + gap), r.w, bh, r.f, r.op)).join("");
+    } },
+  { id: "G4", name: "小写 e 条纹球", tags: ["球即字母", "本命提名"], note: "条纹球本身就是一个小写 e:中横加粗给橙(横杠),下半球右侧逐行收短(开口)。echoless 的 e、条纹球、参考风格,三合一。",
+    draw: (uid) => {
+      const R = 330, pitch = 64, t = 30, cx = 512, cy = 512;
+      let s = "";
+      const openFrac = { 1: 0.06, 2: 0.42, 3: 0.68, 4: 0.9 };
+      for (let k = -4; k <= 4; k++) {
+        const y = cy + k * pitch - 16, dy = Math.abs(y - cy);
+        if (dy > R - 12) continue;
+        const w = Math.sqrt(R * R - dy * dy);
+        if (k === 0) { s += rk(cx - w, y - 26, 2 * w, 52, ACC); continue; }
+        const f = k > 0 ? (openFrac[k] ?? 1) : 1;
+        s += rk(cx - w, y - t / 2, w + w * f, t, PAPER);
+      }
+      return plate() + `<g clip-path="url(#g4${uid})">${s}</g>` +
+        `<defs><clipPath id="g4${uid}"><circle cx="512" cy="512" r="${R}"/></clipPath></defs>`;
+    } },
+  { id: "G5", name: "溶解 E", tags: ["回声尾"], note: "E 的脊柱结实,三条横臂却向右溶解成一串渐小渐淡的碎段 —— 每条臂都拖着自己的回声尾,字母正在被房间「回」掉。",
+    draw: () => {
+      const ys = [272, 467, 662], ah = 90;
+      let s = `<rect x="330" y="272" width="90" height="480" rx="40" fill="${PAPER}"/>`;
+      for (const y of ys) {
+        s += `<rect x="330" y="${y}" width="230" height="${ah}" rx="40" fill="${PAPER}"/>`;
+        s += `<rect x="592" y="${y + 12}" width="72" height="66" rx="33" fill="${PAPER}" fill-opacity="0.55"/>`;
+        s += `<rect x="694" y="${y + 22}" width="46" height="46" rx="23" fill="${PAPER}" fill-opacity="0.3"/>`;
+        s += `<rect x="768" y="${y + 31}" width="28" height="28" rx="14" fill="${PAPER}" fill-opacity="0.15"/>`;
+      }
+      return plate() + s;
+    } },
+  { id: "G6", name: "镜面 E | Ǝ", tags: ["回声 = 镜像"], note: "回声就是声音在墙上的镜像:实心 E 撞上橙色的墙,弹回一个反写的暗淡 Ǝ。物理正确,构图对称。",
+    draw: () => {
+      const E = (mir, f, op) => {
+        const g = mir ? `<g transform="translate(1024 0) scale(-1 1)">` : "<g>";
+        return g +
+          `<rect x="252" y="282" width="82" height="460" rx="34" fill="${f}"${op ? ` fill-opacity="${op}"` : ""}/>` +
+          [282, 470, 658].map(y =>
+            `<rect x="252" y="${y}" width="216" height="84" rx="34" fill="${f}"${op ? ` fill-opacity="${op}"` : ""}/>`).join("") +
+          `</g>`;
+      };
+      return plate() + E(false, PAPER) + E(true, PAPER, 0.3) +
+        `<rect x="496" y="252" width="32" height="520" rx="16" fill="${ACC}"/>`;
     } },
 ]},
 { group: "A · 衰减 — 回声正在死去", items: [
