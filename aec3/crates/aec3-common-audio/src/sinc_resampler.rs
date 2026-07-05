@@ -14,8 +14,8 @@
 
 use std::f64::consts::PI;
 
-use derive_more::Debug;
 use aec3_simd::SimdBackend;
+use derive_more::Debug;
 
 /// Callback for providing input data to the resampler.
 pub trait SincResamplerCallback {

@@ -1297,7 +1297,10 @@ impl AudioProcessingImpl {
             None => {
                 let mut c = EchoCanceller3Config::default();
                 c.echo_removal_control.transparent_mode = ec.transparent_mode;
-                (c, Some(EchoCanceller3Config::create_default_multichannel_config()))
+                (
+                    c,
+                    Some(EchoCanceller3Config::create_default_multichannel_config()),
+                )
             }
         };
 

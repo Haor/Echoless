@@ -361,9 +361,9 @@ fn play_probe_beep(a: &ProbeDelayArgs, beep_path: &Path) -> Result<()> {
             samples.clone(),
         ) {
             Ok(()) => return Ok(()),
-            Err(err) => eprintln!(
-                "probe-delay: monitor→sink 映射播放失败({stem}): {err};回退默认输出"
-            ),
+            Err(err) => {
+                eprintln!("probe-delay: monitor→sink 映射播放失败({stem}): {err};回退默认输出")
+            }
         }
     }
     crate::realtime::play_mono_samples_to_output(None, PROBE_SAMPLE_RATE, samples)
@@ -378,10 +378,7 @@ fn monitor_reference_output_stem(reference: &str) -> Result<Option<String>> {
         "" | "default" | "system" => Ok(None),
         "none" => bail!("probe-delay 需要可播放的 reference;当前 reference=none"),
         value => {
-            let name = value
-                .strip_prefix("input:")
-                .unwrap_or(value)
-                .trim();
+            let name = value.strip_prefix("input:").unwrap_or(value).trim();
             let stem = name
                 .strip_prefix("Monitor of ")
                 .unwrap_or(name)
@@ -392,7 +389,10 @@ fn monitor_reference_output_stem(reference: &str) -> Result<Option<String>> {
     }
 }
 
-#[cfg(all(feature = "realtime", not(any(target_os = "macos", windows, target_os = "linux"))))]
+#[cfg(all(
+    feature = "realtime",
+    not(any(target_os = "macos", windows, target_os = "linux"))
+))]
 fn play_probe_beep(_a: &ProbeDelayArgs, _beep_path: &Path) -> Result<()> {
     bail!("当前平台没有 probe-delay 蜂鸣播放实现");
 }
@@ -945,7 +945,9 @@ mod tests {
         );
         // 无前后缀的普通名字原样透传;default/system/空串 → 默认输出。
         assert_eq!(
-            monitor_reference_output_stem("some-sink").unwrap().as_deref(),
+            monitor_reference_output_stem("some-sink")
+                .unwrap()
+                .as_deref(),
             Some("some-sink")
         );
         assert_eq!(monitor_reference_output_stem("default").unwrap(), None);
