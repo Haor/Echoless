@@ -31,7 +31,7 @@ impl Drop for RunChild {
     fn drop(&mut self) {
         self.stopping.store(true, Ordering::SeqCst);
         shutdown_child_gracefully(&mut self.child);
-        crate::cleanup_run_config(&self.config_path);
+        crate::platform::cleanup_run_config(&self.config_path);
     }
 }
 
@@ -85,7 +85,7 @@ pub(crate) fn mark_run_exited(state: &RunState, config_path: &Path) {
         }
     };
     if child_opt.is_none() {
-        crate::cleanup_run_config(config_path);
+        crate::platform::cleanup_run_config(config_path);
     }
     // Some(_) 由 RunChild::Drop 收尾(子进程已自行退出,try_wait 立即命中)。
 }
