@@ -732,6 +732,81 @@ async fn request_system_audio(app: tauri::AppHandle) -> Result<Value, String> {
 }
 
 /// 主动近端延迟侦测 / AEC 链路诊断。shell `echoless probe-delay --json`:播放一串蜂鸣、
+/// probe-delay 专用 runner:stderr 的 JSONL 进度行实时转发为
+/// `echoless://probe-progress` 事件(前端用 beep_train_start 把进度灯对齐真实播放时刻),
+/// stdout 仍在进程结束后整体解析为最终 JSON 结果。
+fn run_probe_streaming(
+    app: &tauri::AppHandle,
+    args: &[&str],
+    timeout: Duration,
+) -> Result<Value, String> {
+    let label = "probe-delay";
+    let mut command = echoless_command(Some(app))?;
+    command.args(args);
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    suppress_child_console(&mut command);
+    let mut child = command
+        .spawn()
+        .map_err(|e| format!("spawn {label} failed: {e}"))?;
+    let stderr = child.stderr.take().ok_or("probe stderr not captured")?;
+    let app_ev = app.clone();
+    // stderr 尾巴留存:CLI 失败时错误原因在 stderr(stdout 无 JSON)。
+    let stderr_tail = Arc::new(Mutex::new(String::new()));
+    let tail_writer = stderr_tail.clone();
+    let reader = std::thread::spawn(move || {
+        for line in BufReader::new(stderr).lines() {
+            let Ok(line) = line else { break };
+            if let Ok(v) = serde_json::from_str::<Value>(&line) {
+                let _ = app_ev.emit("echoless://probe-progress", v);
+            }
+            let mut tail = tail_writer.lock().unwrap();
+            tail.push_str(&line);
+            tail.push('\n');
+            if tail.len() > 4096 {
+                let cut = tail.len() - 4096;
+                tail.drain(..cut);
+            }
+        }
+    });
+    let started = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if started.elapsed() >= timeout => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = reader.join();
+                let tail = stderr_tail.lock().unwrap().trim().to_string();
+                return Err(format!(
+                    "{label} timed out after {}s; stderr: {tail}",
+                    timeout.as_secs()
+                ));
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(50)),
+            Err(e) => return Err(format!("wait {label} failed: {e}")),
+        }
+    }
+    let out = child
+        .wait_with_output()
+        .map_err(|e| format!("read {label} output failed: {e}"))?;
+    let _ = reader.join();
+    if !out.status.success() {
+        let tail = stderr_tail.lock().unwrap().trim().to_string();
+        // 与 command_status_error 相同的 240 字符截断(错误直达前端 UI)。
+        let detail: String = if tail.chars().count() > 240 {
+            format!("{}…", tail.chars().take(240).collect::<String>())
+        } else {
+            tail
+        };
+        return Err(format!(
+            "{label} failed with status {}; output: {detail}",
+            out.status
+        ));
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    serde_json::from_str(&stdout).map_err(|e| format!("parse json failed: {e}; raw: {stdout}"))
+}
+
 /// 同时录 ref/mic、分析两路相对到达时差,返回 NearDelayProbeResult(含 recommended_near_delay_ms)。
 /// 约 15 秒、会外放蜂鸣 —— 故必须先停掉主 run(probe 内部自起子进程占用设备),由前端 gating。
 /// 当前后端只支持 macOS Process Tap;其它平台 CLI 会非 0 退出,错误经 stderr 透传给前端。
@@ -755,7 +830,7 @@ async fn probe_delay(
         opt("--reference", &reference, &mut args);
         opt("--output", &output, &mut args);
         let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-        run_json_blocking(Some(&app), &arg_refs, PROBE_DELAY_TIMEOUT, "probe-delay")
+        run_probe_streaming(&app, &arg_refs, PROBE_DELAY_TIMEOUT)
     })
     .await
     .map_err(|e| format!("probe task join failed: {e}"))?

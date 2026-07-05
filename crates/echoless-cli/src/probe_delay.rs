@@ -285,6 +285,21 @@ fn run_native_delay_probe(
         a.json,
         format!("playing beep train: {}", beep_path.display()),
     );
+    // GUI 同步点:蜂鸣列车即将开播。stdout 只留最终 JSON,进度走 stderr JSONL,
+    // 前端据此把 12 点进度灯对齐到真实播放时刻(此前按墙钟猜,音画不同步)。
+    if a.json {
+        eprintln!(
+            "{}",
+            serde_json::json!({
+                "type": "probe_progress",
+                "stage": "beep_train_start",
+                "pre_roll_ms": PROBE_PRE_ROLL_S * 1000.0,
+                "beep_ms": PROBE_BEEP_MS,
+                "gap_ms": PROBE_GAP_MS,
+                "beeps": a.beeps,
+            })
+        );
+    }
     play_probe_beep(a, beep_path)?;
 
     let finish_deadline = Instant::now() + Duration::from_secs(u64::from(diagnostic_seconds) + 2);

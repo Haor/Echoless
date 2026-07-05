@@ -226,6 +226,23 @@ export function onRunLog(cb: (line: string) => void): Promise<UnlistenFn> {
 export function onDevicesChanged(cb: () => void): Promise<UnlistenFn> {
   return listen("echoless://devices-changed", () => cb());
 }
+// probe-delay 进度(CLI stderr JSONL 转发):beep_train_start 携带蜂鸣节奏,
+// 前端据此把进度灯对齐到真实播放时刻。
+export interface ProbeProgress {
+  type?: string;
+  stage?: string;
+  pre_roll_ms?: number;
+  beep_ms?: number;
+  gap_ms?: number;
+  beeps?: number;
+}
+export function onProbeProgress(
+  cb: (p: ProbeProgress) => void,
+): Promise<UnlistenFn> {
+  return listen<ProbeProgress>("echoless://probe-progress", (e) =>
+    cb(e.payload ?? {}),
+  );
+}
 
 // ---- 配置生成:把 UI 选择拼成后端 PipelineConfig(TOML) ----
 export interface PipelineCfg {
