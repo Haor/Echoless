@@ -298,6 +298,9 @@ function ProbeSection({
             <Field
               value={pipeline.near_delay_ms}
               numeric
+              min={0}
+              max={500}
+              integer
               placeholder={t("auto")}
               onCommit={(v) =>
                 onPipeline({

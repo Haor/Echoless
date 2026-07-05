@@ -104,6 +104,8 @@ export function DiagnosticsPage({
             <Field
               value={seconds}
               numeric
+              min={1}
+              integer
               placeholder={t("unlimited")}
               onCommit={(v) => onSeconds(v as number | null)}
             />
