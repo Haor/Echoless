@@ -185,6 +185,7 @@ final class ProcessTapRecorder {
     private var firstHostTime: UInt64?
     private var lastHostTime: UInt64?
     private var streamData = Data()
+    private var droppedStreamBytes: UInt64 = 0
 
     init(options: Options) {
         self.options = options
@@ -235,6 +236,9 @@ final class ProcessTapRecorder {
               format.mBitsPerChannel == 32
         else {
             throw TapError(operation: "Unsupported tap format: \(formatSummary(format))", status: -2)
+        }
+        if options.streamStdout {
+            streamData.reserveCapacity(streamBufferLimitBytes())
         }
 
         let aggregateDescription: [String: Any] = [
@@ -306,13 +310,15 @@ final class ProcessTapRecorder {
         return (capturedFrames, callbackCount, peak, rms)
     }
 
-    func drainStreamData() -> Data {
+    func drainStreamData() -> (data: Data, droppedBytes: UInt64) {
         lock.lock()
         defer { lock.unlock() }
 
         let data = streamData
+        let dropped = droppedStreamBytes
         streamData.removeAll(keepingCapacity: true)
-        return data
+        droppedStreamBytes = 0
+        return (data, dropped)
     }
 
     func writeWav(to path: String) throws {
@@ -403,11 +409,22 @@ final class ProcessTapRecorder {
     }
 
     private func appendStreamData(samples: [Float]) {
-        streamData.reserveCapacity(streamData.count + samples.count * MemoryLayout<Float>.size)
-        for sample in samples {
-            var bits = sample.bitPattern.littleEndian
-            streamData.append(Data(bytes: &bits, count: MemoryLayout<UInt32>.size))
+        let byteCount = samples.count * MemoryLayout<Float>.size
+        if streamData.count + byteCount > streamBufferLimitBytes() {
+            droppedStreamBytes += UInt64(byteCount)
+            return
         }
+        samples.withUnsafeBufferPointer { buffer in
+            guard let base = buffer.baseAddress else { return }
+            let bytes = UnsafeRawBufferPointer(start: base, count: byteCount)
+            streamData.append(contentsOf: bytes)
+        }
+    }
+
+    private func streamBufferLimitBytes() -> Int {
+        let rate = max(Int(format.mSampleRate.rounded()), 48_000)
+        let channelCount = max(channels, 1)
+        return rate * channelCount * MemoryLayout<Float>.size
     }
 }
 
@@ -655,7 +672,10 @@ if options.probePermission {
             recorder.stop()
             exit(0)
         }
-        let data = recorder.drainStreamData()
+        let (data, droppedBytes) = recorder.drainStreamData()
+        if droppedBytes > 0 {
+            fputs("stream buffer full; dropped \(droppedBytes) bytes\n", stderr)
+        }
         if !data.isEmpty {
             do {
                 try FileHandle.standardOutput.write(contentsOf: data)
