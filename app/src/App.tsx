@@ -561,6 +561,20 @@ function useAppController() {
       .then((diagDir) => updateApp({ diagDir }))
       .catch(() => {});
 
+    // 设备热插拔:webview devicechange(WebView2 可靠;WKWebView 未必触发,
+    // 由窗口聚焦 + 下拉展开时刷新兜底)。300ms 防抖合并连发——一次插拔常触发
+    // 多个事件,每次刷新都会 spawn 一次 CLI 枚举。
+    let devChangeTimer = 0;
+    const refreshDevicesSoon = () => {
+      window.clearTimeout(devChangeTimer);
+      devChangeTimer = window.setTimeout(refreshDevices, 300);
+    };
+    navigator.mediaDevices?.addEventListener?.(
+      "devicechange",
+      refreshDevicesSoon,
+    );
+    window.addEventListener("focus", refreshDevicesSoon);
+
     const uns: UnlistenFn[] = [];
     (async () => {
       uns.push(
@@ -713,7 +727,15 @@ function useAppController() {
         }),
       );
     })();
-    return () => uns.forEach((u) => u());
+    return () => {
+      window.clearTimeout(devChangeTimer);
+      navigator.mediaDevices?.removeEventListener?.(
+        "devicechange",
+        refreshDevicesSoon,
+      );
+      window.removeEventListener("focus", refreshDevicesSoon);
+      uns.forEach((u) => u());
+    };
   }, [hasRunControl, noteError, refreshDevices, startDiag]);
 
   // Esc 始终有意义:在次级页按 Esc 返回 Overview。
@@ -1364,6 +1386,7 @@ function useAppController() {
             <span className="v">
               <Dropdown
                 value={selInput}
+                onOpen={refreshDevices}
                 options={(devices?.inputs ?? []).map((d) => ({
                   value: d.stable_id,
                   label: d.name,
@@ -1431,6 +1454,7 @@ function useAppController() {
                 align="right"
                 warn={referenceView === "none"}
                 value={referenceView}
+                onOpen={refreshDevices}
                 options={refOptions}
                 onChange={(v) => {
                   updateSelection({ reference: v });
@@ -1450,6 +1474,7 @@ function useAppController() {
             <span className="v">
               <Dropdown
                 value={selOutput}
+                onOpen={refreshDevices}
                 options={(devices?.outputs ?? []).map((d) => ({
                   value: d.stable_id,
                   label: d.name,
