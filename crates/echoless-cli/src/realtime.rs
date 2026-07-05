@@ -952,7 +952,7 @@ where
         .context("构建输出流失败")
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 pub(crate) fn play_mono_samples_to_output(
     selector: Option<&str>,
     sample_rate: u32,
@@ -1011,7 +1011,7 @@ pub(crate) fn play_mono_samples_to_output(
     Ok(())
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 fn build_mono_sample_player_stream<T>(
     device: &Device,
     choice: &StreamConfigChoice,
