@@ -1,4 +1,6 @@
 #!/usr/bin/env node
+// Asset-presence smoke: verifies packaged executables/resources are present and wired.
+// It intentionally does not launch the GUI process.
 import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
