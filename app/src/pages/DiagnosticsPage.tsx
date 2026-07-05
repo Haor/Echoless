@@ -6,7 +6,7 @@ import { useI18n } from "../i18n";
 import { Field } from "../components/Controls";
 import { Toggle } from "../components/Toggle";
 
-interface Props {
+export interface DiagnosticsPageProps {
   rec: boolean;
   seconds: number | null;
   diagDir: string;
@@ -30,7 +30,7 @@ export function DiagnosticsPage({
   onRec,
   onSeconds,
   onDir,
-}: Props) {
+}: DiagnosticsPageProps) {
   const { t } = useI18n();
   const active = rec && running;
 
