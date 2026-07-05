@@ -603,7 +603,6 @@ fn process_loop<M, R, O>(
             BypassFrameInputs {
                 near: &near,
                 far: &far,
-                raw_near: &mic_frame,
             },
             BypassFrameOutputs {
                 processed: &mut processed,
@@ -658,7 +657,6 @@ fn process_loop<M, R, O>(
 struct BypassFrameInputs<'a> {
     near: &'a [f32],
     far: &'a [f32],
-    raw_near: &'a [f32],
 }
 
 struct BypassFrameOutputs<'a> {
@@ -687,7 +685,7 @@ fn process_bypass_frame(
     );
     write_bypass_output(
         outputs.processed,
-        inputs.raw_near,
+        inputs.near,
         outputs.out,
         bypassed,
         crossfade,
@@ -696,25 +694,30 @@ fn process_bypass_frame(
 
 fn write_bypass_output(
     processed: &[f32],
-    raw_near: &[f32],
+    bypass_near: &[f32],
     out: &mut [f32],
     bypassed: bool,
     crossfade: &mut BypassCrossfade,
 ) {
     for (index, sample) in out.iter_mut().enumerate() {
         if let Some((from_bypassed, to_bypassed, alpha)) = crossfade.next_sample() {
-            let from = bypass_source_sample(processed, raw_near, index, from_bypassed);
-            let to = bypass_source_sample(processed, raw_near, index, to_bypassed);
+            let from = bypass_source_sample(processed, bypass_near, index, from_bypassed);
+            let to = bypass_source_sample(processed, bypass_near, index, to_bypassed);
             *sample = from + (to - from) * alpha;
         } else {
-            *sample = bypass_source_sample(processed, raw_near, index, bypassed);
+            *sample = bypass_source_sample(processed, bypass_near, index, bypassed);
         }
     }
 }
 
-fn bypass_source_sample(processed: &[f32], raw_near: &[f32], index: usize, bypassed: bool) -> f32 {
+fn bypass_source_sample(
+    processed: &[f32],
+    bypass_near: &[f32],
+    index: usize,
+    bypassed: bool,
+) -> f32 {
     if bypassed {
-        raw_near.get(index).copied().unwrap_or(0.0)
+        bypass_near.get(index).copied().unwrap_or(0.0)
     } else {
         processed.get(index).copied().unwrap_or(0.0)
     }
@@ -1244,11 +1247,10 @@ mod tests {
     }
 
     #[test]
-    fn bypass_outputs_raw_near_without_near_delay_and_keeps_output_level() {
+    fn bypass_outputs_delayed_near_to_match_processing_timeline_and_keeps_output_level() {
         let mut chain = ProcessorChain::new(48_000, 1);
         chain.push(Box::new(InvertingProcessor));
-        let near_after_delay = [0.9, -0.9, 0.5, -0.5];
-        let raw_near = [0.1, -0.2, 0.25, -0.25];
+        let near_after_delay = [0.1, -0.2, 0.25, -0.25];
         let far = [0.0; 4];
         let mut processed = [0.0; 4];
         let mut out = [0.0; 4];
@@ -1259,7 +1261,6 @@ mod tests {
             BypassFrameInputs {
                 near: &near_after_delay,
                 far: &far,
-                raw_near: &raw_near,
             },
             BypassFrameOutputs {
                 processed: &mut processed,
@@ -1270,7 +1271,7 @@ mod tests {
         );
         apply_output_level(&mut out, MAX_OUTPUT_LEVEL);
 
-        assert_eq!(processed, [-0.9, 0.9, -0.5, 0.5]);
+        assert_eq!(processed, [-0.1, 0.2, -0.25, 0.25]);
         approx_slice(&out, &[0.3, -0.6, 0.75, -0.75], 0.001);
     }
 
@@ -1353,7 +1354,6 @@ mod tests {
                 BypassFrameInputs {
                     near: &near,
                     far: &far,
-                    raw_near: &raw,
                 },
                 BypassFrameOutputs {
                     processed: &mut processed,
@@ -1367,7 +1367,6 @@ mod tests {
                 BypassFrameInputs {
                     near: &near,
                     far: &far,
-                    raw_near: &raw,
                 },
                 BypassFrameOutputs {
                     processed: &mut processed,
@@ -1403,7 +1402,6 @@ mod tests {
                 BypassFrameInputs {
                     near: &near,
                     far: &far,
-                    raw_near: &near,
                 },
                 BypassFrameOutputs {
                     processed: &mut processed,
@@ -1423,7 +1421,6 @@ mod tests {
                 BypassFrameInputs {
                     near: &near,
                     far: &far,
-                    raw_near: &near,
                 },
                 BypassFrameOutputs {
                     processed: &mut processed,
@@ -1442,7 +1439,6 @@ mod tests {
             BypassFrameInputs {
                 near: &near,
                 far: &far,
-                raw_near: &near,
             },
             BypassFrameOutputs {
                 processed: &mut processed,
@@ -1459,7 +1455,6 @@ mod tests {
             BypassFrameInputs {
                 near: &near,
                 far: &far,
-                raw_near: &near,
             },
             BypassFrameOutputs {
                 processed: &mut processed,
