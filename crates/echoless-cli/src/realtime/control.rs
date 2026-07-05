@@ -13,6 +13,7 @@ use echoless_core::{
 };
 
 use super::diagnostics::{DiagnosticDoneReason, DiagnosticRecorder, DiagnosticRecorderConfig};
+use super::emit::emit_stdout_line;
 use super::stats::RealtimeStats;
 use echoless_processors::ProcessorChain;
 
@@ -577,7 +578,8 @@ fn emit_control_error(
 
 fn emit_runtime_json(status_json: bool, value: Value) {
     if status_json {
-        println!("{value}");
+        // 审计 B-02:命令回执在音频处理线程发出,走异步发射器,不同步碰 stdout。
+        emit_stdout_line(value.to_string());
     } else {
         eprintln!("{value}");
     }

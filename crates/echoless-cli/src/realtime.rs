@@ -15,6 +15,7 @@
 mod control;
 mod devices;
 mod diagnostics;
+mod emit;
 #[cfg(target_os = "macos")]
 mod macos_process_tap;
 mod resample;

@@ -7,6 +7,7 @@ use echoless_core::output_level_gain_db;
 use echoless_processors::ProcessorStats;
 
 use super::diagnostics::DiagnosticsStatusHandle;
+use super::emit::emit_stdout_line;
 
 pub(super) struct StatsSample<'a> {
     pub(super) algorithmic_latency_ms: f32,
@@ -311,10 +312,12 @@ impl RealtimeStats {
         if now.duration_since(self.last_print) < self.interval {
             return;
         }
+        // 审计 B-02:本方法在音频处理线程上执行,写出必须走异步发射器,
+        // 不许同步碰 stdout(管道满会阻塞处理循环 → 爆音)。
         if self.status_json {
-            println!("{}", self.status_json_line(now));
+            emit_stdout_line(self.status_json_line(now));
         } else {
-            self.print_text(now);
+            emit_stdout_line(self.text_line(now));
         }
         self.last_print = now;
         self.near_samples = 0;
@@ -337,8 +340,8 @@ impl RealtimeStats {
         self.node_last_error = None;
     }
 
-    fn print_text(&self, now: Instant) {
-        println!(
+    fn text_line(&self, now: Instant) -> String {
+        format!(
             "t={:.1}s frames={} mic={:.1}dB ref={:.1}dB out={:.1}dB mic_q={} ref_q={} out_q={} near_delay_ms={} in_q_ms={:.1} out_q_ms={:.1} est_user_ms={:.1} aec_delay_ms={} ref_underrun={} out_underrun={} out_overrun={} input_drop={} stale_drop={} node_ms={:.2} runtime_errors={} diverged={}",
             now.duration_since(self.started).as_secs_f64(),
             self.total_frames,
@@ -368,7 +371,7 @@ impl RealtimeStats {
             self.node_process_time_ms,
             self.node_runtime_errors,
             self.node_diverged,
-        );
+        )
     }
 
     fn status_json_line(&self, now: Instant) -> String {
