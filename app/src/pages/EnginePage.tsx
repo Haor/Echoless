@@ -198,6 +198,9 @@ function NvafxCard({
           <div className="epair">
             <span className="mk">»</span> {t("engPair")}
           </div>
+          {/* Maxine SDK 许可要求:集成应用须在应用内做品牌归属(README/release 已有,
+              这里是 UI 侧唯一归属点)。 */}
+          <div className="epair">powered by NVIDIA Maxine</div>
         </div>
         <div className={`ecol nvcol ${nvSupported ? "" : "nvna"}`}>
           {!nvSupported ? (
