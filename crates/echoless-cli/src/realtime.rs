@@ -157,7 +157,11 @@ impl BypassCrossfade {
             self.to_bypassed = to_bypassed;
             return;
         }
-        self.position = 0;
+        self.position = if self.is_active() {
+            self.reversed_position_from_last_alpha()
+        } else {
+            0
+        };
         self.from_bypassed = from_bypassed;
         self.to_bypassed = to_bypassed;
     }
@@ -168,6 +172,11 @@ impl BypassCrossfade {
 
     fn target_bypassed(&self) -> Option<bool> {
         self.is_active().then_some(self.to_bypassed)
+    }
+
+    fn reversed_position_from_last_alpha(&self) -> usize {
+        let last_alpha_position = self.position.saturating_sub(1);
+        self.total_samples.saturating_sub(last_alpha_position)
     }
 
     fn next_sample(&mut self) -> Option<(bool, bool, f32)> {
@@ -1297,6 +1306,30 @@ mod tests {
             assert!(
                 (sample - previous).abs() <= 0.126,
                 "crossfade adjacent step too large: previous={previous} sample={sample}"
+            );
+            previous = sample;
+        }
+    }
+
+    #[test]
+    fn bypass_crossfade_reversal_preserves_current_level() {
+        let processed = [0.0f32; 8];
+        let raw = [1.0f32; 8];
+        let mut out_a = [0.0f32; 4];
+        let mut out_b = [0.0f32; 4];
+        let mut crossfade = BypassCrossfade::new(8);
+        crossfade.start(false, true);
+
+        write_bypass_output(&processed, &raw, &mut out_a, true, &mut crossfade);
+        crossfade.start(true, false);
+        write_bypass_output(&processed, &raw, &mut out_b, false, &mut crossfade);
+
+        approx_eq(out_b[0], out_a[3], 0.001);
+        let mut previous = out_a[3];
+        for sample in out_b {
+            assert!(
+                (sample - previous).abs() <= 0.126,
+                "reversed crossfade adjacent step too large: previous={previous} sample={sample}"
             );
             previous = sample;
         }
