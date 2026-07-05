@@ -53,6 +53,7 @@ for (w, col, y) in [(325, PAPER, 350), (435, ACC, 480), (215, MUT, 610)]:
 img.alpha_composite(bars.resize((SIZE, SIZE), Image.LANCZOS))
 
 out = sys.argv[1] if len(sys.argv) > 1 else os.path.join(
-    os.path.dirname(__file__), "..", "icon-master-1024.png")
+    os.path.dirname(__file__), "..", ".generated-icons", "icon-master-1024.png")
+os.makedirs(os.path.dirname(out), exist_ok=True)
 img.save(out)
 print(f"wrote {out}")
