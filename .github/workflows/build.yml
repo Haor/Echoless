@@ -64,13 +64,10 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cargo fmt \
-            -p echoless-audio-io \
-            -p echoless-processors \
-            -p echoless-core \
-            -p echoless-cli \
-            --check
+          # --all 覆盖全部 workspace 成员(含 echoless-paths,此前逐 -p 漏掉;审计 T-04)。
+          cargo fmt --all --check
           (cd app/src-tauri && cargo fmt --check)
+          (cd aec3 && cargo fmt --all --check)
 
       - name: Test
         run: cargo test --workspace --locked
@@ -80,11 +77,13 @@ jobs:
 
       - name: AEC3 tests
         working-directory: aec3
-        run: cargo test -p aec3-apm -p aec3-core --locked
+        # 全 workspace(此前只 apm/core,ns/agc2/fft/simd/common-audio 的
+        # 329 个数值内核测试从不在 CI 运行;审计 T-01)。
+        run: cargo test --workspace --locked
 
       - name: AEC3 clippy
         working-directory: aec3
-        run: cargo clippy -p aec3-apm -p aec3-core --all-targets --locked -- -D warnings
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
       - name: Build release
         run: cargo build --release --workspace --locked
@@ -338,6 +337,7 @@ jobs:
           set -euo pipefail
           rustup toolchain install stable --profile minimal
           rustup default stable
+          rustup component add clippy rustfmt
           rustc --version
           cargo --version
 
@@ -353,6 +353,15 @@ jobs:
       - name: Install frontend dependencies
         working-directory: app
         run: pnpm install --frozen-lockfile
+
+      # Linux 独有代码路径(null-sink / pactl / monitor 映射 / beep 播放)此前
+      # 无任何质量门,带 #[cfg(target_os="linux")] 的测试在别的平台被条件编译
+      # 掉、等于从没跑过(审计 T-03)。与 win/mac matrix 对齐 test/clippy。
+      - name: Test
+        run: cargo test --workspace --locked
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
       - name: Build Rust workspace
         run: cargo build --release --workspace --locked

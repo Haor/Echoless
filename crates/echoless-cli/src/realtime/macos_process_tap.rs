@@ -220,8 +220,7 @@ fn read_pcm_stream<P>(
                     }
                     if &pending[..4] == STREAM_HEADER_MAGIC {
                         let rate = u32::from_le_bytes(pending[8..12].try_into().unwrap());
-                        let hdr_channels =
-                            u32::from_le_bytes(pending[12..16].try_into().unwrap());
+                        let hdr_channels = u32::from_le_bytes(pending[12..16].try_into().unwrap());
                         // 声道协商(审计 B-05):helper 上报的是 tap 实际格式,
                         // Core Audio 不保证严格满足 mono/stereo 请求;若仍按请求值
                         // 解读交织流,整条参考会声道错位,AEC 静默失效。
