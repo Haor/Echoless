@@ -458,6 +458,8 @@ function useAppController() {
   selectionRef.current = selection;
   const applyChangeRef = useRef(applyChange);
   applyChangeRef.current = applyChange;
+  const doctorRef = useRef(doctor);
+  doctorRef.current = doctor;
   const pipelineRef = useRef(pipeline);
   pipelineRef.current = pipeline;
   const paramsRef = useRef(params);
@@ -544,6 +546,30 @@ function useAppController() {
         if (next.reference !== cur.reference)
           override.reference = next.reference;
         if (Object.keys(override).length > 0) applyChangeRef.current(override);
+
+        // 系统音频权限是外部可变状态(用户随时可在系统设置里改;dev 下 TCC 把授权
+        // 记在 responsible process 头上,终端/Cursor 更新即被重置)——doctor 只在
+        // mount 查一次会让「授予权限」按钮在授予后仍挂着。未授予期间搭设备刷新的
+        // 车重查;已授予则零开销。
+        const perm = doctorRef.current?.system_audio_permission;
+        if (perm === "denied" || perm === "undetermined") {
+          doctorAudio()
+            .then((doc) => {
+              updateApp({ doctor: doc });
+              // 授权前创建的 Process Tap 永远输出静音(CoreAudio 不给旧 tap 补活),
+              // 而 P8 电源开关只是 bypass 不重建管线 —— 刚授予 + 正在跑 + 参考静音
+              // 就自动重启一次管线,让 tap 带着新权限重建。
+              if (
+                doc.system_audio_permission === "granted" &&
+                powerOnRef.current &&
+                selectionRef.current.reference === "system" &&
+                telRef.current.ref <= -100
+              ) {
+                applyChangeRef.current({});
+              }
+            })
+            .catch(() => {});
+        }
       })
       .catch((e) => noteError(String(e)));
   }, [noteError]);
