@@ -68,7 +68,7 @@
 <body data-dock="dark">
 <header>
   <h1>ECHOLESS <span class="no">/</span> ICON PROPOSALS</h1>
-  <p class="sub">36 个方向 · 同一主题语汇(炭黑 #1d1d1b · 纸灰 #d6d5cd · 橙 #ff7235)· 每卡含 128 / 64 / 32 / 16 px。选中报编号即可。</p>
+  <p class="sub">39 个方向 · 同一主题语汇(炭黑 #1d1d1b · 纸灰 #d6d5cd · 橙 #ff7235)· 每卡含 128 / 64 / 32 / 16 px。选中报编号即可。</p>
 </header>
 <div class="controls">
   dock 背景
@@ -394,6 +394,26 @@ const VARIANTS = [
       };
       return plate() + E(false, PAPER) + E(true, PAPER, 0.3) +
         `<rect x="496" y="252" width="32" height="520" rx="16" fill="${ACC}"/>`;
+    } },
+]},
+{ group: "H · 原始三杠 — 换色优化", items: [
+  { id: "H1", name: "忠实换色", tags: ["原始 DNA"], note: "重设计前那颗占位图标的原样回魂:三条左对齐圆头横杠、中/长/短原杠序不动,只把纯黑换成主题炭黑、纯白换成纸灰,补上描边。",
+    draw: () => {
+      const ws = [325, 435, 215], x = 300, bh = 64;
+      return plate() + ws.map((w, i) =>
+        `<rect x="${x}" y="${350 + i * 130}" width="${w}" height="${bh}" rx="${bh / 2}" fill="${PAPER}"/>`).join("");
+    } },
+  { id: "H2", name: "一滴橙", tags: ["最小改动"], note: "同 H1,只做一个动作:最长的中杠点橙。原始构图的「文本行」气质保留,但多了一个品牌锚点 —— 如果想要的是「几乎没变但更像我们」,选这张。",
+    draw: () => {
+      const ws = [325, 435, 215], x = 300, bh = 64;
+      return plate() + ws.map((w, i) =>
+        `<rect x="${x}" y="${350 + i * 130}" width="${w}" height="${bh}" rx="${bh / 2}" fill="${i === 1 ? ACC : PAPER}"/>`).join("");
+    } },
+  { id: "H3", name: "衰减序", tags: ["驯化成 echo"], note: "把原始三杠的杠序驯化成语义:长 → 中 → 短的衰减排列,首杠橙(原声),后两杠渐隐(回声)。原始图标和 A1/G3 之间的中间态。",
+    draw: () => {
+      const rows = [[430, ACC, null], [300, PAPER, 0.62], [195, PAPER, 0.32]], x = 300, bh = 64;
+      return plate() + rows.map(([w, f, op], i) =>
+        `<rect x="${x}" y="${350 + i * 130}" width="${w}" height="${bh}" rx="${bh / 2}" fill="${f}"${op ? ` fill-opacity="${op}"` : ""}/>`).join("");
     } },
 ]},
 { group: "A · 衰减 — 回声正在死去", items: [
