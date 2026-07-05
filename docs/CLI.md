@@ -110,7 +110,7 @@ echoless config validate my.toml
 ```bash
 echoless nvafx doctor --json               # GPU / driver / VC++ / runtime checks
 echoless nvafx download-install --json     # fetch runtime + model for this GPU (~1 GB)
-echoless nvafx install --zip <file.zip>    # install from a local zip instead
+echoless nvafx install --common-zip <common.zip> --model-zip <model.zip>  # install from local zips
 echoless nvafx offline --mic ... --reference ... --out ...
 ```
 

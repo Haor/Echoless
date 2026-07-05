@@ -85,9 +85,11 @@ setup. *AEC powered by NVIDIA Maxine.*
 
 ## Install
 
-Grab the installer for your OS from
-[Releases](https://github.com/Haor/echoless/releases), or
-[build from source](#building-from-source).
+[Build from source](#building-from-source) for now. Packaged installers
+(`.dmg` / `.exe` / `.deb` / `.AppImage`) are **coming soon** — until the first
+tagged release, the latest builds are available as
+[CI artifacts](https://github.com/Haor/echoless/actions) (download from a
+green run's "Artifacts" section).
 
 You also need a virtual audio device (see the table above). The app's
 **MIC SETUP** wizard checks for one and walks you through installing it.
@@ -179,3 +181,8 @@ DeepVQE paper:
 - Virtual audio thanks: [VB-CABLE](https://vb-audio.com/Cable/) (donationware)
   and [BlackHole](https://github.com/ExistentialAudio/BlackHole) (GPL-3.0,
   used as an external device, not linked).
+
+Full third-party license texts (WebRTC BSD-3, LocalVQE Apache-2.0 + NOTICE,
+NVIDIA Maxine SDK) are collected in
+[THIRD-PARTY-LICENSES.md](THIRD-PARTY-LICENSES.md), which ships with every
+release package.

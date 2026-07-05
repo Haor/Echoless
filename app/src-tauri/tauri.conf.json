@@ -22,9 +22,12 @@
     "externalBin": [
       "binaries/echoless"
     ],
-    "resources": [
-      "resources/"
-    ],
+    "resources": {
+      "resources/": "resources/",
+      "../../LICENSE": "licenses/LICENSE",
+      "../../aec3/LICENSE": "licenses/AEC3-LICENSE",
+      "../../THIRD-PARTY-LICENSES.md": "licenses/THIRD-PARTY-LICENSES.md"
+    },
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",

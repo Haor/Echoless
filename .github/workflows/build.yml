@@ -279,6 +279,10 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p dist
+          # 许可证随 CLI 包分发(审计 D-03):MIT + AEC3 BSD-3 + 第三方汇总。
+          cp LICENSE dist/LICENSE.txt
+          cp aec3/LICENSE dist/AEC3-LICENSE.txt
+          cp THIRD-PARTY-LICENSES.md dist/
           if [[ "${RUNNER_OS}" == "Windows" ]]; then
             cp target/release/echoless.exe dist/
             cp configs/example.toml dist/
