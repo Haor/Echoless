@@ -489,6 +489,45 @@ if options.preflightPermission {
     exit(0)
 }
 
+// 显式触发「系统音频录制」授权弹窗(私有 TCCAccessRequest,AudioCap 同款)。
+// 关键事实(2026-07-05 日志实证):CATap/aggregate 的创建与启动只会让 coreaudiod
+// 向 tccd 发 preflight 查询,**永远不会自己弹授权框** —— 之前靠「建 tap 顺便触发
+// 弹窗」的假设是错的。返回 nil = SPI 不可用(继续走 tap 尝试兜底)。
+// 注意:弹窗归属于 responsible process(启动 dev 的终端);该 app 的 Info.plist
+// 需含 NSAudioCaptureUsageDescription(Cursor 有,Warp 截至今日没有)。
+func requestAudioCapturePermission() -> Bool? {
+    guard let handle = dlopen(
+        "/System/Library/PrivateFrameworks/TCC.framework/Versions/A/TCC",
+        RTLD_NOW
+    ) else { return nil }
+    defer { dlclose(handle) }
+    guard let sym = dlsym(handle, "TCCAccessRequest") else { return nil }
+    typealias RequestFunc = @convention(c) (
+        CFString, CFDictionary?, @escaping @convention(block) (Bool) -> Void
+    ) -> Void
+    let request = unsafeBitCast(sym, to: RequestFunc.self)
+    let semaphore = DispatchSemaphore(value: 0)
+    var granted = false
+    request("kTCCServiceAudioCapture" as CFString, nil) { ok in
+        granted = ok
+        semaphore.signal()
+    }
+    // 等用户在弹窗上做决定;超时按未授予处理。
+    if semaphore.wait(timeout: .now() + 120) == .timedOut {
+        fputs("permission request timed out waiting for user\n", stderr)
+        return false
+    }
+    return granted
+}
+
+if options.probePermission {
+    if let granted = requestAudioCapturePermission(), !granted {
+        fputs("system audio recording permission was not granted\n", stderr)
+        exit(1)
+    }
+    // granted 或 SPI 不可用:继续用真实 tap 启停验证一次。
+}
+
 let recorder = ProcessTapRecorder(options: options)
 
 do {
