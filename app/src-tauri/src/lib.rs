@@ -81,7 +81,10 @@ pub fn run() {
                     .max_inner_size(1600.0, 1100.0)
                     .background_color(tauri::window::Color(0x1d, 0x1d, 0x1b, 0xff))
                     .resizable(true)
-                    .visible(true);
+                    // 先隐藏:前端首屏就绪(booted)后再 show,彻底消除 WebView
+                    // 初始化那一两帧的白闪(background_color 在部分平台盖不住)。
+                    // 前端 booted 有 1.2s 硬封顶保证必触发;下方再加 Rust 兜底。
+                    .visible(false);
 
             // 平台镜像标题栏(见 Design.md §5.1):
             //   macOS  → Overlay + 隐藏标题,保留系统红绿灯(OS 绘制,左上)
@@ -98,6 +101,17 @@ pub fn run() {
             }
 
             let window = builder.build()?;
+
+            // 安全兜底:前端正常会在首屏就绪后经 core window show 权限亮窗;万一前端
+            // 完全崩溃(打包后不应发生)也在 5s 后强制显示,绝不留一个永不出现的窗口。
+            {
+                let w = window.clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_secs(5));
+                    let _ = w.show();
+                    let _ = w.set_focus();
+                });
+            }
 
             // macOS:把系统红绿灯垂直居中到 40px 标题栏,并与左侧内容对齐。
             #[cfg(target_os = "macos")]

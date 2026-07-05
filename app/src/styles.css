@@ -130,6 +130,17 @@ body {
   position: relative;
   overflow: hidden;
 }
+
+/* 就绪门:首屏数据+字体就位前隐藏内容(opacity 而非 display,保证字体仍加载),
+   就绪后 180ms 一次性淡入——消除空壳骨架闪烁与字标 FOUT。boot 期是纯暗底
+   (= 应用底色),不放任何指示器:揭幕通常 <400ms,暗屏比半成品/转圈更干净。 */
+.window > * {
+  transition: opacity 180ms ease-out;
+}
+.window.booting > * {
+  opacity: 0;
+  transition: none;
+}
 .window > .tbar,
 .window > .content,
 .window > .fbar {

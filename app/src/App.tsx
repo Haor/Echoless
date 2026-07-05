@@ -456,8 +456,9 @@ function useDeviceEnumeration({
   const selectionRef = useRef(selection);
   selectionRef.current = selection;
 
+  // 返回 promise 供就绪门等待首次枚举完成(后续热插拔刷新忽略返回值即可)。
   const refreshDevices = useCallback(() => {
-    listDevices()
+    return listDevices()
       .then((d) => {
         updateApp({ devices: d });
         const cur = selectionRef.current;
@@ -1197,6 +1198,34 @@ function AppShell() {
     undefined,
     initAppState,
   );
+  // 就绪门:首屏数据+字体就位前整窗隐藏,一次性淡入——消除空壳骨架闪烁与
+  // 字标 FOUT(fallback 字体宽度不同 → 点阵字标从窄变宽跳)。
+  const [booted, setBooted] = useState(false);
+  // 独立兜底:无论数据 effect 内部发生什么(异常/promise 不 resolve),
+  // 字体就绪即揭幕,最迟 1.2s 硬封顶保证绝不卡在空屏。字体本地 woff2
+  // 加载 <200ms,常态是数据 effect 先揭幕(见下),这里只兜底。
+  useEffect(() => {
+    let cancelled = false;
+    const lift = () => {
+      if (!cancelled) setBooted(true);
+    };
+    Promise.race([
+      document.fonts?.ready ?? Promise.resolve(),
+      new Promise((r) => setTimeout(r, 1200)),
+    ]).then(lift);
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+  // 窗口以 visible:false 创建;首屏就绪后再显示,彻底消除 WebView 初始化白闪。
+  // booted 有 1.2s 硬封顶保证必翻真;Rust 侧另有 5s 兜底防前端崩溃。
+  useEffect(() => {
+    if (!booted) return;
+    const w = getCurrentWindow();
+    w.show()
+      .then(() => w.setFocus())
+      .catch(() => {});
+  }, [booted]);
   const {
     platform,
     devices,
@@ -1330,11 +1359,11 @@ function AppShell() {
 
   // 平台 + 设备/处理器枚举 + 设备热插拔
   useEffect(() => {
-    getPlatform()
+    const platformReady = getPlatform()
       .then((platform) => updateApp({ platform }))
       .catch(() => {});
-    refreshDevices();
-    listProcessors()
+    const devicesReady = refreshDevices();
+    const processorsReady = listProcessors()
       .then((m) => {
         updateApp({ processors: m.processors });
         const proc = m.processors.find((p) => p.kind === kindRef.current);
@@ -1350,6 +1379,11 @@ function AppShell() {
         }));
       })
       .catch((e) => noteError(String(e)));
+    // 常态揭幕:首批关键数据(平台/设备/引擎清单)就位即亮屏,通常远早于
+    // 上面的 1.2s 兜底。allSettled 不因单路失败而卡;硬封顶由独立 effect 兜底。
+    Promise.allSettled([platformReady, devicesReady, processorsReady]).then(
+      () => setBooted(true),
+    );
     doctorAudio()
       .then((doctor) => updateApp({ doctor }))
       .catch(() => {});
@@ -1660,7 +1694,7 @@ function AppShell() {
 
   return (
     <div
-      className={`window ${isMac ? "mac" : "win"} ${uiOn ? "" : "sysoff"}`}
+      className={`window ${isMac ? "mac" : "win"} ${uiOn ? "" : "sysoff"} ${booted ? "" : "booting"}`}
     >
       {/* ---- titlebar ---- */}
       <header className="tbar" data-tauri-drag-region>
