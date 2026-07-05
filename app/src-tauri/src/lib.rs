@@ -33,6 +33,34 @@ struct RunChild {
     stopping: Arc<AtomicBool>,
     config_path: PathBuf,
 }
+
+/// RAII 兜底(审计 B-01):RunChild 无论从哪条路径被丢弃(terminate_run、
+/// mark_run_exited、start_run 幂等回收、ExitRequested),都走同一套
+/// 优雅停机 + 临时配置清理,杜绝孤儿 CLI。
+impl Drop for RunChild {
+    fn drop(&mut self) {
+        self.stopping.store(true, Ordering::SeqCst);
+        shutdown_child_gracefully(&mut self.child);
+        cleanup_run_config(&self.config_path);
+    }
+}
+
+/// 优雅停机协议(审计 B-01):先关 stdin(CLI 侧「stdin EOF = 停机」契约,
+/// 让 CLI 正常走 Drop 链回收 macOS Process Tap helper),限时等待退出,
+/// 超时才兜底 kill。此前直接 kill(SIGKILL)会跳过 CLI 清理,macOS 上
+/// 每次停止都遗留 helper 持续占用系统音频 tap(录音指示器长亮)。
+fn shutdown_child_gracefully(child: &mut Child) {
+    drop(child.stdin.take());
+    for _ in 0..40 {
+        match child.try_wait() {
+            Ok(Some(_)) => return,
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(25)),
+            Err(_) => break,
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
 /// 当前运行中的 echoless run 子进程(同一时刻最多一个)。
 struct RunState(Mutex<Option<RunChild>>);
 
@@ -70,16 +98,12 @@ fn tray_icon_state_guard(state: &TrayIconState) -> MutexGuard<'_, Option<TrayIco
 }
 
 fn terminate_run(state: &RunState) {
+    // 锁外 drop:RunChild::Drop 的限时等待(最长 1s)不占 run_state 锁。
     let child_opt = {
         let mut guard = run_state_guard(state);
         guard.take()
     };
-    if let Some(mut rc) = child_opt {
-        rc.stopping.store(true, Ordering::SeqCst);
-        let _ = rc.child.kill();
-        let _ = rc.child.wait();
-        cleanup_run_config(&rc.config_path);
-    }
+    drop(child_opt);
 }
 
 fn mark_run_exited(state: &RunState, config_path: &Path) {
@@ -94,12 +118,10 @@ fn mark_run_exited(state: &RunState, config_path: &Path) {
             None
         }
     };
-    if let Some(mut rc) = child_opt {
-        let _ = rc.child.wait();
-        cleanup_run_config(&rc.config_path);
-    } else {
+    if child_opt.is_none() {
         cleanup_run_config(config_path);
     }
+    // Some(_) 由 RunChild::Drop 收尾(子进程已自行退出,try_wait 立即命中)。
 }
 
 fn set_tray_prefs_inner(prefs: &TrayPrefs, close_to_tray: bool) {
@@ -1278,14 +1300,9 @@ fn start_run(
     stats_interval_ms: Option<u32>,
 ) -> Result<(), String> {
     let mut guard = run_state_guard(&state);
-    // 幂等启动:若有残留子进程(并发重启 / 上次崩溃遗留),先标记 intentional 再杀掉,
-    // 避免 "already running" 卡死。其 reader 退出会被判定为 intentional,不报崩溃。
-    if let Some(mut prev) = guard.take() {
-        prev.stopping.store(true, Ordering::SeqCst);
-        let _ = prev.child.kill();
-        let _ = prev.child.wait();
-        cleanup_run_config(&prev.config_path);
-    }
+    // 幂等启动:若有残留子进程(并发重启 / 上次崩溃遗留),经 RunChild::Drop
+    // 优雅停机(stopping 标记使其 reader 判定为 intentional,不报崩溃)。
+    drop(guard.take());
     let dir = transient_config_dir(&app)?;
     let path = write_transient_config_toml(&dir, "run", &toml_text)?;
     let config_arg = path.to_string_lossy().to_string();
@@ -1321,8 +1338,7 @@ fn start_run(
     let stdout = match child.stdout.take() {
         Some(stdout) => stdout,
         None => {
-            let _ = child.kill();
-            let _ = child.wait();
+            shutdown_child_gracefully(&mut child);
             cleanup_run_config(&path);
             return Err("no stdout".to_string());
         }
@@ -1330,8 +1346,7 @@ fn start_run(
     let stderr = match child.stderr.take() {
         Some(stderr) => stderr,
         None => {
-            let _ = child.kill();
-            let _ = child.wait();
+            shutdown_child_gracefully(&mut child);
             cleanup_run_config(&path);
             return Err("no stderr".to_string());
         }
@@ -1597,8 +1612,15 @@ pub fn run() {
                 }
             }
         })
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app_handle, event| {
+            // Cmd+Q / 菜单退出 / Dock Quit 不产生 CloseRequested(审计 B-01):
+            // 统一在 ExitRequested 回收 sidecar,避免孤儿 CLI 占用麦克风/虚拟麦。
+            if let tauri::RunEvent::ExitRequested { .. } = event {
+                terminate_run(&app_handle.state::<RunState>());
+            }
+        });
 }
 
 #[cfg(test)]

@@ -399,7 +399,9 @@ pub fn run_with_options(cfg: &PipelineConfig, options: RuntimeOptions) -> Result
         .as_ref()
         .map(DiagnosticRecorder::session_dir_string);
     let diagnostics_status = diagnostic.as_ref().map(DiagnosticRecorder::status_handle);
-    let control = options.status_json.then(spawn_control_reader);
+    // 控制线程无条件启动(不再只限 --status-json):stdin EOF = 停机契约的
+    // 感知通道,GUI/管道调用方关闭 stdin 即优雅停机(审计 B-01)。
+    let control = Some(spawn_control_reader());
     let started_event = json!({
         "type": "started",
         "cli_version": env!("CARGO_PKG_VERSION"),
@@ -545,6 +547,7 @@ fn process_loop<M, R, O>(
                 output_level: &mut runtime.output_level,
                 bypassed: &mut runtime.bypassed,
                 status_json: runtime.status_json,
+                running: &running,
             },
         );
         let current_bypass_target = bypass_crossfade

@@ -1,5 +1,6 @@
 use std::collections::VecDeque;
 use std::io::BufRead;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, TryRecvError};
 use std::thread;
 
@@ -213,6 +214,7 @@ pub(super) struct RuntimeControlContext<'a> {
     pub(super) output_level: &'a mut u32,
     pub(super) bypassed: &'a mut bool,
     pub(super) status_json: bool,
+    pub(super) running: &'a AtomicBool,
 }
 
 pub(super) fn handle_runtime_controls(
@@ -248,7 +250,11 @@ pub(super) fn handle_runtime_controls(
             }
             Err(TryRecvError::Empty) => break,
             Err(TryRecvError::Disconnected) => {
+                // stdin 关闭 = 停机契约(审计 B-01):GUI 优雅停止先关 stdin;
+                // GUI 崩溃/被杀时管道同样关闭。两种情况都收敛停机,
+                // 避免孤儿 CLI 继续占用麦克风/虚拟麦/Process Tap helper。
                 *control = None;
+                ctx.running.store(false, Ordering::SeqCst);
                 break;
             }
         }

@@ -568,6 +568,26 @@ if options.probePermission {
 
 let recorder = ProcessTapRecorder(options: options)
 
+// ── 进程回收自愈(审计 B-01)────────────────────────────────────────────
+// 默认信号动作会跳过 recorder.stop(),遗留 tap/聚合设备占用系统音频
+// (录音指示器长亮)。SIGTERM/SIGINT 改走干净清理;SIGPIPE 忽略后由流循环
+// 的 write 错误分支主动清理(见下)。流模式主线程阻塞在 sleep 循环,
+// 信号源必须挂全局队列才能得到调度。
+signal(SIGTERM, SIG_IGN)
+signal(SIGINT, SIG_IGN)
+signal(SIGPIPE, SIG_IGN)
+let cleanupSignalSources: [DispatchSourceSignal] = [SIGTERM, SIGINT].map { sig in
+    let source = DispatchSource.makeSignalSource(signal: sig, queue: DispatchQueue.global())
+    source.setEventHandler {
+        fputs("received signal \(sig); releasing Process Tap\n", stderr)
+        recorder.stop()
+        exit(0)
+    }
+    source.resume()
+    return source
+}
+_ = cleanupSignalSources
+
 do {
     try recorder.start()
     fputs("started Process Tap: \(recorder.formatDescription)\n", stderr)
@@ -590,13 +610,33 @@ if options.probePermission {
         var le = value.littleEndian
         withUnsafeBytes(of: &le) { header.append(contentsOf: $0) }
     }
-    FileHandle.standardOutput.write(header)
+    do {
+        try FileHandle.standardOutput.write(contentsOf: header)
+    } catch {
+        fputs("stdout closed before streaming started: \(error)\n", stderr)
+        recorder.stop()
+        exit(1)
+    }
     fputs("streaming raw Float32 PCM to stdout (\(recorder.formatDescription))\n", stderr)
     while true {
         Thread.sleep(forTimeInterval: 0.005)
+        // 父死自愈:CLI 被 SIGKILL/崩溃时本进程被收养(ppid=1),SIGKILL 不可
+        // 捕获,轮询是唯一可靠防线;系统静音期 tap 无数据、不写管道,不能指望
+        // SIGPIPE/写错误兜底(审计 B-01)。
+        if getppid() == 1 {
+            fputs("parent process exited; releasing Process Tap\n", stderr)
+            recorder.stop()
+            exit(0)
+        }
         let data = recorder.drainStreamData()
         if !data.isEmpty {
-            FileHandle.standardOutput.write(data)
+            do {
+                try FileHandle.standardOutput.write(contentsOf: data)
+            } catch {
+                fputs("stdout write failed (consumer gone); releasing Process Tap\n", stderr)
+                recorder.stop()
+                exit(0)
+            }
         }
     }
 } else {
