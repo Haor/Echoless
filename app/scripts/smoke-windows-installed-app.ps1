@@ -82,6 +82,48 @@ function Install-Bundle {
   throw "Unsupported installer type: $($Installer.Type)"
 }
 
+function Uninstall-Bundle {
+  param(
+    [hashtable]$Installer,
+    [string]$InstalledDir
+  )
+
+  if ($null -eq $Installer) {
+    return
+  }
+
+  Write-Host "windows-installed-smoke: uninstalling installer_type=$($Installer.Type)"
+
+  if ($Installer.Type -eq "nsis") {
+    if ([string]::IsNullOrWhiteSpace($InstalledDir) -or -not (Test-Path $InstalledDir)) {
+      Write-Warning "NSIS uninstall skipped; installed directory not found: $InstalledDir"
+      return
+    }
+    $uninstaller = Get-ChildItem -Path $InstalledDir -File -Filter "uninstall*.exe" -ErrorAction SilentlyContinue |
+      Sort-Object FullName |
+      Select-Object -First 1
+    if ($null -eq $uninstaller) {
+      Write-Warning "NSIS uninstall skipped; uninstall*.exe not found under $InstalledDir"
+      return
+    }
+    $proc = Start-Process -FilePath $uninstaller.FullName -ArgumentList @("/S") -Wait -PassThru
+    if ($proc.ExitCode -ne 0) {
+      throw "NSIS uninstaller failed with exit code $($proc.ExitCode)"
+    }
+    return
+  }
+
+  if ($Installer.Type -eq "msi") {
+    $proc = Start-Process -FilePath "msiexec.exe" -ArgumentList @("/x", $Installer.Path, "/qn", "/norestart") -Wait -PassThru
+    if ($proc.ExitCode -ne 0) {
+      throw "MSI uninstall failed with exit code $($proc.ExitCode)"
+    }
+    return
+  }
+
+  throw "Unsupported installer type: $($Installer.Type)"
+}
+
 function Find-InstalledApp {
   param([string]$RequestedInstallDir)
 
@@ -128,17 +170,30 @@ function Find-InstalledApp {
   throw "Installed Echoless directory not found."
 }
 
-if (-not $SkipInstall) {
-  $installer = Find-Installer -Root $BundleRoot
-  Install-Bundle -Installer $installer -RequestedInstallDir $InstallDir
-}
+$installer = $null
+$installed = $null
 
-$installed = Find-InstalledApp -RequestedInstallDir $InstallDir
-Write-Host "windows-installed-smoke: installed_app=$installed"
-
-Push-Location $AppDir
 try {
-  node ".\scripts\smoke-tauri-bundle.mjs" --installed-app $installed
+  if (-not $SkipInstall) {
+    $installer = Find-Installer -Root $BundleRoot
+    Install-Bundle -Installer $installer -RequestedInstallDir $InstallDir
+  }
+
+  $installed = Find-InstalledApp -RequestedInstallDir $InstallDir
+  Write-Host "windows-installed-smoke: installed_app=$installed"
+
+  Push-Location $AppDir
+  try {
+    node ".\scripts\smoke-tauri-bundle.mjs" --installed-app $installed
+  } finally {
+    Pop-Location
+  }
 } finally {
-  Pop-Location
+  if (-not $SkipInstall) {
+    try {
+      Uninstall-Bundle -Installer $installer -InstalledDir $installed
+    } catch {
+      Write-Warning "windows-installed-smoke: uninstall failed: $_"
+    }
+  }
 }
