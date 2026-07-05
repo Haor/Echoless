@@ -23,6 +23,8 @@ const D: Record<string, { en: string; zh: string }> = {
 
   removingEcho: { en: "Removing Echo", zh: "正在消除回声" },
   echoStopped: { en: "Echo Stopped", zh: "已停止" },
+  // P8-D1:OFF = 穿透 —— 强调 mic 仍然活着,只是 AEC 旁路。
+  bypassLive: { en: "Bypass · Mic Live", zh: "直通 · 麦克风在线" },
   unstable: { en: "Unstable", zh: "不稳定" },
   noReference: { en: "No Reference", zh: "无参考信号" },
   volWheel: {
@@ -44,6 +46,10 @@ const D: Record<string, { en: string; zh: string }> = {
   noLoopback: { en: "No Loopback", zh: "No Loopback" },
   installCable: { en: "install virtual cable", zh: "安装虚拟声卡" },
   reduceNoise: { en: "Reduce background noise", zh: "抑制背景噪声" },
+  lvqeNsHint: {
+    en: "on = v1.3 · off = v1.4 pure aec",
+    zh: "开 = v1.3 · 关 = v1.4 纯回声消除",
+  },
 
   signal: { en: "Signal", zh: "Signal" },
   sigFlow: {
@@ -62,11 +68,6 @@ const D: Record<string, { en: string; zh: string }> = {
   sysAudioRequest: {
     en: "request system audio permission",
     zh: "请求系统音频权限",
-  },
-  // 系统音频参考(Process Tap)要求全局采样率 = 48k(与引擎无关)。
-  sysRefRate: {
-    en: "System Audio ref needs 48k sample rate",
-    zh: "系统音频参考需 48k 采样率",
   },
 
   // Engine
@@ -91,7 +92,9 @@ const D: Record<string, { en: string; zh: string }> = {
   engPickModel: { en: "pick .gguf model…", zh: "选择 .gguf 模型…" },
   engModelReq: { en: "model required", zh: "需要模型文件" },
   // LocalVQE 模型列表
-  lvqeDefault: { en: "DEFAULT", zh: "默认" },
+  // 徽标重设计(2026-07-05):DEFAULT 全词太宽挤掉参数量 → 工程 BOM 的标准件记号 STD
+  lvqeDefault: { en: "STD", zh: "标配" },
+  lvqeDefaultHint: { en: "default model", zh: "默认模型" },
   lvqeDownload: { en: "download", zh: "下载" },
   lvqeDownloading: { en: "downloading…", zh: "下载中…" },
   lvqeUse: { en: "use", zh: "使用" },
@@ -178,6 +181,15 @@ const D: Record<string, { en: string; zh: string }> = {
   micPickInApp: { en: "In your call app pick mic:", zh: "在通话软件里把麦克风选成:" },
   micMissing: { en: "Virtual audio not installed", zh: "未安装虚拟声卡" },
   micInstallHint: { en: "Install a virtual audio device:", zh: "安装一个虚拟声卡:" },
+  micLinuxMissing: { en: "PipeWire null sink not found", zh: "未检测到 PipeWire null sink" },
+  micLinuxInstallHint: {
+    en: "Create the Echoless null sink in a terminal:",
+    zh: "在终端创建 Echoless null sink:",
+  },
+  micLinuxMonitorHint: {
+    en: 'In GNOME/KDE sound settings and your call app, choose "Monitor of Echoless-Output" as the microphone.',
+    zh: '在 GNOME/KDE 声音设置与通话软件里,把麦克风选成 "Monitor of Echoless-Output"。',
+  },
   micRebootAfter: { en: "reboot after install", zh: "装完需重启" },
   micIncomplete: { en: "Route incomplete", zh: "路由不完整" },
   micIncompleteHint: {
@@ -191,6 +203,10 @@ const D: Record<string, { en: string; zh: string }> = {
   micCopy: { en: "copy", zh: "复制" },
   micCopied: { en: "copied", zh: "已复制" },
   micReboot: { en: "Reboot to finish the virtual audio install.", zh: "重启以完成虚拟声卡安装。" },
+  micRebootTitle: {
+    en: "Driver installed · devices not active yet",
+    zh: "驱动已安装 · 设备尚未生效",
+  },
   micPermDenied: { en: "Microphone permission denied", zh: "麦克风权限被拒绝" },
   micPermHint: {
     en: "Echoless needs microphone access to capture your voice.",
@@ -248,9 +264,20 @@ const D: Record<string, { en: string; zh: string }> = {
   probeStable: { en: "stable", zh: "稳定" },
   probeUnstable: { en: "unstable", zh: "不稳定" },
   probeRec: { en: "set", zh: "建议" },
-  probeNoFix: { en: "no fix needed · 0ms", zh: "无需修正 · 0ms" },
+  probeNoFix: {
+    // v8/C6:去掉「no fix needed」歧义 —— 正 lag 由 AEC3 自行追踪,near_delay 不动。
+    en: "aligned · near_delay kept at 0ms",
+    zh: "已对齐 · 近端延迟保持 0ms",
+  },
   probeFilled: { en: "filled into Near Delay", zh: "已填入近端延迟" },
   probeInit: { en: "init", zh: "初始延迟" },
+
+  // Session · Windows 托盘偏好(P5;只留「关闭到托盘」,最小化开关退役 2026-07-05)
+  trayClose: { en: "Close to Tray", zh: "关闭到托盘" },
+  trayCloseHint: {
+    en: "Closing hides to tray instead of quitting. Quit via tray menu.",
+    zh: "点关闭改为收进托盘而非退出;从托盘菜单 Quit 才真正退出。",
+  },
 
   // Diagnostics
   diagNote: {
@@ -262,7 +289,12 @@ const D: Record<string, { en: string; zh: string }> = {
   secHealth: { en: "Health", zh: "健康" },
   record: { en: "Record", zh: "录制" },
   maxSeconds: { en: "Max Seconds", zh: "最长秒数" },
-  unlimited: { en: "unlimited", zh: "不限" },
+  // 74px 输入框放不下 UNLIMITED(9 字符),用 NO MAX
+  unlimited: { en: "no max", zh: "不限" },
+  volMuteHint: {
+    en: "click: mute / restore · wheel: adjust",
+    zh: "点按:静音/恢复 · 滚轮:调节",
+  },
   recordDir: { en: "Output Dir", zh: "输出目录" },
   choose: { en: "choose…", zh: "选择…" },
   recording: { en: "recording…", zh: "录制中…" },

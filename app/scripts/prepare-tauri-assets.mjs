@@ -20,6 +20,7 @@ const valueOf = (flag) => {
 const dev = has("--dev");
 const skipCliBuild = has("--skip-cli-build");
 const skipHelperBuild = has("--skip-helper-build");
+// 发布打包必须带上 LocalVQE native runtime(随包分发,2026-07-05 定案;模型走 HF 下载)。
 const requireLocalvqe = has("--require-localvqe-assets");
 const profile = dev ? "debug" : "release";
 
@@ -126,6 +127,14 @@ function copyFile(src, dest) {
     console.log(`asset: ${path.relative(repoRoot, dest)} already present`);
     return;
   }
+  // 内容相同就不动:mac 上二进制字节稳定 = 代码签名哈希稳定 = TCC 授权存活。
+  if (fs.existsSync(dest) && fs.readFileSync(src).equals(fs.readFileSync(dest))) {
+    console.log(`asset: ${path.relative(repoRoot, dest)} unchanged`);
+    return;
+  }
+  // 必须换新 inode(先删再拷):就地覆盖已签名的 Mach-O 会让内核签名缓存失配,
+  // 下次 exec 直接 SIGKILL(2026-07-05 实证:helper 被杀、无 stderr)。
+  fs.rmSync(dest, { force: true });
   fs.copyFileSync(src, dest);
   if (process.platform !== "win32") {
     const mode = fs.statSync(src).mode;
@@ -208,39 +217,6 @@ function prepareProcessTapHelper() {
   );
 }
 
-function prepareLocalvqeModel() {
-  const modelName = "localvqe-v1.3-4.8M-f32.gguf";
-  const dest = path.join(srcTauriDir, "resources", "localvqe", "models", modelName);
-  const candidates = [
-    process.env.ECHOLESS_LOCALVQE_MODEL,
-    process.env.LOCALVQE_MODEL,
-    process.env.RUNNER_TEMP
-      ? path.join(
-          process.env.RUNNER_TEMP,
-          "localvqe-regression-build",
-          "bench_assets",
-          modelName,
-        )
-      : null,
-    dest,
-  ].filter(Boolean);
-
-  let model = candidates.find(existsFile) ?? null;
-  if (!model && process.env.RUNNER_TEMP) {
-    model = firstFile(process.env.RUNNER_TEMP, (file) => path.basename(file) === modelName);
-  }
-
-  if (!model) {
-    const message = `LocalVQE model ${modelName} not found; bundled model will be absent`;
-    if (requireLocalvqe) throw new Error(message);
-    console.warn(`asset warning: ${message}`);
-    return false;
-  }
-
-  copyFile(model, dest);
-  return true;
-}
-
 function localvqeLibraryName(file) {
   const name = path.basename(file);
   if (process.platform === "win32") return name.toLowerCase() === "localvqe.dll";
@@ -254,6 +230,8 @@ function companionLibrary(file) {
   return name.endsWith(".dylib") || name.includes(".so");
 }
 
+// LocalVQE native runtime 随包分发(模型不随包,走 HF 下载)。
+// 来源优先级:ECHOLESS_LOCALVQE_LIBRARY env → CI RUNNER_TEMP 构建产物 → 已在 resources 的现存副本。
 function prepareLocalvqeNative() {
   const nativeDir = path.join(srcTauriDir, "resources", "localvqe", "native");
   let library = existsFile(process.env.ECHOLESS_LOCALVQE_LIBRARY)
@@ -282,17 +260,13 @@ function prepareLocalvqeNative() {
   return true;
 }
 
-function warnDegradedBundle(hasModel, hasNative) {
-  const missing = [];
-  if (!hasModel) missing.push("model (.gguf)");
-  if (!hasNative) missing.push("native runtime (liblocalvqe + ggml backends)");
+function warnDegradedBundle() {
   const banner = "=".repeat(72);
   console.warn(`\n${banner}`);
-  console.warn("⚠  RELEASE BUNDLE WILL SHIP WITHOUT LOCALVQE");
-  console.warn(`   missing: ${missing.join(", ")}`);
+  console.warn("⚠  RELEASE BUNDLE WILL SHIP WITHOUT LOCALVQE NATIVE RUNTIME");
   console.warn("   The packaged app will run, but enabling LocalVQE fails at runtime.");
-  console.warn("   For a release build, supply ECHOLESS_LOCALVQE_MODEL / ECHOLESS_LOCALVQE_LIBRARY");
-  console.warn("   (or RUNNER_TEMP assets) and re-run with --require-localvqe-assets to fail fast.");
+  console.warn("   Supply ECHOLESS_LOCALVQE_LIBRARY (or RUNNER_TEMP assets) and re-run");
+  console.warn("   with --require-localvqe-assets to fail fast on release builds.");
   console.warn(`${banner}\n`);
 }
 
@@ -301,15 +275,12 @@ function main() {
   console.log(`Preparing Tauri assets for ${targetTriple} (${profile})`);
   prepareCliSidecar(targetTriple);
   prepareProcessTapHelper();
-  const hasModel = prepareLocalvqeModel();
   const hasNative = prepareLocalvqeNative();
-  if (requireLocalvqe && (!hasModel || !hasNative)) {
-    throw new Error("LocalVQE assets are incomplete");
+  if (requireLocalvqe && !hasNative) {
+    throw new Error("LocalVQE native runtime is missing");
   }
-  // 非 dev(发布打包)且缺 LocalVQE 资产时,不再静默产出退化包:打印醒目 banner。
-  // 仍保持退出码 0 以不破坏"只想打包测试 UI"的流程;发布请用 --require-localvqe-assets。
-  if (!dev && (!hasModel || !hasNative)) {
-    warnDegradedBundle(hasModel, hasNative);
+  if (!dev && !hasNative) {
+    warnDegradedBundle();
   }
 }
 

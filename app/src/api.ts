@@ -33,12 +33,13 @@ export function requestSystemAudio(): Promise<DoctorAudio> {
   return invoke<DoctorAudio>("request_system_audio");
 }
 
-// LocalVQE 模型:列出可用(下载目录 + 打包资源)、从官方 HF repo 下载。
+// LocalVQE model/runtime assets from the official HF repo.
 export interface LocalvqeModel {
   filename: string;
   path: string;
-  source: "downloaded" | "bundled" | string;
+  source: "downloaded" | string;
 }
+// native runtime 随包分发(2026-07-05 定案),不走下载;native_ready 只兜 dev 病态 case。
 export interface LocalvqeAssets {
   models_dir: string;
   models: LocalvqeModel[];
@@ -57,7 +58,7 @@ export function downloadLocalvqeModel(filename: string): Promise<string> {
 }
 
 // 主动近端延迟侦测 / AEC 链路诊断。后端 shell `echoless probe-delay --json`,约 15 秒,
-// 会外放一串蜂鸣 —— 调用前必须先停掉主 run。结果字段见 docs/frontend/NEAR_DELAY_PROBE_HANDOFF.md。
+// 会外放一串蜂鸣 —— 调用前必须先停掉主 run。字段以 CLI `probe-delay --json` 实测为准(docs/CLI.md)。
 export interface NearDelayProbeResult {
   session_dir: string;
   session_retained: boolean;
@@ -181,6 +182,16 @@ export function setAec3Ns(ns: boolean, nsLevel: string): Promise<void> {
 export function setAec3Agc(agc: boolean): Promise<void> {
   return sendRunControl(JSON.stringify({ cmd: "set_aec3_agc", agc }));
 }
+// P8-D1:穿透开关(OFF = mic 原样直通虚拟麦)。chain 级 bypass,AEC 保温,
+// 15ms crossfade;运行中实时生效。
+export function setBypass(enabled: boolean): Promise<void> {
+  return sendRunControl(JSON.stringify({ cmd: "set_bypass", enabled }));
+}
+// Windows 托盘偏好(P5 契约):
+// 启动时与每次变更时同步到 Rust;非 Windows 平台后端忽略。
+export function setTrayPrefs(closeToTray: boolean): Promise<void> {
+  return invoke("set_tray_prefs", { closeToTray });
+}
 export function setLocalvqeNoiseGate(
   noiseGate: boolean,
   noiseGateThresholdDbfs: number,
@@ -207,6 +218,27 @@ export function onRunExit(
 }
 export function onRunLog(cb: (line: string) => void): Promise<UnlistenFn> {
   return listen<string>("echoless://log", (e) => cb(e.payload));
+}
+// 原生侧设备热插拔通知(macOS CoreAudio 监听;WKWebView 不触发 devicechange)。
+export function onDevicesChanged(cb: () => void): Promise<UnlistenFn> {
+  return listen("echoless://devices-changed", () => cb());
+}
+// probe-delay 进度(CLI stderr JSONL 转发):beep_train_start 携带蜂鸣节奏,
+// 前端据此把进度灯对齐到真实播放时刻。
+export interface ProbeProgress {
+  type?: string;
+  stage?: string;
+  pre_roll_ms?: number;
+  beep_ms?: number;
+  gap_ms?: number;
+  beeps?: number;
+}
+export function onProbeProgress(
+  cb: (p: ProbeProgress) => void,
+): Promise<UnlistenFn> {
+  return listen<ProbeProgress>("echoless://probe-progress", (e) =>
+    cb(e.payload ?? {}),
+  );
 }
 
 // ---- 配置生成:把 UI 选择拼成后端 PipelineConfig(TOML) ----

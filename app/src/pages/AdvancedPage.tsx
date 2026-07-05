@@ -1,6 +1,12 @@
 import { useEffect, useReducer, useRef } from "react";
 import type { ParamSpec, Platform, Processor } from "../types";
-import { probeDelay, type NearDelayProbeResult, type PipelineCfg } from "../api";
+import type { TrayPrefsState } from "../App";
+import {
+  onProbeProgress,
+  probeDelay,
+  type NearDelayProbeResult,
+  type PipelineCfg,
+} from "../api";
 import { useI18n, type Lang } from "../i18n";
 import { Hint } from "../components/Hint";
 import { Field, SegButtons } from "../components/Controls";
@@ -19,12 +25,37 @@ interface Props {
   output: string;
   running: boolean;
   onSetRun: (on: boolean) => Promise<void>;
+  // Windows 托盘偏好(SESSION 段,仅 windows 平台渲染)。
+  trayPrefs: TrayPrefsState;
+  onTrayPrefs: (patch: Partial<TrayPrefsState>) => void;
 }
 
 // 蜂鸣节奏(对齐 CLI:startup 4s + pre-roll 0.5s,每声 70ms / 间隔 650ms ≈ 720ms,共 12 声)。
+// 段按钮定宽 74px(v9.2 对齐轴),枚举文案超宽会溢出 → 长值用缩写显示(提交值不变)。
+const SELECT_LABELS: Record<string, string> = {
+  moderate: "mid",
+  veryhigh: "max",
+};
+
+// C3/C5 减参:专家级/与引擎页重复的字段不在高级页暴露 ——
+//   LocalVQE:model(引擎页模型清单管理)、library/backend/device(auto 即可);
+//   NVAFX:runtime_dir(引擎页 RUNTIME 行已有完整 UI)、model_path/
+//          use_default_gpu/disable_cuda_graph(专家字段,走配置文件)。
+const HIDDEN_PARAMS: Record<string, Set<string>> = {
+  localvqe: new Set(["model", "library", "backend", "device"]),
+  nvidia_afx_aec: new Set([
+    "runtime_dir",
+    "model_path",
+    "use_default_gpu",
+    "disable_cuda_graph",
+  ]),
+};
+
 const PROBE_BEEPS = 12;
 const PROBE_FIRST_MS = 4500;
 const PROBE_STEP_MS = 720;
+// afplay / cpal 输出流从 spawn 到出声的经验常量(进度灯对齐用,无需精确)。
+const PROBE_PLAYER_OPEN_MS = 150;
 // 信号判定阈值:dBFS 低于此视为没收到。
 const PROBE_SIG_DBFS = -55;
 // mac 上 near_delay 被侦测设非零时,顺带给 AEC3 一个 8ms 初始延迟 hint,
@@ -72,20 +103,35 @@ const DESC: Record<string, { en: string; zh: string }> = {
   },
   model: { en: "GGUF model path (required).", zh: "GGUF 模型路径(必填)。" },
   library: { en: "LocalVQE dynamic library path (auto if empty).", zh: "LocalVQE 动态库路径(留空自动)。" },
-  threads: { en: "CPU threads (auto if empty).", zh: "CPU 线程数(留空自动)。" },
-  noise_gate: { en: "LocalVQE noise gate.", zh: "LocalVQE 噪声门。" },
-  noise_gate_threshold_dbfs: { en: "Noise gate threshold (dBFS).", zh: "噪声门阈值(dBFS)。" },
-  intensity_ratio: { en: "RTX AEC strength.", zh: "RTX AEC 强度。" },
+  threads: {
+    en: "CPU threads (auto if empty). 2-4 is plenty for realtime.",
+    zh: "CPU 线程数(留空自动)。实时推理 2-4 已足够。",
+  },
+  noise_gate: {
+    en: "LocalVQE noise gate: mutes output below the threshold. Off by default.",
+    zh: "LocalVQE 噪声门:低于阈值时静音输出。默认关闭。",
+  },
+  noise_gate_threshold_dbfs: {
+    en: "Gate threshold (dBFS). Default -45; raise toward -35 to cut more room noise.",
+    zh: "噪声门阈值(dBFS)。默认 -45;想压掉更多环境声可向 -35 提高。",
+  },
+  intensity_ratio: {
+    en: "RTX AEC strength (0-1). Default 1.0; lower it if voice sounds over-suppressed.",
+    zh: "RTX AEC 强度(0-1)。默认 1.0;人声被压过头时调低。",
+  },
   runtime_dir: { en: "NVIDIA AFX runtime dir (auto if empty).", zh: "NVIDIA AFX runtime 目录(留空自动)。" },
   model_path: { en: "RTX AEC model path (auto if empty).", zh: "RTX AEC 模型路径(留空自动)。" },
-  on_runtime_error: { en: "On backend runtime error: silence or bypass.", zh: "运行时出错时:静音或直通。" },
+  on_runtime_error: {
+    en: "On backend runtime error: silence (safe, no echo leak) or bypass (keeps mic alive but echo passes).",
+    zh: "运行时出错时:silence 安全不漏回声;bypass 保住麦克风但回声直通。",
+  },
   use_default_gpu: { en: "Use the default GPU.", zh: "使用默认 GPU。" },
   disable_cuda_graph: { en: "Disable CUDA graph.", zh: "关闭 CUDA graph。" },
 };
 
 function backendLabel(kind: string, proc?: Processor): string {
   if (kind === "nvidia_afx_aec") return "NVAFX";
-  if (kind === "sonora_aec3") return "AEC3";
+  if (kind === "aec3") return "AEC3";
   return proc?.label ?? kind;
 }
 
@@ -118,7 +164,7 @@ function probeInitialDelay(
   platform: Platform,
   kind: string,
 ): number | null {
-  if (platform !== "macos" || kind !== "sonora_aec3") return null;
+  if (platform !== "macos" || kind !== "aec3") return null;
   if (r.recommended_near_delay_ms > 0) return PROBE_INIT_DELAY_MS;
   const stable =
     r.warnings.length === 0 &&
@@ -175,17 +221,37 @@ function ProbeSection({
         await onSetRun(false);
       }
       updateProbe({ phase: "probing" });
-      const t0 = Date.now();
+      // 进度灯节奏:默认按墙钟估计(旧 CLI 无进度事件的回退);收到 CLI 的
+      // beep_train_start 事件后改以真实开播时刻为基准 —— 蜂鸣要等子进程起好
+      // 设备 + 4s 稳定期才响,纯墙钟估计会让灯超前声音(音画不同步)。
+      let t0 = Date.now();
+      let firstMs = PROBE_FIRST_MS;
+      let stepMs = PROBE_STEP_MS;
+      let beeps = PROBE_BEEPS;
       if (timer.current != null) window.clearInterval(timer.current);
       timer.current = window.setInterval(() => {
         const el = Date.now() - t0;
         const n = Math.max(
           0,
-          Math.min(PROBE_BEEPS, Math.floor((el - PROBE_FIRST_MS) / PROBE_STEP_MS) + 1),
+          Math.min(beeps, Math.floor((el - firstMs) / stepMs) + 1),
         );
         updateProbe({ lit: n });
       }, 100);
-      const r = await probeDelay({ mic, reference, output });
+      const unProgress = await onProbeProgress((p) => {
+        if (p.stage !== "beep_train_start") return;
+        // 首响 = 事件时刻 + WAV 前导静音 + 播放器打开的经验常量。
+        t0 = Date.now();
+        firstMs = (p.pre_roll_ms ?? 500) + PROBE_PLAYER_OPEN_MS;
+        stepMs = (p.beep_ms ?? 70) + (p.gap_ms ?? 650);
+        beeps = p.beeps ?? PROBE_BEEPS;
+        updateProbe({ lit: 0 });
+      });
+      let r: NearDelayProbeResult;
+      try {
+        r = await probeDelay({ mic, reference, output });
+      } finally {
+        unProgress();
+      }
       updateProbe({ probe: r });
       // 自动把实测推荐值填进 near_delay_ms(含 8ms AEC 安全余量,后端已算好)。
       onPipeline({ near_delay_ms: r.recommended_near_delay_ms });
@@ -336,6 +402,8 @@ export function AdvancedPage({
   output,
   running,
   onSetRun,
+  trayPrefs,
+  onTrayPrefs,
 }: Props) {
   const { t, lang, setLang } = useI18n();
   const proc = processors.find((p) => p.kind === kind);
@@ -345,9 +413,15 @@ export function AdvancedPage({
     !spec.requires ||
     Object.entries(spec.requires).every(([rk, rv]) => params[rk] === rv);
 
+  const hidden = HIDDEN_PARAMS[kind];
+
   // 隐藏未满足 requires 的参数(如 ns 关闭时的 ns_level),而非置灰。
   const backendParams = Object.entries(proc?.params ?? {}).filter(
-    ([k, spec]) => k !== "reference_channels" && k !== "ns" && reqMet(spec),
+    ([k, spec]) =>
+      k !== "reference_channels" &&
+      k !== "ns" &&
+      !hidden?.has(k) &&
+      reqMet(spec),
   );
 
   const control = (key: string, spec: ParamSpec) => {
@@ -368,7 +442,10 @@ export function AdvancedPage({
       return (
         <SegButtons
           value={String(val ?? spec.default ?? "")}
-          options={(spec.values ?? []).map((v) => ({ value: v, label: v }))}
+          options={(spec.values ?? []).map((v) => ({
+            value: v,
+            label: SELECT_LABELS[v] ?? v,
+          }))}
           onChange={(v) => onParam(key, v)}
         />
       );
@@ -491,6 +568,25 @@ export function AdvancedPage({
             />
           </span>
         </div>
+        {/* P5 前端侧:托盘偏好(仅 Windows;Rust 端非 Windows 强制 false)。
+            只留「关闭到托盘」一个开关 —— 最小化到托盘退役(用户定案 2026-07-05) */}
+        {platform === "windows" && (
+          <div className="arow">
+            <Hint text={t("trayCloseHint")}>
+              <span className="alabel">{t("trayClose")}</span>
+            </Hint>
+            <span className="aval">
+              <SegButtons
+                value={trayPrefs.closeToTray ? "on" : "off"}
+                options={[
+                  { value: "on", label: "ON" },
+                  { value: "off", label: "OFF" },
+                ]}
+                onChange={(v) => onTrayPrefs({ closeToTray: v === "on" })}
+              />
+            </span>
+          </div>
+        )}
       </div>
     </div>
   );

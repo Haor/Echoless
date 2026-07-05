@@ -38,7 +38,7 @@ pub fn default_near_delay_ms() -> u32 {
     if cfg!(target_os = "macos") {
         25
     } else {
-        0
+        20
     }
 }
 fn default_mic() -> String {
@@ -52,6 +52,9 @@ fn default_output() -> String {
 }
 pub fn default_output_level() -> u32 {
     DEFAULT_OUTPUT_LEVEL
+}
+pub fn default_bypass() -> bool {
+    false
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -112,6 +115,9 @@ pub struct PipelineConfig {
     /// Final output level after all processors. 0=mute, 50=unity, 100=3x gain.
     #[serde(default = "default_output_level")]
     pub output_level: u32,
+    /// Start realtime run in mic passthrough mode; processors may stay warm in realtime.
+    #[serde(default = "default_bypass")]
+    pub bypass: bool,
     /// Optional realtime diagnostic recordings.
     #[serde(default)]
     pub diagnostics: DiagnosticsConfig,
@@ -131,6 +137,7 @@ impl Default for PipelineConfig {
             reference_channels: default_reference_channels(),
             near_delay_ms: default_near_delay_ms(),
             output_level: default_output_level(),
+            bypass: default_bypass(),
             diagnostics: DiagnosticsConfig::default(),
             chain: Vec::new(),
         }
@@ -229,7 +236,9 @@ where
 }
 
 pub fn apply_reference_channels_to_chain(nodes: &mut [NodeConfig], mode: ReferenceChannels) {
-    for node in nodes.iter_mut().filter(|node| node.kind == "sonora_aec3") {
+    for node in nodes.iter_mut().filter(|node| {
+        node.kind == "aec3" || node.kind == "sonora_aec3" // legacy alias, remove after 2 releases
+    }) {
         node.params.insert(
             "reference_channels".to_string(),
             toml::Value::String(mode.as_str().to_string()),

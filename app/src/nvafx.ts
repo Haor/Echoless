@@ -1,6 +1,6 @@
 // NVAFX / RTX AEC runtime 安装向导的共享逻辑:把 `nvafx doctor --json` 的 checks
 // 派生成「单一当前状态」与「就绪阶梯」,并提供按 GPU 架构自动选模型的资产名。
-// 依据 docs/frontend/ENGINE_RUNTIME_WIZARD_GUIDANCE.md + NVAFX_RUNTIME_INSTALLER_HANDOFF.md。
+// 状态机依据 `echoless nvafx doctor --json` 的检查项(docs/CLI.md)。
 import type { GpuArch, NvafxDoctor } from "./types";
 
 const NVAFX_SDK_VERSION = "2.1.0";

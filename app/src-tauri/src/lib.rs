@@ -3,7 +3,7 @@
 //   - 把 `echoless` CLI 作为 sidecar 调用,只消费 JSON / JSONL 契约
 //   - run 的 --status-json 以 JSONL 流式解析,经事件推给前端
 //
-// 契约真理源:echoless/docs/frontend/*.md + CLI 实测。
+// 契约真理源:docs/CLI.md + CLI `--json` 实测。
 use std::fs::OpenOptions;
 use std::io::ErrorKind;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -13,8 +13,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use serde_json::Value;
+use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+#[cfg(target_os = "windows")]
+use tauri::{
+    menu::{Menu, MenuItem, PredefinedMenuItem},
+    tray::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent},
+    AppHandle,
+};
 use tauri::{Emitter, Manager, State, WebviewUrl, WebviewWindowBuilder, WindowEvent};
 #[cfg(target_os = "macos")]
 use tauri_plugin_decorum::WebviewWindowExt;
@@ -30,12 +36,181 @@ struct RunChild {
 /// 当前运行中的 echoless run 子进程(同一时刻最多一个)。
 struct RunState(Mutex<Option<RunChild>>);
 
+#[cfg(target_os = "windows")]
+struct TrayIconState(Mutex<Option<TrayIcon>>);
+
+/// Windows tray preferences pushed by the frontend at startup and on change.
+/// 只剩「关闭到托盘」——最小化到托盘已退役(用户定案 2026-07-05)。
+struct TrayPrefs {
+    close_to_tray: AtomicBool,
+}
+
+impl Default for TrayPrefs {
+    fn default() -> Self {
+        Self {
+            close_to_tray: AtomicBool::new(false),
+        }
+    }
+}
+
 fn run_state_guard(state: &RunState) -> MutexGuard<'_, Option<RunChild>> {
     // Keep the GUI backend recoverable after an unrelated panic while holding the run lock.
     state
         .0
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+#[cfg(target_os = "windows")]
+fn tray_icon_state_guard(state: &TrayIconState) -> MutexGuard<'_, Option<TrayIcon>> {
+    state
+        .0
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn terminate_run(state: &RunState) {
+    let child_opt = {
+        let mut guard = run_state_guard(state);
+        guard.take()
+    };
+    if let Some(mut rc) = child_opt {
+        rc.stopping.store(true, Ordering::SeqCst);
+        let _ = rc.child.kill();
+        let _ = rc.child.wait();
+        cleanup_run_config(&rc.config_path);
+    }
+}
+
+fn mark_run_exited(state: &RunState, config_path: &Path) {
+    let child_opt = {
+        let mut guard = run_state_guard(state);
+        if guard
+            .as_ref()
+            .is_some_and(|rc| rc.config_path == config_path)
+        {
+            guard.take()
+        } else {
+            None
+        }
+    };
+    if let Some(mut rc) = child_opt {
+        let _ = rc.child.wait();
+        cleanup_run_config(&rc.config_path);
+    } else {
+        cleanup_run_config(config_path);
+    }
+}
+
+fn set_tray_prefs_inner(prefs: &TrayPrefs, close_to_tray: bool) {
+    #[cfg(target_os = "windows")]
+    {
+        prefs.close_to_tray.store(close_to_tray, Ordering::SeqCst);
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = close_to_tray;
+        prefs.close_to_tray.store(false, Ordering::SeqCst);
+    }
+}
+
+fn tray_pref_enabled(value: &AtomicBool) -> bool {
+    let stored = value.load(Ordering::SeqCst);
+    #[cfg(target_os = "windows")]
+    {
+        stored
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = stored;
+        false
+    }
+}
+
+fn close_to_tray_enabled(prefs: &TrayPrefs) -> bool {
+    tray_pref_enabled(&prefs.close_to_tray)
+}
+
+fn tray_tooltip(running: bool) -> &'static str {
+    if running {
+        "Echoless — RUNNING"
+    } else {
+        "Echoless — STOPPED"
+    }
+}
+
+fn update_tray_tooltip(app: &tauri::AppHandle, running: bool) {
+    let tooltip = tray_tooltip(running);
+    #[cfg(target_os = "windows")]
+    {
+        let tray_state = app.state::<TrayIconState>();
+        let tray = tray_icon_state_guard(&tray_state).clone();
+        if let Some(tray) = tray {
+            let _ = tray.set_tooltip(Some(tooltip));
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = (app, tooltip);
+    }
+}
+
+#[cfg(target_os = "windows")]
+const TRAY_ID: &str = "main-tray";
+#[cfg(target_os = "windows")]
+const TRAY_MENU_SHOW: &str = "show";
+#[cfg(target_os = "windows")]
+const TRAY_MENU_QUIT: &str = "quit";
+
+#[cfg(target_os = "windows")]
+fn show_main_window(app: &AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.show();
+        let _ = window.unminimize();
+        let _ = window.set_focus();
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn register_windows_tray(app: &mut tauri::App) -> tauri::Result<()> {
+    let show_item = MenuItem::with_id(app, TRAY_MENU_SHOW, "Show", true, None::<&str>)?;
+    let separator = PredefinedMenuItem::separator(app)?;
+    let quit_item = MenuItem::with_id(app, TRAY_MENU_QUIT, "Quit", true, None::<&str>)?;
+    let menu = Menu::with_items(app, &[&show_item, &separator, &quit_item])?;
+
+    let mut builder = TrayIconBuilder::with_id(TRAY_ID)
+        .menu(&menu)
+        .show_menu_on_left_click(false)
+        .tooltip(tray_tooltip(false))
+        .on_menu_event(|app, event| match event.id().as_ref() {
+            TRAY_MENU_SHOW => show_main_window(app),
+            TRAY_MENU_QUIT => {
+                let state = app.state::<RunState>();
+                terminate_run(&state);
+                update_tray_tooltip(app, false);
+                app.exit(0);
+            }
+            _ => {}
+        })
+        .on_tray_icon_event(|tray, event| {
+            if let TrayIconEvent::Click {
+                button: MouseButton::Left,
+                button_state: MouseButtonState::Up,
+                ..
+            } = event
+            {
+                show_main_window(tray.app_handle());
+            }
+        });
+
+    if let Some(icon) = app.default_window_icon().cloned() {
+        builder = builder.icon(icon);
+    }
+
+    let tray = builder.build(app)?;
+    let tray_state = app.state::<TrayIconState>();
+    *tray_icon_state_guard(&tray_state) = Some(tray);
+    Ok(())
 }
 
 const TAURI_TARGET_TRIPLE: &str = env!("TAURI_ENV_TARGET_TRIPLE");
@@ -278,17 +453,22 @@ fn localvqe_library_path(app: Option<&tauri::AppHandle>, cli: &Path) -> Option<P
         push_file_candidate(&mut candidates, PathBuf::from(p));
     }
 
+    // 产品决策(2026-07-05 修正):native runtime 随包分发,只有模型走 HF 下载。
+    // 打包 Resource 目录 → dev 的 src-tauri/resources → 品牌数据根(下载兜底)。
     if let Some(resource_native) = resource_path(app, "resources/localvqe/native") {
         if let Some(path) = find_localvqe_library_in_dir(&resource_native) {
             push_file_candidate(&mut candidates, path);
         }
     }
-
     let manifest_native = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("resources")
         .join("localvqe")
         .join("native");
     if let Some(path) = find_localvqe_library_in_dir(&manifest_native) {
+        push_file_candidate(&mut candidates, path);
+    }
+
+    if let Some(path) = find_localvqe_library_in_dir(&localvqe_native_dir_path()) {
         push_file_candidate(&mut candidates, path);
     }
 
@@ -388,6 +568,13 @@ fn command_status_error(label: &str, out: &Output) -> String {
         stderr.trim()
     } else {
         stdout.trim()
+    };
+    // 错误会直达前端状态条/卡片,截断防止长输出撑爆 UI。
+    let detail: String = if detail.chars().count() > 240 {
+        let head: String = detail.chars().take(240).collect();
+        format!("{head}…")
+    } else {
+        detail.to_string()
     };
     format!(
         "{label} failed with status {}; output: {detail}",
@@ -499,6 +686,81 @@ async fn request_system_audio(app: tauri::AppHandle) -> Result<Value, String> {
 }
 
 /// 主动近端延迟侦测 / AEC 链路诊断。shell `echoless probe-delay --json`:播放一串蜂鸣、
+/// probe-delay 专用 runner:stderr 的 JSONL 进度行实时转发为
+/// `echoless://probe-progress` 事件(前端用 beep_train_start 把进度灯对齐真实播放时刻),
+/// stdout 仍在进程结束后整体解析为最终 JSON 结果。
+fn run_probe_streaming(
+    app: &tauri::AppHandle,
+    args: &[&str],
+    timeout: Duration,
+) -> Result<Value, String> {
+    let label = "probe-delay";
+    let mut command = echoless_command(Some(app))?;
+    command.args(args);
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    suppress_child_console(&mut command);
+    let mut child = command
+        .spawn()
+        .map_err(|e| format!("spawn {label} failed: {e}"))?;
+    let stderr = child.stderr.take().ok_or("probe stderr not captured")?;
+    let app_ev = app.clone();
+    // stderr 尾巴留存:CLI 失败时错误原因在 stderr(stdout 无 JSON)。
+    let stderr_tail = Arc::new(Mutex::new(String::new()));
+    let tail_writer = stderr_tail.clone();
+    let reader = std::thread::spawn(move || {
+        for line in BufReader::new(stderr).lines() {
+            let Ok(line) = line else { break };
+            if let Ok(v) = serde_json::from_str::<Value>(&line) {
+                let _ = app_ev.emit("echoless://probe-progress", v);
+            }
+            let mut tail = tail_writer.lock().unwrap();
+            tail.push_str(&line);
+            tail.push('\n');
+            if tail.len() > 4096 {
+                let cut = tail.len() - 4096;
+                tail.drain(..cut);
+            }
+        }
+    });
+    let started = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if started.elapsed() >= timeout => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = reader.join();
+                let tail = stderr_tail.lock().unwrap().trim().to_string();
+                return Err(format!(
+                    "{label} timed out after {}s; stderr: {tail}",
+                    timeout.as_secs()
+                ));
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(50)),
+            Err(e) => return Err(format!("wait {label} failed: {e}")),
+        }
+    }
+    let out = child
+        .wait_with_output()
+        .map_err(|e| format!("read {label} output failed: {e}"))?;
+    let _ = reader.join();
+    if !out.status.success() {
+        let tail = stderr_tail.lock().unwrap().trim().to_string();
+        // 与 command_status_error 相同的 240 字符截断(错误直达前端 UI)。
+        let detail: String = if tail.chars().count() > 240 {
+            format!("{}…", tail.chars().take(240).collect::<String>())
+        } else {
+            tail
+        };
+        return Err(format!(
+            "{label} failed with status {}; output: {detail}",
+            out.status
+        ));
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    serde_json::from_str(&stdout).map_err(|e| format!("parse json failed: {e}; raw: {stdout}"))
+}
+
 /// 同时录 ref/mic、分析两路相对到达时差,返回 NearDelayProbeResult(含 recommended_near_delay_ms)。
 /// 约 15 秒、会外放蜂鸣 —— 故必须先停掉主 run(probe 内部自起子进程占用设备),由前端 gating。
 /// 当前后端只支持 macOS Process Tap;其它平台 CLI 会非 0 退出,错误经 stderr 透传给前端。
@@ -522,14 +784,16 @@ async fn probe_delay(
         opt("--reference", &reference, &mut args);
         opt("--output", &output, &mut args);
         let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-        run_json_blocking(Some(&app), &arg_refs, PROBE_DELAY_TIMEOUT, "probe-delay")
+        run_probe_streaming(&app, &arg_refs, PROBE_DELAY_TIMEOUT)
     })
     .await
     .map_err(|e| format!("probe task join failed: {e}"))?
 }
 
-// ---- LocalVQE 模型管理(打包默认模型 + 从官方 HF repo 下载选择) ----
-const LOCALVQE_HF_REVISION: &str = "5760d09ce556750f76c1251c024e4a8c37231591";
+// ---- LocalVQE model/native management: brand data root + HF downloads ----
+// revision 跟 main:完整性由每文件 sha256 pin 保证,新上传的文件无需改代码即可下载。
+// (曾 pin 具体 commit,但该 rev 在 HF 上不存在导致下载全挂。)
+const LOCALVQE_HF_REVISION: &str = "main";
 
 #[derive(Clone, Copy)]
 struct LocalVqeModelPin {
@@ -545,11 +809,6 @@ const LOCALVQE_MODEL_PINS: &[LocalVqeModelPin] = &[
         size: 5_162_720,
     },
     LocalVqeModelPin {
-        filename: "localvqe-v1.1-1.3M-f32.gguf",
-        sha256: "c118227c6b433d6aa36d9e4b993e0f31aa60787ea38d301d04db917a4a2b0a84",
-        size: 5_173_088,
-    },
-    LocalVqeModelPin {
         filename: "localvqe-v1.2-1.3M-f32.gguf",
         sha256: "4856ecf5f522b23fb2bc5caeac81f323c0ef1c4c156a9c7d40a6adbe092ba9ce",
         size: 5_173_088,
@@ -558,6 +817,11 @@ const LOCALVQE_MODEL_PINS: &[LocalVqeModelPin] = &[
         filename: "localvqe-v1.3-4.8M-f32.gguf",
         sha256: "c4f7912485c32cfc206c536f2f050b52513f2f613fdbc616391f6b26ab1d51ec",
         size: 19_268_160,
+    },
+    LocalVqeModelPin {
+        filename: "localvqe-v1.4-aec-200K-f32.gguf",
+        sha256: "b6e43138588a83bfe903ab5e143b4020b91c1e1629f5a575ac5855ff0003c731",
+        size: 2_924_224,
     },
 ];
 
@@ -584,36 +848,64 @@ fn sha256_file(path: &Path) -> Result<String, String> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
-fn verify_localvqe_model_file(path: &Path, pin: &LocalVqeModelPin) -> Result<(), String> {
+fn verify_pinned_file(
+    path: &Path,
+    expected_sha256: &str,
+    expected_size: u64,
+    label: &str,
+) -> Result<(), String> {
     let size = std::fs::metadata(path)
-        .map_err(|e| format!("读取模型文件信息失败: {}: {e}", path.display()))?
+        .map_err(|e| format!("读取文件信息失败: {}: {e}", path.display()))?
         .len();
-    if size != pin.size {
+    if size != expected_size {
         return Err(format!(
-            "LocalVQE 模型大小不匹配: file={}, actual={}, expected={}",
+            "{label}大小不匹配: file={}, actual={}, expected={}",
             path.display(),
             size,
-            pin.size
+            expected_size
         ));
     }
     let actual = sha256_file(path)?;
-    if !actual.eq_ignore_ascii_case(pin.sha256) {
+    if !actual.eq_ignore_ascii_case(expected_sha256) {
         return Err(format!(
-            "LocalVQE 模型 SHA256 不匹配: file={}, actual={}, expected={}",
+            "{label} SHA256 不匹配: file={}, actual={}, expected={}",
             path.display(),
             actual,
-            pin.sha256
+            expected_sha256
         ));
     }
     Ok(())
 }
 
-/// 下载模型的本地目录:<app_local_data>/localvqe/models(自动创建)。
-fn localvqe_models_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {
-    let base = app.path().app_local_data_dir().map_err(|e| e.to_string())?;
-    let dir = base.join("localvqe").join("models");
+fn verify_localvqe_model_file(path: &Path, pin: &LocalVqeModelPin) -> Result<(), String> {
+    verify_pinned_file(path, pin.sha256, pin.size, "LocalVQE 模型")
+}
+
+fn localvqe_data_dir_path() -> PathBuf {
+    let (base, _) = echoless_paths::brand_data_root();
+    base.join("localvqe")
+}
+
+fn localvqe_models_dir_path() -> PathBuf {
+    localvqe_data_dir_path().join("models")
+}
+
+fn localvqe_native_dir_path() -> PathBuf {
+    localvqe_data_dir_path().join("native")
+}
+
+fn localvqe_native_dir() -> Result<PathBuf, String> {
+    let dir = localvqe_native_dir_path();
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    // 目录说明:用户手动放入的 .gguf 与应用内下载的模型都落在这里,引擎页自动检测。
+    Ok(dir)
+}
+
+/// Local directory for downloaded models: <brand data root>/localvqe/models.
+fn localvqe_models_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    let dir = localvqe_models_dir_path();
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    migrate_legacy_localvqe_models(app, &dir);
+    // User-supplied and in-app downloaded .gguf files both live here.
     let readme = dir.join("README.txt");
     if !readme.exists() {
         let _ = std::fs::write(
@@ -629,7 +921,45 @@ fn localvqe_models_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     Ok(dir)
 }
 
-fn collect_gguf(dir: &Path, source: &str, out: &mut Vec<Value>) {
+fn migrate_legacy_localvqe_models(app: &tauri::AppHandle, dest_dir: &Path) {
+    let Ok(legacy_base) = app.path().app_local_data_dir() else {
+        return;
+    };
+    let legacy_dir = legacy_base.join("localvqe").join("models");
+    if legacy_dir == dest_dir || !legacy_dir.is_dir() {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(&legacy_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) != Some("gguf") {
+            continue;
+        }
+        let Some(name) = path.file_name() else {
+            continue;
+        };
+        let dest = dest_dir.join(name);
+        if dest.exists() {
+            continue;
+        }
+        if let Err(rename_err) = std::fs::rename(&path, &dest) {
+            if let Err(copy_err) =
+                std::fs::copy(&path, &dest).and_then(|_| std::fs::remove_file(&path))
+            {
+                eprintln!(
+                    "LocalVQE legacy model migration skipped: {} -> {}: rename={rename_err}; copy={copy_err}",
+                    path.display(),
+                    dest.display()
+                );
+            }
+        }
+    }
+}
+
+fn collect_gguf(dir: &Path) -> Vec<Value> {
+    let mut models = Vec::new();
     if let Ok(rd) = std::fs::read_dir(dir) {
         for e in rd.flatten() {
             let p = e.path();
@@ -637,17 +967,21 @@ fn collect_gguf(dir: &Path, source: &str, out: &mut Vec<Value>) {
                 continue;
             }
             if let Some(name) = p.file_name().and_then(|s| s.to_str()) {
-                if out.iter().any(|m| m["filename"] == name) {
-                    continue; // 下载目录优先,避免与打包资源重名重复
-                }
-                out.push(serde_json::json!({
+                models.push(serde_json::json!({
                     "filename": name,
                     "path": p.to_string_lossy(),
-                    "source": source,
+                    "source": "downloaded",
                 }));
             }
         }
     }
+    models.sort_by(|a, b| {
+        a["filename"]
+            .as_str()
+            .unwrap_or_default()
+            .cmp(b["filename"].as_str().unwrap_or_default())
+    });
+    models
 }
 
 fn collect_native_files(dir: &Path) -> Vec<String> {
@@ -666,29 +1000,17 @@ fn collect_native_files(dir: &Path) -> Vec<String> {
     files
 }
 
-/// 列出可用 LocalVQE 模型(下载目录 + 打包资源里的 .gguf),供引擎页选择。
+/// List available LocalVQE models from the single local model directory.
 #[tauri::command]
 fn localvqe_assets(app: tauri::AppHandle) -> Result<Value, String> {
     let dir = localvqe_models_dir(&app)?;
-    let mut models: Vec<Value> = vec![];
-    collect_gguf(&dir, "downloaded", &mut models);
-    if let Ok(res) = app.path().resolve(
-        "resources/localvqe/models",
-        tauri::path::BaseDirectory::Resource,
-    ) {
-        collect_gguf(&res, "bundled", &mut models);
-    }
+    let models = collect_gguf(&dir);
+    let native_dir = localvqe_native_dir()?;
     let cli = echoless_bin(Some(&app)).ok();
     let library = cli
         .as_deref()
         .and_then(|path| localvqe_library_path(Some(&app), path));
-    let native_dir = library
-        .as_ref()
-        .and_then(|path| path.parent().map(Path::to_path_buf));
-    let native_files = native_dir
-        .as_deref()
-        .map(collect_native_files)
-        .unwrap_or_default();
+    let native_files = collect_native_files(&native_dir);
     let process_tap_helper = cli
         .as_deref()
         .and_then(|path| process_tap_helper_bin(Some(&app), path));
@@ -697,7 +1019,7 @@ fn localvqe_assets(app: tauri::AppHandle) -> Result<Value, String> {
         "models": models,
         "native_ready": library.is_some(),
         "library_path": library.map(|p| p.to_string_lossy().to_string()),
-        "native_dir": native_dir.map(|p| p.to_string_lossy().to_string()),
+        "native_dir": native_dir.to_string_lossy(),
         "native_files": native_files,
         "cli_path": cli.map(|p| p.to_string_lossy().to_string()),
         "process_tap_helper_path": process_tap_helper.map(|p| p.to_string_lossy().to_string()),
@@ -739,7 +1061,10 @@ fn download_localvqe_model_blocking(
         pin.filename
     );
     let mut curl = Command::new("curl");
-    curl.args(["-fL", "--retry", "2", "-o"]).arg(&tmp).arg(&url);
+    // -sS:去掉进度表(否则 curl 把整张进度表写进 stderr,报错时被原样灌进 UI)。
+    curl.args(["-sSfL", "--retry", "2", "-o"])
+        .arg(&tmp)
+        .arg(&url);
     let out =
         command_output_with_timeout(&mut curl, MODEL_DOWNLOAD_TIMEOUT, "LocalVQE model download")?;
     if !out.status.success() {
@@ -857,6 +1182,11 @@ fn validate_browser_url(url: &str) -> Result<String, String> {
         .any(|ch| ch.is_control() || ch.is_whitespace())
     {
         return Err("URL 不能包含空白或控制字符".to_string());
+    }
+    // 系统设置深链(隐私面板跳转):固定 scheme 白名单。此前被 http(s) 门拒掉,
+    // 「授予系统音频权限」按钮点了毫无反应(2026-07-05 修)。
+    if trimmed.starts_with("x-apple.systempreferences:") {
+        return Ok(trimmed.to_string());
     }
     if !(trimmed.starts_with("https://") || trimmed.starts_with("http://")) {
         return Err("仅允许打开 http(s) URL".to_string());
@@ -1031,11 +1361,13 @@ fn start_run(
         }
         // 退出归因:intentional=主动停/重启(本 flag 已被置 true);否则=子进程自己退出(崩溃)。
         let intentional = stop_reader.load(Ordering::SeqCst);
+        let run_state = app_out.state::<RunState>();
+        mark_run_exited(&run_state, &reader_config_path);
+        update_tray_tooltip(&app_out, false);
         let _ = app_out.emit(
             "echoless://exit",
             serde_json::json!({ "intentional": intentional }),
         );
-        cleanup_run_config(&reader_config_path);
     });
 
     // stderr = 人类日志
@@ -1062,6 +1394,7 @@ fn start_run(
         stopping,
         config_path: path,
     });
+    update_tray_tooltip(&app, true);
     Ok(())
 }
 
@@ -1069,7 +1402,11 @@ fn start_run(
 /// 具体能力由 CLI started.supported_controls 上报。
 #[tauri::command]
 fn send_run_control(state: State<RunState>, line: String) -> Result<(), String> {
-    let mut guard = run_state_guard(&state);
+    write_run_control_line(&state, &line)
+}
+
+fn write_run_control_line(state: &RunState, line: &str) -> Result<(), String> {
+    let mut guard = run_state_guard(state);
     let rc = guard.as_mut().ok_or("not running")?;
     let stdin = rc.child.stdin.as_mut().ok_or("no stdin")?;
     stdin
@@ -1081,23 +1418,107 @@ fn send_run_control(state: State<RunState>, line: String) -> Result<(), String> 
 }
 
 #[tauri::command]
-fn stop_run(state: State<RunState>) -> Result<(), String> {
-    let mut guard = run_state_guard(&state);
-    if let Some(mut rc) = guard.take() {
-        rc.stopping.store(true, Ordering::SeqCst); // 主动停 → 其 reader 退出判为 intentional
-        let _ = rc.child.kill();
-        let _ = rc.child.wait();
-        cleanup_run_config(&rc.config_path);
-    }
+fn set_bypass(state: State<RunState>, enabled: bool) -> Result<(), String> {
+    let line = bypass_control_line(enabled);
+    write_run_control_line(&state, &line)
+}
+
+fn bypass_control_line(enabled: bool) -> String {
+    json!({
+        "cmd": "set_bypass",
+        "enabled": enabled,
+    })
+    .to_string()
+}
+
+#[tauri::command]
+fn stop_run(app: tauri::AppHandle, state: State<RunState>) -> Result<(), String> {
+    terminate_run(&state);
+    update_tray_tooltip(&app, false);
     Ok(())
+}
+
+#[tauri::command]
+fn set_tray_prefs(prefs: State<TrayPrefs>, close_to_tray: bool) {
+    set_tray_prefs_inner(&prefs, close_to_tray);
+}
+
+// macOS 设备热插拔监听:CoreAudio 设备列表('dev#')变更即推事件给前端刷新。
+// WKWebView 不触发 navigator.mediaDevices 的 devicechange,只能原生侧监听;
+// Windows 的 WebView2(Chromium)会触发,前端已挂 devicechange,无需原生监听。
+#[cfg(target_os = "macos")]
+mod device_watch {
+    use std::ffi::c_void;
+    use tauri::Emitter;
+
+    // CoreAudio/AudioHardware.h
+    #[repr(C)]
+    struct AudioObjectPropertyAddress {
+        selector: u32,
+        scope: u32,
+        element: u32,
+    }
+
+    const SYSTEM_OBJECT: u32 = 1; // kAudioObjectSystemObject
+    const DEVICES_ADDRESS: AudioObjectPropertyAddress = AudioObjectPropertyAddress {
+        selector: u32::from_be_bytes(*b"dev#"), // kAudioHardwarePropertyDevices
+        scope: u32::from_be_bytes(*b"glob"),    // kAudioObjectPropertyScopeGlobal
+        element: 0,                             // kAudioObjectPropertyElementMain
+    };
+
+    type Listener = extern "C" fn(u32, u32, *const AudioObjectPropertyAddress, *mut c_void) -> i32;
+
+    #[link(name = "CoreAudio", kind = "framework")]
+    extern "C" {
+        fn AudioObjectAddPropertyListener(
+            object_id: u32,
+            address: *const AudioObjectPropertyAddress,
+            listener: Listener,
+            client_data: *mut c_void,
+        ) -> i32;
+    }
+
+    // HAL 通知线程回调:只透传「变了」,枚举仍由前端调 list_devices 完成。
+    extern "C" fn on_devices_changed(
+        _object_id: u32,
+        _num_addresses: u32,
+        _addresses: *const AudioObjectPropertyAddress,
+        client_data: *mut c_void,
+    ) -> i32 {
+        let app = unsafe { &*(client_data as *const tauri::AppHandle) };
+        let _ = app.emit("echoless://devices-changed", ());
+        0
+    }
+
+    pub fn start(app: &tauri::AppHandle) {
+        // AppHandle 有意泄漏成 'static:监听与进程同生命周期,不注销。
+        let client = Box::into_raw(Box::new(app.clone()));
+        let status = unsafe {
+            AudioObjectAddPropertyListener(
+                SYSTEM_OBJECT,
+                &DEVICES_ADDRESS,
+                on_devices_changed,
+                client as *mut c_void,
+            )
+        };
+        if status != 0 {
+            eprintln!("device watch: AudioObjectAddPropertyListener failed ({status})");
+        }
+    }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
+    let builder = tauri::Builder::default()
         .plugin(tauri_plugin_decorum::init())
         .plugin(tauri_plugin_dialog::init())
         .manage(RunState(Mutex::new(None)))
+        .manage(TrayPrefs::default());
+
+    #[cfg(target_os = "windows")]
+    let builder = builder.manage(TrayIconState(Mutex::new(None)));
+
+    builder
         .invoke_handler(tauri::generate_handler![
             get_platform,
             list_devices,
@@ -1116,16 +1537,21 @@ pub fn run() {
             validate_config,
             start_run,
             send_run_control,
-            stop_run
+            set_bypass,
+            stop_run,
+            set_tray_prefs
         ])
         .setup(|app| {
-            // 默认打开基线 1040×640(布局按此定稿);可缩放,设合理 min/max 防止过小/过大破版。
+            // 默认打开基线 1040×640(v17 设计稿画布,布局按此定稿);
+            // B1:min 锁到默认尺寸 —— plate 分格在更小窗口必然破版。
+            // B3:builder 背景色 = 新色板 --bg #1d1d1b,resize 瞬间不露白边。
             let mut builder =
                 WebviewWindowBuilder::new(app, "main", WebviewUrl::App("index.html".into()))
                     .title("Echoless")
                     .inner_size(1040.0, 640.0)
-                    .min_inner_size(960.0, 600.0)
+                    .min_inner_size(1040.0, 640.0)
                     .max_inner_size(1600.0, 1100.0)
+                    .background_color(tauri::window::Color(0x1d, 0x1d, 0x1b, 0xff))
                     .resizable(true)
                     .visible(true);
 
@@ -1150,21 +1576,24 @@ pub fn run() {
             {
                 let _ = window.set_traffic_lights_inset(16.0, 13.0);
             }
+            #[cfg(target_os = "windows")]
+            {
+                register_windows_tray(app)?;
+            }
+            #[cfg(target_os = "macos")]
+            device_watch::start(app.handle());
             let _ = &window;
             Ok(())
         })
         .on_window_event(|window, event| {
-            // 关窗时确保杀掉 echoless 子进程,避免遗留进程占用音频设备。
-            if let WindowEvent::CloseRequested { .. } = event {
-                let child_opt = {
+            if let WindowEvent::CloseRequested { api, .. } = event {
+                let prefs = window.state::<TrayPrefs>();
+                if close_to_tray_enabled(&prefs) {
+                    api.prevent_close();
+                    let _ = window.hide();
+                } else {
                     let state = window.state::<RunState>();
-                    let mut guard = run_state_guard(&state);
-                    guard.take()
-                };
-                if let Some(mut rc) = child_opt {
-                    rc.stopping.store(true, Ordering::SeqCst);
-                    let _ = rc.child.kill();
-                    cleanup_run_config(&rc.config_path);
+                    terminate_run(&state);
                 }
             }
         })
@@ -1227,6 +1656,52 @@ mod tests {
     }
 
     #[test]
+    fn bypass_control_line_matches_runtime_contract() {
+        let enabled: Value = serde_json::from_str(&bypass_control_line(true)).unwrap();
+        assert_eq!(enabled["cmd"], "set_bypass");
+        assert_eq!(enabled["enabled"], true);
+
+        let disabled: Value = serde_json::from_str(&bypass_control_line(false)).unwrap();
+        assert_eq!(disabled["cmd"], "set_bypass");
+        assert_eq!(disabled["enabled"], false);
+    }
+
+    #[test]
+    fn terminate_run_marks_stopping_waits_and_cleans_config() {
+        let dir = unique_temp_dir("echoless-terminate-run");
+        let config_path = dir.join("run.toml");
+        std::fs::write(&config_path, "stub = true").unwrap();
+        let stopping = Arc::new(AtomicBool::new(false));
+        let child = slow_child_command().spawn().unwrap();
+        let state = RunState(Mutex::new(Some(RunChild {
+            child,
+            stopping: stopping.clone(),
+            config_path: config_path.clone(),
+        })));
+
+        terminate_run(&state);
+
+        assert!(stopping.load(Ordering::SeqCst));
+        assert!(run_state_guard(&state).is_none());
+        assert!(!config_path.exists());
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn tray_prefs_default_false_and_follow_platform_gate() {
+        let prefs = TrayPrefs::default();
+        assert!(!prefs.close_to_tray.load(Ordering::SeqCst));
+
+        set_tray_prefs_inner(&prefs, true);
+
+        #[cfg(target_os = "windows")]
+        assert!(prefs.close_to_tray.load(Ordering::SeqCst));
+        #[cfg(not(target_os = "windows"))]
+        assert!(!prefs.close_to_tray.load(Ordering::SeqCst));
+    }
+
+    #[test]
     fn finds_platform_localvqe_native_library() {
         let dir = unique_temp_dir("echoless-localvqe-native");
         let name = if cfg!(target_os = "windows") {
@@ -1257,6 +1732,14 @@ mod tests {
         assert_eq!(
             validate_browser_url("http://example.com/#drivers").unwrap(),
             "http://example.com/#drivers"
+        );
+        // 系统设置深链白名单(隐私面板跳转)。
+        assert_eq!(
+            validate_browser_url(
+                "x-apple.systempreferences:com.apple.preference.security?Privacy_AudioCapture"
+            )
+            .unwrap(),
+            "x-apple.systempreferences:com.apple.preference.security?Privacy_AudioCapture"
         );
 
         for bad in [

@@ -1,21 +1,21 @@
-//! sonora_aec3 节点回归测试。验证 vendored sonora fork 后:
+//! aec3 节点回归测试。验证 vendored aec3 fork 后:
 //!   (1) AEC3 真实消回声;
 //!   (2) 经 fork 开放的 tail 调参口能注入、跑通、不劣化。
-//! 无外部 WAV,纯合成。仅在 sonora-engine 特性下运行(默认开)。
+//! 无外部 WAV,纯合成。仅在 aec3-engine 特性下运行(默认开)。
 //!
-//! 关键经验(调研得来,见 research/sonora_aec3_internal_map.md):
+//! 关键经验(调研得来,见 research/aec3_internal_map.md):
 //!   - 激励必须是**非平稳语音类**信号。AEC3 有 stationarity gate,平稳白噪声会被当
 //!     背景噪声、抑制滤波器自适应(实测平稳白噪声仅 ~8dB,非平稳语音类 20–41dB)。
 //!   - `erle_db` 统计在本路径下恒为常数、不可信(§7);效果以输出能量下降为准。
 //!   - 合成长跑(>10s)效果会随 pause 段累积退化,疑为合成信号 artifact;真实退化
 //!     行为待真实录音验证(Phase 1)。故本测试用 5s 短窗稳定断言。
 
-#![cfg(feature = "sonora-engine")]
+#![cfg(feature = "aec3-engine")]
 
 use echoless_processors::registry;
 
 const SR: usize = 48_000;
-const FRAME: usize = 480; // sonora_aec3 io_spec = 48k
+const FRAME: usize = 480; // aec3 io_spec = 48k
 
 fn white(n: usize) -> f32 {
     let mut x = (n as u64)
@@ -34,10 +34,14 @@ fn refsig(n: usize) -> f32 {
     white(n) * syllable * pause * 1.6
 }
 
+fn set_delay_hold(params: &mut toml::Table, enabled: bool) {
+    params.insert("delay_hold".into(), toml::Value::Boolean(enabled));
+}
+
 /// 跑合成回声场景。`paths` = 各回声径 (延迟样本, 增益);near 为各径叠加,无近端人声。
 /// 返回回声能量下降 dB(跳过前 2 秒收敛)。
 fn run(params: toml::Table, paths: &[(usize, f32)]) -> f32 {
-    let mut p = registry::build("sonora_aec3").unwrap();
+    let mut p = registry::build("aec3").unwrap();
     p.configure(&params).unwrap();
     let far_channels = p.io_spec().far_channels.max(1) as usize;
 
@@ -78,6 +82,115 @@ fn run(params: toml::Table, paths: &[(usize, f32)]) -> f32 {
     20.0 * (mic / out.max(1e-12)).log10() as f32
 }
 
+fn run_with_ref_hole(params: toml::Table, paths: &[(usize, f32)]) -> f32 {
+    let mut p = registry::build("aec3").unwrap();
+    p.configure(&params).unwrap();
+    let far_channels = p.io_spec().far_channels.max(1) as usize;
+
+    let total = SR * 7;
+    let hole_start = SR * 3;
+    let hole_end = hole_start + SR * 3 / 10;
+    let recovery_end = hole_end + SR / 10;
+    let mut near = vec![0.0f32; FRAME];
+    let mut far = vec![0.0f32; FRAME * far_channels];
+    let mut out = vec![0.0f32; FRAME];
+
+    let (mut mic_sq, mut out_sq, mut cnt) = (0.0f64, 0.0f64, 0u64);
+    let mut i = 0;
+    while i + FRAME <= total {
+        for j in 0..FRAME {
+            let n = i + j;
+            let far_sample = if (hole_start..hole_end).contains(&n) {
+                0.0
+            } else {
+                refsig(n)
+            };
+            for ch in 0..far_channels {
+                far[j * far_channels + ch] = far_sample;
+            }
+            let mut echo = 0.0;
+            for &(d, g) in paths {
+                if n >= d {
+                    echo += g * refsig(n - d);
+                }
+            }
+            near[j] = echo;
+        }
+        p.process(&near, &far, &mut out, FRAME as u32);
+        for j in 0..FRAME {
+            let n = i + j;
+            if (hole_end..recovery_end).contains(&n) {
+                mic_sq += (near[j] as f64).powi(2);
+                out_sq += (out[j] as f64).powi(2);
+                cnt += 1;
+            }
+        }
+        i += FRAME;
+    }
+    let mic = (mic_sq / cnt as f64).sqrt();
+    let out = (out_sq / cnt as f64).sqrt();
+    20.0 * (mic / out.max(1e-12)).log10() as f32
+}
+
+fn run_windowed(
+    params: toml::Table,
+    paths: &[(usize, f32)],
+    windows: &[(usize, usize)],
+) -> Vec<f32> {
+    let mut p = registry::build("aec3").unwrap();
+    p.configure(&params).unwrap();
+    let far_channels = p.io_spec().far_channels.max(1) as usize;
+
+    let total = windows
+        .iter()
+        .map(|(_, end)| *end)
+        .max()
+        .unwrap_or(SR * 5)
+        .max(SR * 5);
+    let mut near = vec![0.0f32; FRAME];
+    let mut far = vec![0.0f32; FRAME * far_channels];
+    let mut out = vec![0.0f32; FRAME];
+    let mut accum = vec![(0.0f64, 0.0f64, 0u64); windows.len()];
+
+    let mut i = 0;
+    while i + FRAME <= total {
+        for j in 0..FRAME {
+            let n = i + j;
+            for ch in 0..far_channels {
+                far[j * far_channels + ch] = refsig(n);
+            }
+            let mut echo = 0.0;
+            for &(d, g) in paths {
+                if n >= d {
+                    echo += g * refsig(n - d);
+                }
+            }
+            near[j] = echo;
+        }
+        p.process(&near, &far, &mut out, FRAME as u32);
+        for j in 0..FRAME {
+            let n = i + j;
+            for (window, (mic_sq, out_sq, cnt)) in windows.iter().zip(accum.iter_mut()) {
+                if (window.0..window.1).contains(&n) {
+                    *mic_sq += (near[j] as f64).powi(2);
+                    *out_sq += (out[j] as f64).powi(2);
+                    *cnt += 1;
+                }
+            }
+        }
+        i += FRAME;
+    }
+
+    accum
+        .into_iter()
+        .map(|(mic_sq, out_sq, cnt)| {
+            let mic = (mic_sq / cnt as f64).sqrt();
+            let out = (out_sq / cnt as f64).sqrt();
+            20.0 * (mic / out.max(1e-12)).log10() as f32
+        })
+        .collect()
+}
+
 #[test]
 fn cancels_single_path_echo() {
     // 单径 50ms 回声,默认 config。
@@ -107,8 +220,8 @@ fn stereo_reference_mode_cancels_single_path_echo() {
 }
 
 #[test]
-fn stereo_reference_mode_changes_sonora_io_spec() {
-    let mut p = registry::build("sonora_aec3").unwrap();
+fn stereo_reference_mode_changes_aec3_io_spec() {
+    let mut p = registry::build("aec3").unwrap();
     let mut params = toml::Table::new();
     params.insert(
         "reference_channels".into(),
@@ -118,4 +231,41 @@ fn stereo_reference_mode_changes_sonora_io_spec() {
     p.configure(&params).unwrap();
 
     assert_eq!(p.io_spec().far_channels, 2);
+}
+
+#[test]
+fn delay_hold_recovers_faster_after_reference_hole() {
+    let mut hold_on = toml::Table::new();
+    set_delay_hold(&mut hold_on, true);
+    let mut hold_off = toml::Table::new();
+    set_delay_hold(&mut hold_off, false);
+
+    let on_db = run_with_ref_hole(hold_on, &[(2400, 0.5)]);
+    let off_db = run_with_ref_hole(hold_off, &[(2400, 0.5)]);
+
+    assert!(
+        on_db > off_db + 2.0,
+        "delay_hold 恢复收益不足:on={on_db:.1}dB off={off_db:.1}dB"
+    );
+}
+
+#[test]
+#[ignore = "heavy >60s synthetic AEC3 regression check"]
+fn long_run_energy_reduction_stays_stable_over_60s() {
+    // 2026-07-05 调查定案(三窗口实测 41.1 → 38.3 → 38.1 dB):
+    //   - 所谓「长跑退化」= 刚收敛后的蜜月峰值(5-15s)一次性回落 ~3dB 进入稳态
+    //     平台,25s 后平台平稳(38.3→38.1,Δ0.26dB),不是发散趋势;
+    //   - 与 P4 delay_hold 无关:同 harness 关掉 delay_hold 是 9.6→5.6dB
+    //     (即 §11.6 的严重退化),P4 反而把长跑从 9.6dB 拉到 41dB;
+    //   - 故断言语义改为「平台稳定 + 绝对效果」,不再拿蜜月峰值当基线。
+    let windows = [(SR * 5, SR * 15), (SR * 25, SR * 35), (SR * 55, SR * 65)];
+    let db = run_windowed(toml::Table::new(), &[(2400, 0.5)], &windows);
+    eprintln!("windows(5-15s / 25-35s / 55-65s): {db:?}");
+    let mid_db = db[1];
+    let late_db = db[2];
+
+    assert!(
+        late_db >= mid_db - 1.0 && late_db > 18.0,
+        ">60s AEC3 平台不稳:mid={mid_db:.1}dB late={late_db:.1}dB"
+    );
 }

@@ -47,6 +47,10 @@ pub(super) fn aggregate_estimated_delay_ms(stats: &[ProcessorStats]) -> i32 {
         .unwrap_or(0)
 }
 
+pub(super) fn aggregate_aec3_delay_blocks(stats: &[ProcessorStats]) -> Option<u32> {
+    stats.iter().find_map(|stat| stat.aec3_delay_blocks)
+}
+
 pub(super) fn aggregate_diverged(stats: &[ProcessorStats]) -> bool {
     stats.iter().any(|stat| stat.diverged)
 }
@@ -153,6 +157,7 @@ pub(super) struct RealtimeStats {
     near_delay_ms: u32,
     output_level: u32,
     output_gain_db: Option<f32>,
+    bypassed: bool,
     near_delay_buffered_samples: usize,
     algorithmic_latency_ms: f32,
     status_json: bool,
@@ -180,6 +185,7 @@ pub(super) struct RealtimeStats {
     node_process_time_ms: f32,
     node_runtime_errors: u64,
     aec_estimated_delay_ms: i32,
+    aec3_delay_blocks: Option<u32>,
     node_diverged: bool,
     node_last_error: Option<String>,
 }
@@ -190,6 +196,7 @@ pub(super) struct RealtimeStatsConfig {
     pub(super) frame_ms: u32,
     pub(super) near_delay_ms: u32,
     pub(super) output_level: u32,
+    pub(super) bypassed: bool,
     pub(super) backend: String,
     pub(super) algorithmic_latency_ms: f32,
     pub(super) status_json: bool,
@@ -210,6 +217,7 @@ impl RealtimeStats {
             near_delay_ms: config.near_delay_ms,
             output_level: config.output_level,
             output_gain_db: output_level_gain_db(config.output_level),
+            bypassed: config.bypassed,
             near_delay_buffered_samples: 0,
             algorithmic_latency_ms: config.algorithmic_latency_ms,
             status_json: config.status_json,
@@ -237,6 +245,7 @@ impl RealtimeStats {
             node_process_time_ms: 0.0,
             node_runtime_errors: 0,
             aec_estimated_delay_ms: 0,
+            aec3_delay_blocks: None,
             node_diverged: false,
             node_last_error: None,
         }
@@ -254,6 +263,10 @@ impl RealtimeStats {
     pub(super) fn set_output_level(&mut self, output_level: u32) {
         self.output_level = output_level;
         self.output_gain_db = output_level_gain_db(output_level);
+    }
+
+    pub(super) fn set_bypassed(&mut self, bypassed: bool) {
+        self.bypassed = bypassed;
     }
 
     pub(super) fn set_near_delay_ms(&mut self, near_delay_ms: u32) {
@@ -287,6 +300,7 @@ impl RealtimeStats {
             .max(aggregate_process_time_ms(sample.node_stats));
         self.node_runtime_errors = aggregate_runtime_errors(sample.node_stats);
         self.aec_estimated_delay_ms = aggregate_estimated_delay_ms(sample.node_stats);
+        self.aec3_delay_blocks = aggregate_aec3_delay_blocks(sample.node_stats);
         self.node_diverged = aggregate_diverged(sample.node_stats);
         self.node_last_error = aggregate_last_error(sample.node_stats);
         self.maybe_print();
@@ -397,6 +411,7 @@ impl RealtimeStats {
             "near_delay_buffered_samples": self.near_delay_buffered_samples,
             "output_level": self.output_level,
             "output_gain_db": self.output_gain_db,
+            "bypassed": self.bypassed,
             "mic_dbfs": rms_dbfs(self.near_sq, self.near_samples),
             "ref_dbfs": rms_dbfs(self.far_sq, self.far_samples),
             "out_dbfs": rms_dbfs(self.out_sq, self.out_samples),
@@ -411,6 +426,7 @@ impl RealtimeStats {
             "algorithmic_latency_ms": self.algorithmic_latency_ms,
             "estimated_user_latency_ms": estimated_user_latency_ms,
             "aec_estimated_delay_ms": self.aec_estimated_delay_ms,
+            "aec3_delay_blocks": self.aec3_delay_blocks,
             "mic_input_drops": self.mic_input_drops,
             "ref_input_drops": self.ref_input_drops,
             "input_drops": self.mic_input_drops + self.ref_input_drops,
@@ -467,6 +483,7 @@ mod tests {
             frame_ms: 10,
             near_delay_ms: 25,
             output_level: 75,
+            bypassed: true,
             backend: "localvqe".into(),
             algorithmic_latency_ms: 16.0,
             status_json: true,
@@ -485,6 +502,7 @@ mod tests {
         stats.mic_input_drops = 1;
         stats.ref_input_drops = 2;
         stats.aec_estimated_delay_ms = 48;
+        stats.aec3_delay_blocks = Some(12);
 
         let value = stats.status_value(stats.started + Duration::from_secs(1));
 
@@ -494,10 +512,12 @@ mod tests {
         assert_eq!(value["near_delay_ms"], 25);
         assert_eq!(value["output_level"], 75);
         assert_eq!(value["output_gain_db"], output_level_gain_db(75).unwrap());
+        assert_eq!(value["bypassed"], true);
         assert_eq!(value["input_queue_latency_ms"], 10.0);
         assert_eq!(value["output_queue_latency_ms"], 50.0);
         assert_eq!(value["estimated_user_latency_ms"], 106.0);
         assert_eq!(value["aec_estimated_delay_ms"], 48);
+        assert_eq!(value["aec3_delay_blocks"], 12);
         assert_eq!(value["diagnostics_session_dir"], "diagnostics/session-1");
         assert_eq!(value["recording"], false);
         assert_eq!(value["diagnostics_frames"], 0);
@@ -523,5 +543,9 @@ mod tests {
         stats.set_near_delay_ms(40);
         let value = stats.status_value(stats.started + Duration::from_secs(3));
         assert_eq!(value["near_delay_ms"], 40);
+
+        stats.set_bypassed(false);
+        let value = stats.status_value(stats.started + Duration::from_secs(4));
+        assert_eq!(value["bypassed"], false);
     }
 }

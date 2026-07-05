@@ -1,5 +1,6 @@
-import { useCallback, useEffect, useReducer, useRef } from "react";
+import { useCallback, useEffect, useReducer, useRef, useState } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { getVersion } from "@tauri-apps/api/app";
 import type { UnlistenFn } from "@tauri-apps/api/event";
 import {
   buildConfigToml,
@@ -8,9 +9,11 @@ import {
   getPlatform,
   listDevices,
   listProcessors,
+  localvqeAssets,
   nvafxDoctor,
   nvafxDownloadInstall,
   nvafxInstall,
+  onDevicesChanged,
   onRunEvent,
   onRunExit,
   onRunLog,
@@ -18,10 +21,12 @@ import {
   requestSystemAudio,
   setAec3Agc,
   setAec3Ns,
+  setBypass,
   setInitialDelayMs,
   setLocalvqeNoiseGate,
   setNearDelayMs,
   setOutputLevel,
+  setTrayPrefs,
   startDiagnostics,
   startRun,
   stopDiagnostics,
@@ -56,7 +61,11 @@ import { VolumeWheel } from "./components/VolumeWheel";
 import { RuntimeDiagnosticsPage } from "./components/RuntimeDiagnosticsPage";
 import { RuntimeFooterBars } from "./components/RuntimeFooterBars";
 import { RuntimeSignalPanel } from "./components/RuntimeSignalPanel";
-import { RuntimeStatusStrip } from "./components/RuntimeStatusStrip";
+import {
+  RuntimeStatusStrip,
+  RuntimeSubline,
+  useRunStatusKind,
+} from "./components/RuntimeStatusStrip";
 import { AdvancedPage } from "./pages/AdvancedPage";
 import { EnginePage } from "./pages/EnginePage";
 import { RtxSetupPage } from "./pages/RtxSetupPage";
@@ -66,6 +75,7 @@ import { simMicDoctor, type MicState } from "./mic";
 import {
   publishRuntimeStatus,
   resetRuntimeHealth,
+  resetRuntimeLive,
   setDiagnosticsSessionDir,
 } from "./runtimeTelemetry";
 
@@ -82,10 +92,25 @@ const REQUIRED_RUN_CONTROLS = [
 
 const DEVICE_SELECTION_KEY = "echoless.deviceSelection.v1";
 
+// Windows 托盘偏好(P5 契约):持久化在前端,启动/变更时推给 Rust。
+// UI 只留「关闭到托盘」一个开关(用户定案 2026-07-05:符合一般使用习惯);
+// 最小化到托盘退役,Rust 端恒收 false(旧存档里的 minimizeToTray 忽略)。
+const TRAY_PREFS_KEY = "echoless.trayPrefs.v1";
+export type TrayPrefsState = { closeToTray: boolean };
+function readTrayPrefs(): TrayPrefsState {
+  try {
+    const raw = localStorage.getItem(TRAY_PREFS_KEY);
+    const p = raw ? JSON.parse(raw) : null;
+    return { closeToTray: Boolean(p?.closeToTray) };
+  } catch {
+    return { closeToTray: false };
+  }
+}
+
 // 设备选择值统一用 stable_id(跨重启稳定;mic/output 配置直接吃它)。
 // 选默认输出:优先虚拟声卡(VB-CABLE / BlackHole),否则系统默认。
 function pickDefaultOutput(outs: AudioDevice[]): string {
-  const virt = outs.find((d) => /cable|blackhole|vb-?audio/i.test(d.name));
+  const virt = outs.find((d) => /cable|blackhole|vb-?audio|echoless|null/i.test(d.name));
   if (virt) return virt.stable_id;
   return (
     outs.find((d) => d.is_default)?.stable_id ?? outs[0]?.stable_id ?? "default"
@@ -140,14 +165,49 @@ function pickReference(devices: DeviceList, current: string): string {
   if (referenceSelectionStillExists(devices, current)) return current;
   const sys = devices.reference_sources.find((r) => r.id === "system");
   if (sys?.available) return "system";
+  const monitor = devices.reference_sources.find(
+    (r) => r.available && r.kind === "input" && /monitor/i.test(r.label),
+  );
+  if (monitor) return monitor.selector ?? monitor.id;
   return "none";
 }
 
+function parseDevPlatform(value: string | null): Platform | null {
+  if (value === "win" || value === "windows") return "windows";
+  if (value === "mac" || value === "macos") return "macos";
+  if (value === "linux") return "linux";
+  return null;
+}
+
+function cycleDevPlatform(current: Platform | null): Platform | null {
+  if (current === null || current === "macos") return "windows";
+  if (current === "windows") return "linux";
+  return null;
+}
+
+function platformTag(platform: Platform): string {
+  if (platform === "windows") return "WIN";
+  if (platform === "linux") return "LINUX";
+  return "MAC";
+}
+
+function ioBackendLabel(platform: Platform): string {
+  if (platform === "macos") return "COREAUDIO";
+  if (platform === "linux") return "PIPEWIRE";
+  return "WASAPI";
+}
+
 const MODELS: { kind: string; label: string }[] = [
-  { kind: "sonora_aec3", label: "AEC3" },
-  { kind: "localvqe", label: "LOCALVQE" },
+  { kind: "aec3", label: "AEC3" },
+  { kind: "localvqe", label: "LVQE" },
   { kind: "nvidia_afx_aec", label: "NVAFX" },
 ];
+
+// LocalVQE 官方描述:v1.4 = 纯 AEC(无降噪),v1.3 = AEC + 降噪。
+// 首页 NOISE 开关在 LVQE 下的语义 = 在这两个版本间切换(文件名 "-aec-" 标记纯 AEC)。
+const LVQE_NS_ON_FILE = "localvqe-v1.3-4.8M-f32.gguf";
+const LVQE_NS_OFF_FILE = "localvqe-v1.4-aec-200K-f32.gguf";
+const lvqePureAec = (model: unknown) => String(model ?? "").includes("-aec-");
 
 function modelName(kind: string): string {
   return MODELS.find((m) => m.kind === kind)?.label ?? kind.toUpperCase();
@@ -227,9 +287,11 @@ type AppState = {
   dev: boolean;
   devRtxState: RtxState;
   devMicState: MicState;
-  devWin: boolean;
+  devPlatform: Platform | null;
   io: IoResamplingState;
   rec: boolean;
+  // P8-D1:穿透中(sidecar 活着,mic 直通,AEC 保温)。UI 的「电源 OFF」= 此态。
+  bypassed: boolean;
   diagSeconds: number | null;
   diagDir: string;
 };
@@ -272,18 +334,75 @@ const INITIAL_APP_STATE: AppState = {
   dev: false,
   devRtxState: "runtime_not_installed",
   devMicState: "missing",
-  devWin: false,
+  devPlatform: null,
   io: null,
   rec: false,
+  bypassed: false,
   diagSeconds: null,
   diagDir: "",
 };
 
 const INITIAL_ENGINE_STATE: EngineState = {
-  kind: "sonora_aec3",
+  kind: "aec3",
   pipeline: INITIAL_PIPELINE,
   params: {},
 };
+
+// 引擎配置持久化:kind + pipeline(含 near_delay/output_level)+ 每引擎参数。
+// 模块加载时读一次;之后每次变更由 effect 写回。
+const ENGINE_STATE_KEY = "echoless.engine.v1";
+
+type SavedEngineState = {
+  kind?: string;
+  pipeline?: Partial<PipelineCfg>;
+  paramsByKind?: Record<string, Record<string, unknown>>;
+};
+
+function readSavedEngineState(): SavedEngineState {
+  try {
+    const raw = localStorage.getItem(ENGINE_STATE_KEY);
+    if (!raw) return {};
+    const p = JSON.parse(raw);
+    if (!p || typeof p !== "object") return {};
+    return {
+      kind: typeof p.kind === "string" ? p.kind : undefined,
+      pipeline:
+        p.pipeline && typeof p.pipeline === "object" ? p.pipeline : undefined,
+      paramsByKind:
+        p.paramsByKind && typeof p.paramsByKind === "object"
+          ? p.paramsByKind
+          : undefined,
+    };
+  } catch {
+    return {};
+  }
+}
+
+const SAVED_ENGINE = readSavedEngineState();
+
+function initEngineState(): EngineState {
+  const pl = SAVED_ENGINE.pipeline ?? {};
+  const kind = SAVED_ENGINE.kind ?? INITIAL_ENGINE_STATE.kind;
+  return {
+    kind,
+    pipeline: {
+      sample_rate:
+        typeof pl.sample_rate === "number"
+          ? pl.sample_rate
+          : INITIAL_PIPELINE.sample_rate,
+      frame_ms:
+        typeof pl.frame_ms === "number"
+          ? pl.frame_ms
+          : INITIAL_PIPELINE.frame_ms,
+      reference_channels: pl.reference_channels === "stereo" ? "stereo" : "mono",
+      near_delay_ms:
+        typeof pl.near_delay_ms === "number" ? pl.near_delay_ms : undefined,
+      output_level:
+        typeof pl.output_level === "number" ? pl.output_level : undefined,
+    },
+    params: SAVED_ENGINE.paramsByKind?.[kind] ?? {},
+  };
+}
 
 function initSelection(): SelectionState {
   const saved = readSavedDeviceSelection();
@@ -294,10 +413,36 @@ function initSelection(): SelectionState {
   };
 }
 
+// 浏览器预览直达(设计稿 hash 直链的 app 版):?view=advanced&dev=1&os=linux。
+// Tauri 里没有 query,恒回落初始值。
+function initAppState(): AppState {
+  try {
+    const q = new URLSearchParams(window.location.search);
+    const v = q.get("view");
+    const views: View[] = [
+      "overview",
+      "engine",
+      "advanced",
+      "diagnostics",
+      "rtxsetup",
+      "micsetup",
+    ];
+    return {
+      ...INITIAL_APP_STATE,
+      view: views.includes(v as View) ? (v as View) : "overview",
+      dev: import.meta.env.DEV && q.has("dev"),
+      devPlatform: parseDevPlatform(q.get("os")),
+    };
+  } catch {
+    return INITIAL_APP_STATE;
+  }
+}
+
 function useAppController() {
   const [appState, updateApp] = useReducer(
     patchReducer<AppState>,
-    INITIAL_APP_STATE,
+    undefined,
+    initAppState,
   );
   const [selection, updateSelection] = useReducer(
     patchReducer<SelectionState>,
@@ -306,7 +451,8 @@ function useAppController() {
   );
   const [engineState, updateEngine] = useReducer(
     patchReducer<EngineState>,
-    INITIAL_ENGINE_STATE,
+    undefined,
+    initEngineState,
   );
   const {
     platform,
@@ -322,9 +468,10 @@ function useAppController() {
     dev,
     devRtxState,
     devMicState,
-    devWin,
+    devPlatform,
     io,
     rec,
+    bypassed,
     diagSeconds,
     diagDir,
   } = appState;
@@ -340,12 +487,22 @@ function useAppController() {
   const lastLogRef = useRef<string>("");
   const powerOnRef = useRef(powerOn);
   powerOnRef.current = powerOn;
+  // 供 refreshDevices(mount 时创建的稳定回调)读到最新选择 / 触发最新 applyChange,
+  // 避免闭包里的陈旧 selection 把用户后来改过的设备写回 toml。
+  const selectionRef = useRef(selection);
+  selectionRef.current = selection;
+  const applyChangeRef = useRef(applyChange);
+  applyChangeRef.current = applyChange;
+  const doctorRef = useRef(doctor);
+  doctorRef.current = doctor;
   const pipelineRef = useRef(pipeline);
   pipelineRef.current = pipeline;
   const paramsRef = useRef(params);
   paramsRef.current = params;
-  // 记住每个引擎的参数(如 LocalVQE 选的模型),切换引擎再切回来不丢。
-  const paramsByKind = useRef<Record<string, Record<string, unknown>>>({});
+  // 记住每个引擎的参数(如 LocalVQE 选的模型),切换引擎再切回来不丢。跨重启持久化。
+  const paramsByKind = useRef<Record<string, Record<string, unknown>>>(
+    SAVED_ENGINE.paramsByKind ?? {},
+  );
   const recRef = useRef(rec);
   recRef.current = rec;
   const diagSecondsRef = useRef(diagSeconds);
@@ -400,7 +557,8 @@ function useAppController() {
     listDevices()
       .then((d) => {
         updateApp({ devices: d });
-        updateSelection((cur) => ({
+        const cur = selectionRef.current;
+        const next: SelectionState = {
           selInput: deviceSelectionStillExists(d.inputs, cur.selInput)
             ? cur.selInput
             : pickDefaultInput(d.inputs),
@@ -409,7 +567,44 @@ function useAppController() {
             : pickDefaultOutput(d.outputs),
           // 默认 reference:system 可用就用 system,否则退到 none;用户改过则保留。
           reference: pickReference(d, cur.reference),
-        }));
+        };
+        // 立即同步 ref:一次插拔常连发多个 devicechange,防止后续 refresh
+        // 用陈旧选择重复判定、重复重启。
+        selectionRef.current = next;
+        updateSelection(next);
+        // 运行中设备被拔,选择被迫回退 → 把新设备真正应用到管线(重启 run)。
+        // 只改选中值不重启的话,sidecar 仍抱着已死的输入流:波形冻结、
+        // 采样率徽标停留在旧设备,直到用户手动重选。
+        const override: Override = {};
+        if (next.selInput !== cur.selInput) override.mic = next.selInput;
+        if (next.selOutput !== cur.selOutput) override.output = next.selOutput;
+        if (next.reference !== cur.reference)
+          override.reference = next.reference;
+        if (Object.keys(override).length > 0) applyChangeRef.current(override);
+
+        // 系统音频权限是外部可变状态(用户随时可在系统设置里改;dev 下 TCC 把授权
+        // 记在 responsible process 头上,终端/Cursor 更新即被重置)——doctor 只在
+        // mount 查一次会让「授予权限」按钮在授予后仍挂着。未授予期间搭设备刷新的
+        // 车重查;已授予则零开销。
+        const perm = doctorRef.current?.system_audio_permission;
+        if (perm === "denied" || perm === "undetermined") {
+          doctorAudio()
+            .then((doc) => {
+              updateApp({ doctor: doc });
+              // 授权前创建的 Process Tap 永远输出静音(CoreAudio 不给旧 tap 补活),
+              // 而 P8 电源开关只是 bypass 不重建管线 —— 刚授予 + 正在跑 + 参考静音
+              // 就自动重启一次管线,让 tap 带着新权限重建。
+              if (
+                doc.system_audio_permission === "granted" &&
+                powerOnRef.current &&
+                selectionRef.current.reference === "system" &&
+                telRef.current.ref <= -100
+              ) {
+                applyChangeRef.current({});
+              }
+            })
+            .catch(() => {});
+        }
       })
       .catch((e) => noteError(String(e)));
   }, [noteError]);
@@ -426,15 +621,16 @@ function useAppController() {
       .then((m) => {
         updateApp({ processors: m.processors });
         const proc = m.processors.find((p) => p.kind === kindRef.current);
-        updateEngine((cur) =>
-          Object.keys(cur.params).length === 0
-            ? {
-                ...cur,
-                params:
-                  paramsByKind.current[kindRef.current] ?? defaultParams(proc),
-              }
-            : cur,
-        );
+        // manifest defaults 打底 + 持久化参数覆盖:新版本新增参数时老存档不缺键。
+        updateEngine((cur) => ({
+          ...cur,
+          params: {
+            ...defaultParams(proc),
+            ...(Object.keys(cur.params).length
+              ? cur.params
+              : (paramsByKind.current[kindRef.current] ?? {})),
+          },
+        }));
       })
       .catch((e) => noteError(String(e)));
     doctorAudio()
@@ -447,8 +643,25 @@ function useAppController() {
       .then((diagDir) => updateApp({ diagDir }))
       .catch(() => {});
 
+    // 设备热插拔:三路触发 → 同一个防抖刷新。
+    //   ① 原生 CoreAudio 监听(macOS;WKWebView 不触发 devicechange)
+    //   ② webview devicechange(Windows WebView2 可靠)
+    //   ③ 窗口聚焦 + 下拉展开(兜底)
+    // 300ms 防抖合并连发——一次插拔常触发多个事件,每次刷新都 spawn 一次 CLI 枚举。
+    let devChangeTimer = 0;
+    const refreshDevicesSoon = () => {
+      window.clearTimeout(devChangeTimer);
+      devChangeTimer = window.setTimeout(refreshDevices, 300);
+    };
+    navigator.mediaDevices?.addEventListener?.(
+      "devicechange",
+      refreshDevicesSoon,
+    );
+    window.addEventListener("focus", refreshDevicesSoon);
+
     const uns: UnlistenFn[] = [];
     (async () => {
+      uns.push(await onDevicesChanged(refreshDevicesSoon));
       uns.push(
         await onRunEvent((ev) => {
           if (ev.type === "started") {
@@ -507,13 +720,28 @@ function useAppController() {
           if (ev.type === "localvqe_noise_gate_changed") {
             return;
           }
-          // 诊断录制收尾:writer 已 finalize 文件。仅「录满 max_seconds」时
-          // 自动关开关 + 打开会话目录;stopped / run_exit / error 不弹目录。
+          // 穿透回执:以后端为准校准(乐观更新失败时会被拉回)。
+          if (ev.type === "bypass_changed") {
+            updateApp((state) =>
+              state.bypassed === ev.bypassed
+                ? state
+                : { ...state, bypassed: ev.bypassed },
+            );
+            return;
+          }
+          // 诊断录制收尾:writer 已 finalize 文件。「录满 max_seconds」和
+          // 「手动关录制 stopped」都打开会话目录(录完 = 想看文件);
+          // run_exit / error 不弹(停机/出错时弹窗打扰)。
           if (ev.type === "diagnostics_done") {
             if (ev.reason === "max_seconds") {
               recRef.current = false;
               updateApp({ rec: false });
-              if (ev.session_dir) openPath(ev.session_dir).catch(() => {});
+            }
+            if (
+              (ev.reason === "max_seconds" || ev.reason === "stopped") &&
+              ev.session_dir
+            ) {
+              openPath(ev.session_dir).catch(() => {});
             }
             return;
           }
@@ -537,6 +765,13 @@ function useAppController() {
                 : state,
             );
           }
+          // status 常驻 bypassed 字段:兜底同步(如回执丢失/前端重载)。
+          if (typeof s.bypassed === "boolean") {
+            const sb = s.bypassed;
+            updateApp((state) =>
+              state.bypassed === sb ? state : { ...state, bypassed: sb },
+            );
+          }
           const tel = telRef.current;
           tel.mic = s.mic_dbfs;
           tel.ref = s.ref_dbfs;
@@ -551,7 +786,8 @@ function useAppController() {
       uns.push(
         await onRunExit((ev) => {
           telRef.current.on = false;
-          updateApp({ io: null });
+          resetRuntimeLive(); // 清掉停机后残留的 dBFS / 延迟读数
+          updateApp({ io: null, bypassed: false });
           refSourceRef.current = null;
           cliVersionRef.current = null;
           runControlsRef.current = null;
@@ -576,7 +812,15 @@ function useAppController() {
         }),
       );
     })();
-    return () => uns.forEach((u) => u());
+    return () => {
+      window.clearTimeout(devChangeTimer);
+      navigator.mediaDevices?.removeEventListener?.(
+        "devicechange",
+        refreshDevicesSoon,
+      );
+      window.removeEventListener("focus", refreshDevicesSoon);
+      uns.forEach((u) => u());
+    };
   }, [hasRunControl, noteError, refreshDevices, startDiag]);
 
   // Esc 始终有意义:在次级页按 Esc 返回 Overview。
@@ -607,7 +851,10 @@ function useAppController() {
   }, []);
 
   // 开发态快捷键:按 ~ 切换(在输入框里则正常输入,不触发)。
+  // 仅 dev 构建存在:正式包 import.meta.env.DEV=false,快捷键与 dev 模式
+  // 一并从产物里消失(?dev=1 直链在 Tauri 里本就没有 query,双保险)。
   useEffect(() => {
+    if (!import.meta.env.DEV) return;
     const onTilde = (e: KeyboardEvent) => {
       if (e.key !== "~") return;
       const el = document.activeElement;
@@ -619,15 +866,19 @@ function useAppController() {
     return () => window.removeEventListener("keydown", onTilde);
   }, []);
 
-  // 开发态下按 `(同一物理键不按 Shift)在 Windows / macOS 模拟平台间切换。
+  // 开发态下按 `(同一物理键不按 Shift)在 当前平台 / Windows / Linux 间切换。
   useEffect(() => {
+    if (!import.meta.env.DEV) return;
     const onBacktick = (e: KeyboardEvent) => {
       if (e.key !== "`") return;
       const el = document.activeElement;
       if (el && /^(INPUT|TEXTAREA)$/.test(el.tagName)) return;
       if (!dev) return;
       e.preventDefault();
-      updateApp((state) => ({ ...state, devWin: !state.devWin }));
+      updateApp((state) => ({
+        ...state,
+        devPlatform: cycleDevPlatform(state.devPlatform),
+      }));
     };
     window.addEventListener("keydown", onBacktick);
     return () => window.removeEventListener("keydown", onBacktick);
@@ -647,11 +898,18 @@ function useAppController() {
       .catch(() => {});
   }
 
-  // 用户主动请求系统音频录制权限:触发一次 Process Tap probe(macOS 弹窗),回传更新 doctor。
+  // 用户主动请求系统音频录制权限:helper 显式调 TCCAccessRequest 弹窗,回传更新 doctor。
+  // 未授予时不再自动跳设置(用户否决 2026-07-05),把 CLI 的失败原因如实显示。
   const probeSystemAudio = useCallback(() => {
     noteError(null);
     requestSystemAudio()
-      .then((doctor) => updateApp({ doctor }))
+      .then((doctor) => {
+        updateApp({ doctor });
+        if (doctor.system_audio_permission !== "granted") {
+          const detail = doctor.system_audio_permission_probe?.detail;
+          noteError(detail || "system audio permission was not granted");
+        }
+      })
       .catch((e) => noteError(String(e)));
   }, [noteError]);
 
@@ -730,6 +988,7 @@ function useAppController() {
   async function start() {
     updateApp({ busy: true, err: null });
     resetRuntimeHealth();
+    resetRuntimeLive();
     lastLogRef.current = ""; // 清掉上次的 stderr,避免旧错误误报
     try {
       const toml = currentToml();
@@ -743,7 +1002,8 @@ function useAppController() {
       }
       telRef.current.on = true;
       await startRun(toml, 80);
-      updateApp({ powerOn: true });
+      // 启动即 AEC on(toml 不写 bypass,后端默认 false)。
+      updateApp({ powerOn: true, bypassed: false });
     } catch (e) {
       noteError(String(e));
       telRef.current.on = false;
@@ -760,7 +1020,7 @@ function useAppController() {
       noteError(String(e));
     } finally {
       telRef.current.on = false;
-      updateApp({ powerOn: false, busy: false });
+      updateApp({ powerOn: false, bypassed: false, busy: false });
     }
   }
 
@@ -771,10 +1031,22 @@ function useAppController() {
     else await stop();
   }
 
+  // P8-D1 语义(用户拍板 2026-07-04):电源 OFF = 穿透,mic 绝不变哑。
+  //   sidecar 未跑 → 启动(AEC on);
+  //   AEC on     → set_bypass(true):mic 直通,引擎保温,15ms crossfade;
+  //   穿透中     → set_bypass(false):瞬时恢复 AEC(零重收敛)。
+  // 「完全停机」不是用户级操作(退出应用 = 停);stop() 只服务重启/probe/错误路径。
   async function togglePower() {
     if (busy) return;
     if (powerOn) {
-      await stop();
+      if (!hasRunControl("set_bypass")) {
+        // 旧 CLI 兼容:没有热穿透命令时退回整机停转。
+        await stop();
+        return;
+      }
+      const next = !bypassed;
+      updateApp({ bypassed: next }); // 乐观更新,回执/status 会再校准
+      setBypass(next).catch((e) => noteError(String(e)));
       return;
     }
     // 引擎未就绪(无模型 / doctor 未过)→ 先去 Engine 配置,避免启动即失败。
@@ -782,11 +1054,7 @@ function useAppController() {
       gotoView("engine");
       return;
     }
-    // mac 系统音频参考需 48k;采样率不符 → 去 Advanced 改,避免启动即被后端拒。
-    if (sysRefRateConflict) {
-      gotoView("advanced");
-      return;
-    }
+    // A5 后:tap 采样率由 helper 上报并在后端重采样,系统参考不再要求 48k。
     await start();
   }
 
@@ -834,7 +1102,7 @@ function useAppController() {
     paramsRef.current = np; // 同步更新 ref:探测后自动恢复引擎时能立刻读到新 initial_delay_ms
     paramsByKind.current[kind] = np;
     updateEngine({ params: np });
-    if (kind === "sonora_aec3" && key === "initial_delay_ms") {
+    if (kind === "aec3" && key === "initial_delay_ms") {
       if (powerOnRef.current) {
         if (!hasRunControl("set_initial_delay_ms")) {
           reportMissingRunControl("set_initial_delay_ms");
@@ -849,7 +1117,7 @@ function useAppController() {
       }
       return;
     }
-    if (kind === "sonora_aec3" && (key === "ns" || key === "ns_level")) {
+    if (kind === "aec3" && (key === "ns" || key === "ns_level")) {
       if (powerOnRef.current) {
         if (!hasRunControl("set_aec3_ns")) {
           reportMissingRunControl("set_aec3_ns");
@@ -861,7 +1129,7 @@ function useAppController() {
       }
       return;
     }
-    if (kind === "sonora_aec3" && key === "agc") {
+    if (kind === "aec3" && key === "agc") {
       if (powerOnRef.current) {
         if (!hasRunControl("set_aec3_agc")) {
           reportMissingRunControl("set_aec3_agc");
@@ -892,6 +1160,20 @@ function useAppController() {
       return;
     }
     applyChange({ params: np });
+  }
+  // LVQE 下的 NOISE 开关 = 切模型版本(ON→v1.3 AEC+降噪,OFF→v1.4 纯 AEC)。
+  // 目标版本未下载时跳 Engine 页(那里有下载入口),不生成缺文件的配置。
+  function setLvqeNoise(on: boolean) {
+    const curOn = !lvqePureAec(paramsRef.current.model);
+    if (on === curOn) return; // 已处于目标态
+    const target = on ? LVQE_NS_ON_FILE : LVQE_NS_OFF_FILE;
+    localvqeAssets()
+      .then((a) => {
+        const found = a.models.find((m) => m.filename === target);
+        if (found) pickLocalvqeModel(found.path);
+        else gotoView("engine");
+      })
+      .catch((e) => noteError(String(e)));
   }
   // 选 LocalVQE 模型(清单常驻):原子地切到 localvqe 引擎并设 model,避免把 model 写到当前引擎上。
   function pickLocalvqeModel(path: string) {
@@ -968,10 +1250,12 @@ function useAppController() {
     if (powerOnRef.current && recRef.current) startDiag();
   }, [startDiag]);
 
+  const platformView: Platform = dev && devPlatform ? devPlatform : platform;
+
   // dev 模拟 Windows 时,系统 render loopback 原生可用 → 注入一个 system 参考源,
   // 让 win 预览忠实(真实 win 上后端本就返回 system available;mac 才退 none)。
   const refSources =
-    dev && devWin
+    dev && platformView === "windows"
       ? [
           {
             id: "system",
@@ -984,15 +1268,32 @@ function useAppController() {
           ...(devices?.reference_sources ?? []).filter((r) => r.id !== "system"),
         ]
       : devices?.reference_sources ?? [];
-  // dev win 下默认就选 system(否则沿用真实选择)。
-  const referenceView = dev && devWin ? "system" : reference;
+  // dev win 下默认就选 system;dev linux 没有 system 项,默认退到 none。
+  const referenceView =
+    dev && platformView === "windows"
+      ? "system"
+      : dev && platformView === "linux"
+        ? "none"
+        : reference;
   // reference 概念 = 系统正在播放的声音(输出内容)。只保留有意义的参考源:
   //   system(Process Tap / loopback)、none、output 设备回环、以及承载系统声的虚拟声卡输入
   //   (BlackHole / VB-CABLE)。隐藏物理麦克风等(选它们当参考无意义)。
-  const VIRTUAL_REF = /blackhole|vb-?cable|vb-?audio|cable|loopback|stereo\s*mix|soundflower/i;
+  const VIRTUAL_REF =
+    /blackhole|vb-?cable|vb-?audio|cable|loopback|stereo\s*mix|soundflower|monitor|echoless|null/i;
+  // A2:排除自环 —— Echoless 自己的输出设备(及其同名输入侧,如 BlackHole 的 in 口)
+  // 作参考会把处理后的输出再喂回来,形成回授;从候选里剔掉。
+  const selOutDevName = devices?.outputs.find(
+    (d) => d.stable_id === selOutput,
+  )?.name;
+  const isSelfLoop = (r: (typeof refSources)[number]) =>
+    (r.kind === "output" || r.kind === "input") &&
+    ((r.selector ?? r.id) === selOutput ||
+      r.stable_id === selOutput ||
+      (selOutDevName != null && r.label === selOutDevName));
   const availRefs = refSources.filter(
     (r) =>
       r.available &&
+      !isSelfLoop(r) &&
       (r.kind === "system" ||
         r.kind === "none" ||
         r.kind === "output" ||
@@ -1018,15 +1319,15 @@ function useAppController() {
     };
   });
 
-  // dev 下可把平台模拟成 Windows(按 `),让 mac 也能预览 win 全流程(标题栏/引擎/虚拟麦)。
-  const platformView: Platform = dev && devWin ? "windows" : platform;
   const isMac = platformView === "macos";
   const refSel = dev ? referenceView : reference;
-  const ns = Boolean(params.ns);
-  // 降噪是 AEC3 管线独有(其它 backend 无 ns 参数)→ 不支持时置灰。
-  const nsSupported = Boolean(
-    processors.find((p) => p.kind === kind)?.params?.ns,
-  );
+  // NOISE 开关三种语义:aec3 = ns 参数;localvqe = 模型版本(v1.3 带降噪 / v1.4 纯 AEC);
+  // nvafx 无对应 → 置灰。
+  const isLvqe = kind === "localvqe";
+  const ns = isLvqe ? !lvqePureAec(params.model) : Boolean(params.ns);
+  const nsSupported =
+    isLvqe ||
+    Boolean(processors.find((p) => p.kind === kind)?.params?.ns);
   // 通话 app 里要选的"麦克风"名:由所选输出设备名推导(CABLE Input→CABLE Output;其余同名)。
   const outDev = devices?.outputs.find((d) => d.stable_id === selOutput);
   const cableName = outDev
@@ -1064,12 +1365,59 @@ function useAppController() {
   const usingSysRef = isMac && referenceView === "system";
   const sysAudioDenied = usingSysRef && sysAudioPerm === "denied";
   const sysAudioUndet = usingSysRef && sysAudioPerm === "undetermined";
-  // mac Process Tap reference 要求全局采样率必须 48k(与引擎无关 —— LocalVQE 的 16k
-  // 由 ProcessorChain 内部适配)。不符 → 阻止运行,引导去 Advanced 改采样率。
-  const sysRefRateConflict = usingSysRef && pipeline.sample_rate !== 48000;
+  // UI 电源视觉态 = sidecar 在跑且未穿透。穿透时波形照常流动(mic 活着),
+  // 但字标熄灭 + 控制件调暗(AEC 不在工作)。
+  const uiOn = powerOn && !bypassed;
+
+  // 运行五态(含 A4 防抖):状态盒 / srail 状态字 / zsub 共用同一判定。
+  const statusKind = useRunStatusKind(powerOn, refSel, dev, bypassed);
+
+  // 引擎配置持久化:kind/pipeline/params 任一变更即写回(paramsByKind 随写,
+  // 切引擎再切回、重启 app 都不丢)。
+  useEffect(() => {
+    paramsByKind.current[kind] = params;
+    try {
+      localStorage.setItem(
+        ENGINE_STATE_KEY,
+        JSON.stringify({ kind, pipeline, paramsByKind: paramsByKind.current }),
+      );
+    } catch {
+      /* 持久化失败不阻塞 */
+    }
+  }, [kind, pipeline, params]);
+
+  // Windows 托盘偏好:持久化 + 每次变更(含首个渲染 = 启动同步)推给 Rust。
+  const [trayPrefs, updateTrayPrefs] = useState<TrayPrefsState>(readTrayPrefs);
+  useEffect(() => {
+    try {
+      localStorage.setItem(TRAY_PREFS_KEY, JSON.stringify(trayPrefs));
+    } catch {
+      /* 持久化失败不阻塞 */
+    }
+    setTrayPrefs(trayPrefs.closeToTray).catch(() => {});
+  }, [trayPrefs]);
+
+  // zmeta 版本号(tauri.conf.json 为源)。
+  const [appVersion, setAppVersion] = useState("");
+  useEffect(() => {
+    getVersion()
+      .then(setAppVersion)
+      .catch(() => {});
+  }, []);
+
+  // v14/v17:字标随电源亮灭 —— 熄→亮播 crton(磷光渐暖),亮→熄播 crtoff(衰减)。
+  // render 期 prev 比较(不走 useEffect):首帧不播动画,切换帧同 commit 内定类名。
+  const [wordAnim, setWordAnim] = useState("");
+  const prevPowerRef = useRef(uiOn);
+  if (prevPowerRef.current !== uiOn) {
+    prevPowerRef.current = uiOn;
+    setWordAnim(uiOn ? "igniting" : "dying");
+  }
 
   return (
-    <div className={`window ${isMac ? "mac" : "win"}`}>
+    <div
+      className={`window ${isMac ? "mac" : "win"} ${uiOn ? "" : "sysoff"}`}
+    >
       {/* ---- titlebar ---- */}
       <header className="tbar" data-tauri-drag-region>
         <AppIcon />
@@ -1079,7 +1427,7 @@ function useAppController() {
         <span className="hatch" />
         {dev && (
           <span className="devtag">
-            DEV · {platformView === "windows" ? "WIN" : "MAC"}
+            DEV · {platformTag(platformView)}
           </span>
         )}
         <span className="uid">{modelName(kind)}</span>
@@ -1101,43 +1449,63 @@ function useAppController() {
       {/* ---- content ---- */}
       <main className="content">
         {view === "overview" && (
-        <>
-        <div className="kick">
-          <span className="d">
-            <i />
-            <i />
-            <i />
-          </span>{" "}
-          {t("kicker")}
-        </div>
-        <div className="hero">
-          <div className="word">ECHOLESS</div>
-          <SlideSwitch on={powerOn} onToggle={togglePower} disabled={busy} />
-        </div>
-        <RuntimeStatusStrip
-          powerOn={powerOn}
-          activeReady={activeReady}
-          refSel={refSel}
-          dev={dev}
-          sysRefRateConflict={sysRefRateConflict}
-          sysAudioDenied={sysAudioDenied}
-          sysAudioUndet={sysAudioUndet}
-          onEngineSetup={() => gotoView("engine")}
-          onAdvanced={() => gotoView("advanced")}
-          onProbeSystemAudio={probeSystemAudio}
-        />
+        // v12:铭牌分格 plate —— A 铭牌 / B 电源格 / C 信号链 / D 仪器区
+        <div className="plate">
+        <section className="zone za">
+          <div className="kick">
+            <span className="d">
+              <i />
+              <i />
+              <i />
+            </span>{" "}
+            {t("kicker")}
+          </div>
+          {/* v6.1/v14:半调点阵字标,随电源亮灭 */}
+          <div className="word">
+            <span className={`wtxt ${uiOn ? "lit" : ""} ${wordAnim}`}>
+              ECHOLESS
+            </span>
+          </div>
+          {/* v14:zmeta = 真实运行参数(引擎/管线/采集后端/版本) */}
+          <div className="zmeta">
+            ENGINE{" "}
+            <b>
+              <ScrambleText text={modelName(kind)} />
+            </b>{" "}
+            · {pipeline.sample_rate / 1000} KHZ / {pipeline.frame_ms} MS BLOCK
+            · I/O{" "}
+            <b>
+              <ScrambleText text={ioBackendLabel(platformView)} />
+            </b>
+            {appVersion ? ` · ECHOLESS V${appVersion}` : ""}
+          </div>
+        </section>
 
-        <hr className="hair" />
+        <section className="zone zb">
+          <div className="zhead">Power</div>
+          <SlideSwitch on={uiOn} onToggle={togglePower} disabled={busy} />
+          <RuntimeStatusStrip statusKind={statusKind} />
+          <RuntimeSubline
+            statusKind={statusKind}
+            activeReady={activeReady}
+            sysAudioDenied={sysAudioDenied}
+            sysAudioUndet={sysAudioUndet}
+            onEngineSetup={() => gotoView("engine")}
+            onProbeSystemAudio={probeSystemAudio}
+            onCheckSetup={() => gotoView("diagnostics")}
+          />
+        </section>
 
-        {/* ---- controls ---- */}
-        <div className="rows">
-          <div className="row">
-            <span className="bul">•</span>
-            <span className="k">{t("input")}</span>
+        {/* ---- C 信号链:01-04 站点 ---- */}
+        <section className="zone zc">
+          <div className="station">
+            <span className="stnum">01</span>
+            <span className="stkey">{t("input")}</span>
             <span className="co">:</span>
             <span className="v">
               <Dropdown
                 value={selInput}
+                onOpen={refreshDevices}
                 options={(devices?.inputs ?? []).map((d) => ({
                   value: d.stable_id,
                   label: d.name,
@@ -1163,24 +1531,23 @@ function useAppController() {
             </span>
           </div>
 
-          <div className="row">
-            <span className="bul">•</span>
-            <span className="k">{t("model")}</span>
+          <div className="station">
+            <span className="stnum">02</span>
+            <span className="stkey">{t("model")}</span>
             <span className="co">:</span>
             <div className="segg" id="models">
               {MODELS.map((m) => {
                 const proc = processors.find((p) => p.kind === m.kind);
                 const supported =
                   !proc || proc.platforms.includes(platform) || dev;
-                const exp = proc?.experimental;
                 const rdy = engineReady(m.kind);
                 return (
                   <button
                     type="button"
                     key={m.kind}
                     className={`b ${kind === m.kind ? "active" : ""} ${
-                      exp ? "exp" : ""
-                    } ${supported && !rdy ? "unready" : ""}`}
+                      supported && !rdy ? "unready" : ""
+                    }`}
                     disabled={!supported}
                     onClick={() => {
                       // 未就绪(LocalVQE 无模型 / NVAFX doctor 未过):跳 Engine 配置,不生成非法配置。
@@ -1205,6 +1572,7 @@ function useAppController() {
                 align="right"
                 warn={referenceView === "none"}
                 value={referenceView}
+                onOpen={refreshDevices}
                 options={refOptions}
                 onChange={(v) => {
                   updateSelection({ reference: v });
@@ -1217,13 +1585,14 @@ function useAppController() {
             </span>
           </div>
 
-          <div className="row">
-            <span className="bul">•</span>
-            <span className="k">{t("output")}</span>
+          <div className="station">
+            <span className="stnum">03</span>
+            <span className="stkey">{t("output")}</span>
             <span className="co">:</span>
             <span className="v">
               <Dropdown
                 value={selOutput}
+                onOpen={refreshDevices}
                 options={(devices?.outputs ?? []).map((d) => ({
                   value: d.stable_id,
                   label: d.name,
@@ -1251,40 +1620,53 @@ function useAppController() {
             </span>
           </div>
 
-          <div className="row">
-            <span className="bul">•</span>
-            <span className="k">{t("noise")}</span>
+          <div className="station">
+            <span className="stnum">04</span>
+            <span className="stkey">{t("noise")}</span>
             <span className="co">:</span>
             <div className={`segg ${nsSupported ? "" : "dim"}`} id="ns">
               <button
                 type="button"
                 className={`b ${ns ? "active" : ""}`}
-                onClick={() => setParam("ns", true)}
+                onClick={() =>
+                  isLvqe ? setLvqeNoise(true) : setParam("ns", true)
+                }
               >
                 ON
               </button>
               <button
                 type="button"
                 className={`b ${!ns ? "active" : ""}`}
-                onClick={() => setParam("ns", false)}
+                onClick={() =>
+                  isLvqe ? setLvqeNoise(false) : setParam("ns", false)
+                }
               >
                 OFF
               </button>
             </div>
             <span className="sp" />
             <span className="meta">
-              {nsSupported ? t("reduceNoise") : "AEC3 only"}
+              {isLvqe
+                ? t("lvqeNsHint")
+                : nsSupported
+                  ? t("reduceNoise")
+                  : "AEC3 only"}
             </span>
             <span className="ico">
               <IcoNoise />
             </span>
           </div>
+        </section>
+
+        {/* ---- D 仪器区 ---- */}
+        <section className="zone zd">
+          <RuntimeSignalPanel
+            telRef={telRef}
+            powerOn={powerOn}
+            statusKind={statusKind}
+          />
+        </section>
         </div>
-
-        <hr className="hair" />
-
-        <RuntimeSignalPanel telRef={telRef} powerOn={powerOn} />
-        </>
         )}
         {view === "engine" && (
           <EnginePage
@@ -1339,6 +1721,10 @@ function useAppController() {
             output={selOutput}
             running={powerOn}
             onSetRun={setRunForProbe}
+            trayPrefs={trayPrefs}
+            onTrayPrefs={(patch) =>
+              updateTrayPrefs((cur) => ({ ...cur, ...patch }))
+            }
           />
         )}
         {view === "diagnostics" && (
@@ -1374,7 +1760,6 @@ function useAppController() {
             <button
               type="button"
               className="link"
-              style={linkStyle}
               onClick={() => gotoView("engine")}
             >
               {t("engine")} <span className="mk">&gt;&gt;&gt;</span>
@@ -1382,7 +1767,6 @@ function useAppController() {
             <button
               type="button"
               className="link"
-              style={linkStyle}
               onClick={() => gotoView("advanced")}
             >
               {t("advanced")} <span className="mk">&gt;&gt;&gt;</span>
@@ -1390,7 +1774,6 @@ function useAppController() {
             <button
               type="button"
               className="link"
-              style={linkStyle}
               onClick={() => gotoView("diagnostics")}
             >
               {t("diagnostics")} <span className="mk">&gt;&gt;&gt;</span>
@@ -1400,7 +1783,6 @@ function useAppController() {
           <button
             type="button"
             className="link"
-            style={linkStyle}
             onClick={() =>
               gotoView(
                 view === "rtxsetup"
@@ -1424,12 +1806,12 @@ function useAppController() {
           <VolumeWheel
             volume={pipeline.output_level ?? 50}
             onChange={changeOutVolume}
+            invertWheel={isMac}
           />
           {err ? (
             <button
               type="button"
               className="stamp err plainbtn"
-              style={{ color: "var(--warn)", cursor: "pointer" }}
               title={`${err} · 点击关闭`}
               onClick={() => noteError(null)}
             >
@@ -1440,11 +1822,172 @@ function useAppController() {
             <>
               <span className="fdot">·</span>
               <span className="stamp">{stamp}</span>
+              <span className="fdot">·</span>
+              {/* v3:UPTIME 走表(动效只证明系统活着) */}
+              <UptimeStamp powerOn={powerOn} />
             </>
           )}
         </span>
         <RuntimeFooterBars telRef={telRef} powerOn={powerOn} />
       </footer>
+
+      {/* v10 动态底噪(WebGL shader,见 TvNoise 注释);OFF 时随 sysoff 渐隐停走 */}
+      <TvNoise active={uiOn} />
+      {/* v6 VHS 亮带(transform 合成器动画);OFF 时随 sysoff 渐隐暂停 */}
+      <div className="vhs" aria-hidden="true">
+        <i className="band" />
+        <i className="line" />
+      </div>
+    </div>
+  );
+}
+
+// 动态底噪 v4:WebGL 逐项复刻 feTurbulence(type=turbulence, baseFrequency=1.15,
+// numOctaves=1),每帧一次 draw call,CPU 归零(原版 SMIL 滤镜 = 320% CPU)。
+// 复刻要点(三轮反馈的最终结论):
+//   · value noise(晶格 + smoothstep 插值)= 平滑连续场 —— 质感的关键;
+//     逐像素独立 hash 是椒盐白噪,又硬又脏;
+//   · |2n-1| 折叠 = turbulence 的 |noise|,分布偏 0,白底上大多近乎透明;
+//   · px uniform = baseFrequency/dpr,晶格按 CSS 像素网格(与 SVG 滤镜一致)。
+const NOISE_FS = `precision highp float;
+uniform float t;
+uniform float px;
+float h(vec2 p) {
+  return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453123);
+}
+float vn(vec2 p, float s) {
+  vec2 i = floor(p);
+  vec2 f = fract(p);
+  vec2 u = f * f * (3.0 - 2.0 * f);
+  return mix(
+    mix(h(i + s), h(i + s + vec2(1.0, 0.0)), u.x),
+    mix(h(i + s + vec2(0.0, 1.0)), h(i + s + vec2(1.0, 1.0)), u.x),
+    u.y
+  );
+}
+float tb(vec2 p, float s) {
+  return abs(vn(p, s) * 2.0 - 1.0);
+}
+void main() {
+  vec2 p = gl_FragCoord.xy * px;
+  vec3 rgb = vec3(tb(p, t), tb(p, t + 17.0), tb(p, t + 41.0));
+  float a = tb(p, t + 89.0);
+  // alpha 恒等折叠:multiply 下 (rgb, a) 与 (mix(1,rgb,a), 1) 逐像素等价。
+  // 输出全不透明,绕开 WKWebView 对 premultipliedAlpha:false 画布的
+  // unpremultiply 溢出(a→0 像素爆成高饱和彩点 = 椒盐,用户三轮反馈根源)。
+  gl_FragColor = vec4(mix(vec3(1.0), rgb, a), 1.0);
+}`;
+const NOISE_VS = `attribute vec2 a;
+void main() { gl_Position = vec4(a, 0.0, 1.0); }`;
+
+function TvNoise({ active }: { active: boolean }) {
+  const ref = useRef<HTMLCanvasElement>(null);
+  const activeRef = useRef(active);
+  activeRef.current = active;
+  const scheduleRef = useRef<() => void>(() => {});
+  useEffect(() => {
+    const canvas = ref.current;
+    if (!canvas) return;
+    const gl = canvas.getContext("webgl", {
+      alpha: false, // 输出全不透明(alpha 已折进颜色),跨引擎合成零歧义
+      antialias: false,
+      depth: false,
+      stencil: false,
+      powerPreference: "low-power",
+      preserveDrawingBuffer: true, // 截图/快照可读回;全屏重画场景无性能代价
+    });
+    if (!gl) return; // 无 WebGL:静默无噪点(氛围件,不值得再养 fallback)
+
+    const compile = (type: number, src: string) => {
+      const s = gl.createShader(type)!;
+      gl.shaderSource(s, src);
+      gl.compileShader(s);
+      return s;
+    };
+    const prog = gl.createProgram()!;
+    gl.attachShader(prog, compile(gl.VERTEX_SHADER, NOISE_VS));
+    gl.attachShader(prog, compile(gl.FRAGMENT_SHADER, NOISE_FS));
+    gl.linkProgram(prog);
+    if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) return;
+    gl.useProgram(prog);
+    // 全屏三角形
+    const buf = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+    gl.bufferData(
+      gl.ARRAY_BUFFER,
+      new Float32Array([-1, -1, 3, -1, -1, 3]),
+      gl.STATIC_DRAW,
+    );
+    const loc = gl.getAttribLocation(prog, "a");
+    gl.enableVertexAttribArray(loc);
+    gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
+    const tLoc = gl.getUniformLocation(prog, "t");
+    const pxLoc = gl.getUniformLocation(prog, "px");
+
+    // 画布按设备物理像素渲染(retina 不糊),噪声晶格按 CSS 像素网格
+    // (px = baseFrequency / dpr)—— 两者同 feTurbulence 的栅格化行为。
+    const fit = () => {
+      const dpr = window.devicePixelRatio || 1;
+      const w = Math.max(1, Math.round(canvas.clientWidth * dpr));
+      const h = Math.max(1, Math.round(canvas.clientHeight * dpr));
+      if (canvas.width !== w || canvas.height !== h) {
+        canvas.width = w;
+        canvas.height = h;
+        gl.viewport(0, 0, w, h);
+      }
+      // 1.35:较设计稿 baseFrequency 1.15 晶格更密 → 颗粒更细(用户定档)
+      gl.uniform1f(pxLoc, 1.35 / dpr);
+    };
+    const reduce = matchMedia("(prefers-reduced-motion: reduce)").matches;
+    let raf = 0;
+    let seed = 2;
+    const draw = () => {
+      fit();
+      gl.uniform1f(tLoc, seed);
+      gl.drawArrays(gl.TRIANGLES, 0, 3);
+    };
+    const frame = () => {
+      raf = 0;
+      // t 保持小数值域(hash 的 sin 精度),循环推进
+      seed = (seed + 0.618) % 61.0;
+      draw();
+      // OFF(穿透/停机)时停走:动效只属于活着的系统;CSS 同步渐隐
+      if (!reduce && !document.hidden && activeRef.current)
+        raf = requestAnimationFrame(frame);
+    };
+    const schedule = () => {
+      if (!raf) raf = requestAnimationFrame(frame);
+    };
+    scheduleRef.current = schedule;
+    const onVisibility = () => {
+      if (document.hidden) {
+        if (raf) cancelAnimationFrame(raf);
+        raf = 0;
+      } else schedule();
+    };
+    const ro = new ResizeObserver(() => {
+      draw(); // resize 立即补一帧,避免拉伸残影
+    });
+    ro.observe(canvas);
+    document.addEventListener("visibilitychange", onVisibility);
+    if (reduce) draw();
+    else schedule();
+    return () => {
+      // 不 loseContext:StrictMode 双挂载下同一 canvas 的 context 丢失后
+      // 无法复活(getContext 返回同一个已死实例),会让噪声永久空白。
+      // 组件与 App 同生命周期,context 随窗口销毁即可。
+      if (raf) cancelAnimationFrame(raf);
+      ro.disconnect();
+      document.removeEventListener("visibilitychange", onVisibility);
+      scheduleRef.current = () => {};
+    };
+  }, []);
+  useEffect(() => {
+    if (active) scheduleRef.current(); // 重新上电 → 恢复走噪
+  }, [active]);
+  return (
+    <div className="tvnoise" aria-hidden="true">
+      <canvas ref={ref} />
     </div>
   );
 }
@@ -1453,15 +1996,26 @@ export default function App() {
   return useAppController();
 }
 
-const linkStyle: React.CSSProperties = {
-  color: "var(--t-soft)",
-  textDecoration: "none",
-  display: "flex",
-  alignItems: "center",
-  gap: 7,
-  background: "transparent",
-  border: "none",
-  font: "inherit",
-  letterSpacing: "inherit",
-  textTransform: "inherit",
-};
+// UPTIME 走表:开机从零计,关机冻结最后读数(v3 原则 #5)。
+// ref 直写 DOM:每秒走字不进 React 渲染;vdom 文本恒定,父级重渲不会覆写。
+function UptimeStamp({ powerOn }: { powerOn: boolean }) {
+  const ref = useRef<HTMLSpanElement>(null);
+  useEffect(() => {
+    if (!powerOn) return; // 冻结显示,保留最后读数
+    const start = performance.now();
+    if (ref.current) ref.current.textContent = "UP 00:00:00";
+    const iv = window.setInterval(() => {
+      const s = Math.floor((performance.now() - start) / 1000);
+      const hh = String(Math.floor(s / 3600)).padStart(2, "0");
+      const mm = String(Math.floor(s / 60) % 60).padStart(2, "0");
+      const ss = String(s % 60).padStart(2, "0");
+      if (ref.current) ref.current.textContent = `UP ${hh}:${mm}:${ss}`;
+    }, 1000);
+    return () => window.clearInterval(iv);
+  }, [powerOn]);
+  return (
+    <span className="stamp" ref={ref}>
+      UP 00:00:00
+    </span>
+  );
+}

@@ -14,17 +14,17 @@ import {
 } from "../api";
 import { useI18n } from "../i18n";
 
-// LocalVQE 官方模型(HF repo)。default=随 app 打包的默认模型。
+// Official LocalVQE models from HF. The default is recommended, not bundled.
+// 行内只标参数量(体积不上行 —— 列宽预算有限,详情看 hover title)。
 const LVQE_MODELS: {
   file: string;
   ver: string;
   params: string;
-  size: string;
   def?: boolean;
 }[] = [
-  { file: "localvqe-v1.3-4.8M-f32.gguf", ver: "v1.3", params: "4.8M", size: "~18 MB", def: true },
-  { file: "localvqe-v1.2-1.3M-f32.gguf", ver: "v1.2", params: "1.3M", size: "~5 MB" },
-  { file: "localvqe-v1.1-1.3M-f32.gguf", ver: "v1.1", params: "1.3M", size: "~5 MB" },
+  { file: "localvqe-v1.4-aec-200K-f32.gguf", ver: "v1.4", params: "200K" },
+  { file: "localvqe-v1.3-4.8M-f32.gguf", ver: "v1.3", params: "4.8M", def: true },
+  { file: "localvqe-v1.2-1.3M-f32.gguf", ver: "v1.2", params: "1.3M" },
 ];
 
 // 引擎能力画像(前端描述性数据,非配置 contract)。
@@ -42,31 +42,31 @@ interface Profile {
 }
 const PROFILES: Profile[] = [
   {
-    kind: "sonora_aec3",
+    kind: "aec3",
     name: "AEC3",
     tier: { en: "DEFAULT", zh: "默认" },
     echo: 9,
     voice: 6,
     cost: "CPU · light",
     sr: "48k / 16k",
-    os: "Win · mac",
+    os: "Win · mac · Linux",
   },
   {
     kind: "localvqe",
     name: "LOCALVQE",
     tier: { en: "EXPERIMENTAL", zh: "试验" },
-    echo: 8,
-    voice: 6,
+    echo: 9,
+    voice: 5,
     cost: "CPU · neural",
-    sr: "16k only",
-    os: "Win · mac",
+    sr: "16k · auto 48 ↔ 16", // A6:管线级自动重采样适配,如实标注
+    os: "Win · mac · Linux",
   },
   {
     kind: "nvidia_afx_aec",
     name: "NVAFX",
     tier: { en: "CLEANEST VOICE", zh: "人声最干净" },
     echo: 7,
-    voice: 10,
+    voice: 9,
     cost: "GPU · Tensor Core",
     sr: "16k / 48k",
     os: "Win · only",
@@ -198,8 +198,11 @@ function NvafxCard({
           <div className="epair">
             <span className="mk">»</span> {t("engPair")}
           </div>
+          {/* Maxine SDK 许可要求:集成应用须在应用内做品牌归属(README/release 已有,
+              这里是 UI 侧唯一归属点)。 */}
+          <div className="epair">powered by NVIDIA Maxine</div>
         </div>
-        <div className="ecol nvcol">
+        <div className={`ecol nvcol ${nvSupported ? "" : "nvna"}`}>
           {!nvSupported ? (
             <div className="cdetail na">{t("engWinOnly")}</div>
           ) : (
@@ -237,7 +240,12 @@ function NvafxCard({
                   className="dopen"
                   onClick={(e) => {
                     e.stopPropagation();
-                    onRecheck((params.runtime_dir as string) || undefined);
+                    // B8:与左侧 dpick 显示同源 —— 检查的就是展示的那个目录。
+                    onRecheck(
+                      (params.runtime_dir as string) ||
+                        nv?.runtime_dir ||
+                        undefined,
+                    );
                   }}
                 >
                   {t("engRecheck")} <span className="mk">↻</span>
@@ -279,7 +287,7 @@ export function EnginePage({
 }: Props) {
   const { t, lang } = useI18n();
 
-  // LocalVQE 可用模型(下载目录 + 打包资源);选中 localvqe 时拉取。
+  // Available LocalVQE models/native runtime.
   const [lvAssets, setLvAssets] = useState<LocalvqeAssets | null>(null);
   const [lvDl, setLvDl] = useState<string | null>(null);
   const [lvErr, setLvErr] = useState<string | null>(null);
@@ -299,7 +307,6 @@ export function EnginePage({
       setLvDl(null);
     }
   }
-
   const proc = (k: string) => processors.find((p) => p.kind === k);
   // 开发态(dev)临时解开 NVAFX 平台/doctor 门槛,用于走通前端流程。
   const supported = (k: string) =>
@@ -331,16 +338,18 @@ export function EnginePage({
               e.stopPropagation();
               found ? onPickModel(found.path) : downloadModel(m.file);
             }}
-            title={found ? found.path : `${t("lvqeDownload")} · ${m.file}`}
+            title={`${m.ver} · ${m.params} · ${found ? found.path : `${t("lvqeDownload")} ${m.file}`}`}
           >
             <span className={`lvbox ${found ? "ok" : "miss"}`}>{box}</span>
             <span className="lvver">{m.ver}</span>
-            {m.def && <i className="lvdef">{t("lvqeDefault")}</i>}
+            {m.def && (
+              <i className="lvdef" title={t("lvqeDefaultHint")}>
+                {t("lvqeDefault")}
+              </i>
+            )}
             <span className="lvsp" />
             <span className="lvms">
               <span className="lvp">{m.params}</span>
-              <span className="lvsep">·</span>
-              <span className="lvz">{m.size}</span>
             </span>
           </button>
         );
@@ -358,12 +367,18 @@ export function EnginePage({
           {t("lvqeOpenDir")} <span className="mk">↗</span>
         </button>
       </div>
+      {/* native runtime 随包分发(2026-07-05 定案),正常永远就绪;
+          这条 warn 只兜 dev 环境资源缺失的病态 case,不提供下载按钮 */}
       {lvAssets && !lvAssets.native_ready && (
         <div className="cdetail warn" title={lvAssets.native_dir ?? undefined}>
           {t("lvqeRuntimeMissing")}
         </div>
       )}
-      {lvErr && <div className="cdetail warn">{lvErr}</div>}
+      {lvErr && (
+        <div className="cdetail warn lverr" title={lvErr}>
+          {lvErr}
+        </div>
+      )}
     </div>
   );
 

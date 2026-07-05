@@ -1,23 +1,23 @@
 //! echoless-processors — 统一回声处理节点。
 //!
-//! 关键架构(蓝本 §7):sonora 经典 AEC3 与 LocalVQE 都是平级的 `EchoProcessor` 节点,
+//! 关键架构(蓝本 §7):aec3 经典 AEC3 与 LocalVQE 都是平级的 `EchoProcessor` 节点,
 //! **没有「主引擎 + 残余」的固定主从**。怎么组合由配置决定:可单开、可串联、可自由组合、可扩展。
 //! 加新方案 = 再写一个 `impl EchoProcessor` 并在 registry 注册,其余 crate 不动。
 
 use serde::{Deserialize, Serialize};
 
+pub mod aec3;
 pub mod chain;
 mod dsp;
 pub mod localvqe;
 pub mod nvafx;
 pub mod passthrough;
 pub mod registry;
-pub mod sonora_aec3;
 
 pub use chain::{chain_from_nodes, ProcessorChain};
 
 /// 处理器的「天然处理域」。`ProcessorChain` 在节点边界按它自动重采样 + 声道适配。
-/// 例:SonoraAec3 = {48000, near 1ch, far 2ch};LocalVqe = {16000, near 1ch, far 1ch}。
+/// 例:Aec3Engine = {48000, near 1ch, far 2ch};LocalVqe = {16000, near 1ch, far 1ch}。
 #[derive(Clone, Copy, Debug)]
 pub struct IoSpec {
     pub sample_rate: u32,
@@ -33,6 +33,7 @@ pub struct ProcessorStats {
     pub erle_db: f32,
     pub residual_echo_likelihood: f32,
     pub estimated_delay_ms: i32,
+    pub aec3_delay_blocks: Option<u32>,
     pub diverged: bool,
     pub mic_clipped: bool,
     pub process_time_ms: f32,
@@ -49,6 +50,7 @@ impl ProcessorStats {
             erle_db: 0.0,
             residual_echo_likelihood: 0.0,
             estimated_delay_ms: 0,
+            aec3_delay_blocks: None,
             diverged: false,
             mic_clipped: false,
             process_time_ms: 0.0,

@@ -9,6 +9,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
 use clap::Args;
+use echoless_core::default_near_delay_ms;
 use serde_json::json;
 
 use crate::dsp::rms_dbfs;
@@ -54,8 +55,8 @@ pub(crate) fn cmd_probe_delay(a: ProbeDelayArgs) -> Result<()> {
     if !cfg!(feature = "realtime") {
         bail!("probe-delay 需 realtime 特性(cpal)");
     }
-    if !(cfg!(target_os = "macos") || cfg!(windows)) {
-        bail!("probe-delay 当前只支持 macOS Process Tap reference 与 Windows WASAPI loopback reference");
+    if !(cfg!(target_os = "macos") || cfg!(windows) || cfg!(target_os = "linux")) {
+        bail!("probe-delay 当前只支持 macOS / Windows / Linux");
     }
     if !a.startup_delay.is_finite() || a.startup_delay < 0.0 {
         bail!("--startup-delay 必须是非负有限数");
@@ -284,6 +285,21 @@ fn run_native_delay_probe(
         a.json,
         format!("playing beep train: {}", beep_path.display()),
     );
+    // GUI 同步点:蜂鸣列车即将开播。stdout 只留最终 JSON,进度走 stderr JSONL,
+    // 前端据此把 12 点进度灯对齐到真实播放时刻(此前按墙钟猜,音画不同步)。
+    if a.json {
+        eprintln!(
+            "{}",
+            serde_json::json!({
+                "type": "probe_progress",
+                "stage": "beep_train_start",
+                "pre_roll_ms": PROBE_PRE_ROLL_S * 1000.0,
+                "beep_ms": PROBE_BEEP_MS,
+                "gap_ms": PROBE_GAP_MS,
+                "beeps": a.beeps,
+            })
+        );
+    }
     play_probe_beep(a, beep_path)?;
 
     let finish_deadline = Instant::now() + Duration::from_secs(u64::from(diagnostic_seconds) + 2);
@@ -329,7 +345,54 @@ fn play_probe_beep(a: &ProbeDelayArgs, beep_path: &Path) -> Result<()> {
     crate::realtime::play_mono_samples_to_output(selector, PROBE_SAMPLE_RATE, samples)
 }
 
-#[cfg(all(feature = "realtime", not(any(target_os = "macos", windows))))]
+// Linux:参考是 PipeWire/Pulse 的 monitor source,把它映射回被监听的 sink 再播蜂鸣。
+// 命名约定核实自 pipewire 源码(module-protocol-pulse/pulse-server.c):
+//   节点名 = "<sink_name>.monitor"(:767,官方也用该后缀判定 :2124);
+//   描述名 = "Monitor of <sink_desc>"(:3998)。
+// 映射失败时回退默认输出(常见场景 monitor 的就是默认 sink)——beep 只要从被
+// 监听的 sink 出声,分析就成立;彻底播错设备时 probe 会以 ref silent 告警收场。
+#[cfg(all(feature = "realtime", target_os = "linux"))]
+fn play_probe_beep(a: &ProbeDelayArgs, beep_path: &Path) -> Result<()> {
+    let samples = read_probe_beep_samples(beep_path)?;
+    if let Some(stem) = monitor_reference_output_stem(&a.reference)? {
+        match crate::realtime::play_mono_samples_to_output(
+            Some(&stem),
+            PROBE_SAMPLE_RATE,
+            samples.clone(),
+        ) {
+            Ok(()) => return Ok(()),
+            Err(err) => {
+                eprintln!("probe-delay: monitor→sink 映射播放失败({stem}): {err};回退默认输出")
+            }
+        }
+    }
+    crate::realtime::play_mono_samples_to_output(None, PROBE_SAMPLE_RATE, samples)
+}
+
+/// monitor 参考名 → 被监听 sink 的名字片段(cpal 输出设备 selector)。
+/// None = 用默认输出。纯字符串逻辑,单测在所有平台跑。
+#[cfg_attr(not(all(feature = "realtime", target_os = "linux")), allow(dead_code))]
+fn monitor_reference_output_stem(reference: &str) -> Result<Option<String>> {
+    let reference = reference.trim();
+    match reference {
+        "" | "default" | "system" => Ok(None),
+        "none" => bail!("probe-delay 需要可播放的 reference;当前 reference=none"),
+        value => {
+            let name = value.strip_prefix("input:").unwrap_or(value).trim();
+            let stem = name
+                .strip_prefix("Monitor of ")
+                .unwrap_or(name)
+                .trim_end_matches(".monitor")
+                .trim();
+            Ok((!stem.is_empty()).then(|| stem.to_string()))
+        }
+    }
+}
+
+#[cfg(all(
+    feature = "realtime",
+    not(any(target_os = "macos", windows, target_os = "linux"))
+))]
 fn play_probe_beep(_a: &ProbeDelayArgs, _beep_path: &Path) -> Result<()> {
     bail!("当前平台没有 probe-delay 蜂鸣播放实现");
 }
@@ -357,7 +420,7 @@ fn reference_playback_output_selector(reference: &str) -> Result<Option<&str>> {
     }
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 fn read_probe_beep_samples(beep_path: &Path) -> Result<Vec<f32>> {
     let mut reader = hound::WavReader::open(beep_path)
         .with_context(|| format!("读取蜂鸣 WAV 失败: {}", beep_path.display()))?;
@@ -709,10 +772,9 @@ fn per_event_lags(
 }
 
 fn recommended_near_delay_ms(lag_ms: f64, safety_ms: f64) -> u32 {
-    if lag_ms >= 0.0 {
-        return 0;
-    }
-    ((-lag_ms + safety_ms) / 5.0).round().max(0.0) as u32 * 5
+    let default_bias_ms = default_near_delay_ms() as f64;
+    let recommended_ms = (-lag_ms + safety_ms).max(default_bias_ms);
+    (recommended_ms / 5.0).round().max(0.0) as u32 * 5
 }
 
 fn emit_probe_result(result: &ProbeResult, json_mode: bool, session_retained: bool) -> Result<()> {
@@ -816,10 +878,12 @@ mod tests {
     }
 
     #[test]
-    fn probe_recommendation_uses_only_mic_lead() {
+    fn probe_recommendation_preserves_default_bias() {
+        let default_bias_ms = default_near_delay_ms();
+
         assert_eq!(recommended_near_delay_ms(-18.5, 8.0), 25);
-        assert_eq!(recommended_near_delay_ms(-2.0, 8.0), 10);
-        assert_eq!(recommended_near_delay_ms(12.0, 8.0), 0);
+        assert_eq!(recommended_near_delay_ms(-2.0, 8.0), default_bias_ms);
+        assert_eq!(recommended_near_delay_ms(12.0, 8.0), default_bias_ms);
     }
 
     #[test]
@@ -862,6 +926,34 @@ mod tests {
         );
         assert!(reference_playback_output_selector("none").is_err());
         assert!(reference_playback_output_selector("input:mic-id").is_err());
+    }
+
+    #[test]
+    fn monitor_reference_maps_back_to_sink_stem() {
+        // PipeWire/Pulse 两种命名(pulse-server.c :767 / :3998)都要能剥回 sink。
+        assert_eq!(
+            monitor_reference_output_stem("input:alsa_output.pci-0000.analog-stereo.monitor")
+                .unwrap()
+                .as_deref(),
+            Some("alsa_output.pci-0000.analog-stereo")
+        );
+        assert_eq!(
+            monitor_reference_output_stem("input:Monitor of Built-in Audio Analog Stereo")
+                .unwrap()
+                .as_deref(),
+            Some("Built-in Audio Analog Stereo")
+        );
+        // 无前后缀的普通名字原样透传;default/system/空串 → 默认输出。
+        assert_eq!(
+            monitor_reference_output_stem("some-sink")
+                .unwrap()
+                .as_deref(),
+            Some("some-sink")
+        );
+        assert_eq!(monitor_reference_output_stem("default").unwrap(), None);
+        assert_eq!(monitor_reference_output_stem("system").unwrap(), None);
+        assert_eq!(monitor_reference_output_stem("").unwrap(), None);
+        assert!(monitor_reference_output_stem("none").is_err());
     }
 
     #[test]

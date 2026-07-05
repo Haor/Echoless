@@ -17,6 +17,7 @@ struct Options {
     var mono = false
     var streamStdout = false
     var probePermission = false
+    var preflightPermission = false
     var excludePids: [pid_t] = []
 }
 
@@ -27,6 +28,7 @@ func usage() -> Never {
           echoless-process-tap-poc [--seconds N] [--out PATH] [--mono]
           echoless-process-tap-poc --stream-stdout [--mono] [--exclude-pid PID ...]
           echoless-process-tap-poc --probe-permission [--mono]
+          echoless-process-tap-poc --preflight-permission
 
         Captures macOS system output audio through Core Audio Process Tap.
         Play audio while this runs, then inspect the generated WAV.
@@ -34,6 +36,8 @@ func usage() -> Never {
         Echoless realtime pipeline.
         --probe-permission starts and stops a tap without writing audio. Use it
         only after explicit user action to trigger System Audio Recording TCC.
+        --preflight-permission prints granted|denied|undetermined|unknown to
+        stdout without ever triggering the TCC prompt (private TCC SPI).
         --exclude-pid excludes an audio-producing process, usually the parent
         echoless CLI, so processed output does not contaminate the reference.
 
@@ -65,6 +69,8 @@ func parseOptions() -> Options {
             options.streamStdout = true
         case "--probe-permission":
             options.probePermission = true
+        case "--preflight-permission":
+            options.preflightPermission = true
         case "--exclude-pid":
             index += 1
             guard index < args.count, let pid = Int32(args[index]), pid > 0 else {
@@ -452,7 +458,114 @@ func writeFloat32Wav(
     try data.write(to: URL(fileURLWithPath: path), options: .atomic)
 }
 
+// 无弹窗查询 System Audio Recording(kTCCServiceAudioCapture)授权状态。
+// TCC 没有公开的查询 API;这里走私有 TCC.framework 的 TCCAccessPreflight
+//(AudioCap 同款做法)。任何一步失败都回退 "unknown",绝不触发授权弹窗。
+func preflightAudioCapturePermission() -> String {
+    guard let handle = dlopen(
+        "/System/Library/PrivateFrameworks/TCC.framework/Versions/A/TCC",
+        RTLD_NOW
+    ) else { return "unknown" }
+    defer { dlclose(handle) }
+    guard let sym = dlsym(handle, "TCCAccessPreflight") else { return "unknown" }
+    typealias PreflightFunc = @convention(c) (CFString, CFDictionary?) -> Int32
+    let preflight = unsafeBitCast(sym, to: PreflightFunc.self)
+    // 私有 API 的返回枚举只有 0=granted 可确证;1/2 的 denied/unknown 语义在
+    // 不同 headers dump 里互相矛盾(2026-07-05 实测:无授权记录时返回 1,若按
+    // "denied" 上报,UI 会引导去系统设置——而那里没有条目可开,请求弹窗的路径
+    // 反而永远走不到,用户卡死)。故非 0 一律报 undetermined:UI 走「请求」路径,
+    // 真 denied 时系统静默不弹窗,再由前端兜底打开设置,无一卡死。
+    switch preflight("kTCCServiceAudioCapture" as CFString, nil) {
+    case 0: return "granted"
+    case 1, 2: return "undetermined"
+    default: return "unknown"
+    }
+}
+
+// TCC 责任人自立(disclaim,AudioCap 同款架构)。不做这步时,授权归属启动链
+// 上层的 responsible process —— dev 下就是终端 App(Cursor/Warp/Terminal):
+// 终端一自动更新记录即失效(面板里开关还开着但签名失配),Warp 这类缺
+// NSAudioCaptureUsageDescription 的终端更是连弹窗都出不来(2026-07-05 日志实证)。
+// self-disclaim 后授权记在本 helper 自己名下(内嵌 Info.plist 提供 bundle id
+// 与用途说明),与终端、与 Echoless app 的重编彻底解耦。
+func selfDisclaimIfNeeded() {
+    let marker = "ECHOLESS_TAP_DISCLAIMED"
+    if ProcessInfo.processInfo.environment[marker] != nil { return }
+    guard let sym = dlsym(dlopen(nil, RTLD_NOW), "responsibility_spawnattrs_setdisclaim") else {
+        return
+    }
+    typealias SetDisclaimFunc = @convention(c) (
+        UnsafeMutablePointer<posix_spawnattr_t?>, Int32
+    ) -> Int32
+    let setDisclaim = unsafeBitCast(sym, to: SetDisclaimFunc.self)
+
+    var attr: posix_spawnattr_t? = nil
+    guard posix_spawnattr_init(&attr) == 0 else { return }
+    defer { posix_spawnattr_destroy(&attr) }
+    guard setDisclaim(&attr, 1) == 0,
+        posix_spawnattr_setflags(&attr, Int16(POSIX_SPAWN_SETEXEC)) == 0
+    else { return }
+
+    // SETEXEC:用带 disclaim 的自身镜像原地替换当前进程(pid/stdio 不变),
+    // 环境标记防循环;posix_spawn 成功即不返回,失败则以未 disclaim 状态继续。
+    let exePath = Bundle.main.executablePath ?? CommandLine.arguments[0]
+    var argv: [UnsafeMutablePointer<CChar>?] = CommandLine.arguments.map { strdup($0) }
+    argv.append(nil)
+    var envs: [UnsafeMutablePointer<CChar>?] = ProcessInfo.processInfo.environment.map {
+        strdup("\($0.key)=\($0.value)")
+    }
+    envs.append(strdup("\(marker)=1"))
+    envs.append(nil)
+    _ = posix_spawn(nil, exePath, nil, &attr, argv, envs)
+}
+selfDisclaimIfNeeded()
+
 let options = parseOptions()
+
+if options.preflightPermission {
+    print(preflightAudioCapturePermission())
+    exit(0)
+}
+
+// 显式触发「系统音频录制」授权弹窗(私有 TCCAccessRequest,AudioCap 同款)。
+// 关键事实(2026-07-05 日志实证):CATap/aggregate 的创建与启动只会让 coreaudiod
+// 向 tccd 发 preflight 查询,**永远不会自己弹授权框** —— 之前靠「建 tap 顺便触发
+// 弹窗」的假设是错的。返回 nil = SPI 不可用(继续走 tap 尝试兜底)。
+// 注意:弹窗归属于 responsible process(启动 dev 的终端);该 app 的 Info.plist
+// 需含 NSAudioCaptureUsageDescription(Cursor 有,Warp 截至今日没有)。
+func requestAudioCapturePermission() -> Bool? {
+    guard let handle = dlopen(
+        "/System/Library/PrivateFrameworks/TCC.framework/Versions/A/TCC",
+        RTLD_NOW
+    ) else { return nil }
+    defer { dlclose(handle) }
+    guard let sym = dlsym(handle, "TCCAccessRequest") else { return nil }
+    typealias RequestFunc = @convention(c) (
+        CFString, CFDictionary?, @escaping @convention(block) (Bool) -> Void
+    ) -> Void
+    let request = unsafeBitCast(sym, to: RequestFunc.self)
+    let semaphore = DispatchSemaphore(value: 0)
+    var granted = false
+    request("kTCCServiceAudioCapture" as CFString, nil) { ok in
+        granted = ok
+        semaphore.signal()
+    }
+    // 等用户在弹窗上做决定;超时按未授予处理。
+    if semaphore.wait(timeout: .now() + 120) == .timedOut {
+        fputs("permission request timed out waiting for user\n", stderr)
+        return false
+    }
+    return granted
+}
+
+if options.probePermission {
+    if let granted = requestAudioCapturePermission(), !granted {
+        fputs("system audio recording permission was not granted\n", stderr)
+        exit(1)
+    }
+    // granted 或 SPI 不可用:继续用真实 tap 启停验证一次。
+}
+
 let recorder = ProcessTapRecorder(options: options)
 
 do {
@@ -470,7 +583,15 @@ if options.probePermission {
     fputs("permission probe succeeded\n", stderr)
     exit(0)
 } else if options.streamStdout {
-    fputs("streaming raw Float32 PCM to stdout\n", stderr)
+    // A5:PCM 前先发 16 字节二进制头(magic ELTP + version + 实际采样率 + 声道数),
+    // Rust 侧据此决定是否插重采样 —— tap 采样率跟随系统输出设备,不恒为 48k。
+    var header = Data("ELTP".utf8)
+    for value in [UInt32(1), UInt32(recorder.sampleRate.rounded()), UInt32(recorder.channels)] {
+        var le = value.littleEndian
+        withUnsafeBytes(of: &le) { header.append(contentsOf: $0) }
+    }
+    FileHandle.standardOutput.write(header)
+    fputs("streaming raw Float32 PCM to stdout (\(recorder.formatDescription))\n", stderr)
     while true {
         Thread.sleep(forTimeInterval: 0.005)
         let data = recorder.drainStreamData()

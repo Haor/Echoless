@@ -1,0 +1,7 @@
+# 仅影响本 workspace 的 cargo run/test:通过 dev-runner 在启动前给二进制
+# 补稳定签名(TCC 授权跨重编存活;无 "Echoless Dev" 证书时是纯透传)。
+[target.aarch64-apple-darwin]
+runner = ".cargo/dev-runner.sh"
+
+[target.x86_64-apple-darwin]
+runner = ".cargo/dev-runner.sh"
