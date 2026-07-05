@@ -201,7 +201,7 @@ pub(crate) fn localvqe_library_path(app: Option<&tauri::AppHandle>, cli: &Path) 
         push_file_candidate(&mut candidates, path);
     }
 
-    if let Some(path) = find_localvqe_library_in_dir(&crate::localvqe_native_dir_path()) {
+    if let Some(path) = find_localvqe_library_in_dir(&crate::localvqe::localvqe_native_dir_path()) {
         push_file_candidate(&mut candidates, path);
     }
 

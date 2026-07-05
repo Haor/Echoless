@@ -215,7 +215,7 @@ fn allowed_open_path_roots() -> Vec<PathBuf> {
     [
         brand_root.clone(),
         brand_root.join("diagnostics"),
-        crate::localvqe_models_dir_path(),
+        crate::localvqe::localvqe_models_dir_path(),
     ]
     .into_iter()
     .filter_map(|path| path.canonicalize().ok())
