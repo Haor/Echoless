@@ -342,39 +342,6 @@ body {
   min-height: 0;
   min-width: 0;
 }
-/* v11:分隔行 = 十字准星 + 点划中心线(机械制图 centerline:长划-点-长划) */
-.fid {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  margin: 16px 0 2px;
-  height: 9px;
-  background: repeating-linear-gradient(
-      90deg,
-      var(--t-dim) 0 14px,
-      transparent 14px 19px,
-      var(--t-dim) 19px 20.5px,
-      transparent 20.5px 25.5px
-    )
-    center / 100% 1px no-repeat;
-}
-.fid i {
-  width: 9px;
-  height: 9px;
-  background:
-    linear-gradient(var(--bg), var(--bg)) center / 9px 9px no-repeat,
-    none;
-  position: relative;
-}
-.fid i::before {
-  content: "";
-  position: absolute;
-  inset: 0;
-  background:
-    linear-gradient(var(--t-faint), var(--t-faint)) center / 9px 1px no-repeat,
-    linear-gradient(var(--t-faint), var(--t-faint)) center / 1px 9px no-repeat;
-}
-
 /* v9:B2 修复改道 —— 不滚动,参数多的页面用 dense 紧凑布局放进一屏 */
 .page {
   display: flex;
@@ -844,19 +811,6 @@ body {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-}
-.lvsrc {
-  max-width: 100%;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  color: var(--t-faint);
-  font-size: 10px;
-  letter-spacing: 0.3px;
-  cursor: pointer;
-  white-space: nowrap;
-}
-.lvsrc:hover {
-  color: var(--t-soft);
 }
 .drow .dpick {
   color: var(--t);
@@ -1508,12 +1462,6 @@ button.ecard:disabled {
   line-height: 1.7;
   white-space: nowrap;
 }
-.hero {
-  display: flex;
-  justify-content: space-between;
-  align-items: flex-end;
-  margin-top: 5px; /* v11:配合大字标收紧 */
-}
 /* v6.1:字标 = bh_059 CATHEDRAL lockup —— 斜纹前缀块 + 半调点阵(dot screen)
    宽体大写;点阵用 radial-gradient 网屏 + background-clip:text 实现 */
 .word {
@@ -1779,52 +1727,6 @@ hr.hair {
   margin: 18px 0 2px;
 }
 
-/* control rows + 右侧功能图标 */
-.rows {
-  display: flex;
-  flex-direction: column;
-}
-.row {
-  display: flex;
-  align-items: center;
-  height: 48px;
-  padding: 0 4px;
-  margin: 0 -4px;
-}
-.row:hover {
-  background: rgba(255, 255, 255, 0.018);
-}
-/* v3:• 圆点 → 01-04 编号侧轨(bh_078 numbered rail) */
-.row .bul {
-  width: 24px;
-  color: var(--t-faint);
-  font-size: 9px;
-  letter-spacing: 1px;
-  font-variant-numeric: tabular-nums;
-}
-.row .k {
-  width: 74px;
-  color: var(--t-faint);
-  font-size: 10px;
-  letter-spacing: 2px;
-  text-transform: uppercase;
-}
-.row .co {
-  width: 16px;
-  color: var(--t-faint);
-}
-.row .v {
-  display: flex;
-  align-items: center;
-  gap: 9px;
-  color: var(--t);
-  font-size: 15px;
-  min-width: 0;
-}
-.row .v .dn {
-  color: var(--t-mut);
-}
-
 /* 自绘下拉(brutalist 单色直角) */
 .dd {
   position: relative;
@@ -1941,42 +1843,6 @@ hr.hair {
   font-size: 11px;
   text-transform: none;
   letter-spacing: 0.3px;
-}
-/* v3:行内点线引导(spec-sheet leader,bh_034) */
-.row .sp {
-  flex: 1;
-  align-self: center;
-  height: 0;
-  margin: 0 16px;
-  border-bottom: 1px dotted var(--t-dim);
-}
-.row .meta {
-  color: var(--t-faint);
-  font-size: 10px;
-  letter-spacing: 1.2px;
-  text-transform: uppercase;
-  min-width: 0;
-  white-space: nowrap; /* v3.1:修 meta 两行断裂(截图诊断) */
-  flex: none;
-}
-.row .meta b {
-  color: var(--t-soft);
-  font-weight: 400;
-}
-.row .meta .mk {
-  color: var(--t-mut);
-  letter-spacing: -1px;
-}
-.row .ico {
-  width: 30px;
-  margin-left: 18px;
-  display: flex;
-  justify-content: flex-end;
-  color: var(--t-soft);
-}
-.row .ico svg {
-  width: 22px;
-  height: 18px;
 }
 .segg {
   display: flex;
