@@ -176,7 +176,7 @@ function NvafxCard({
               ? `${t("active")} · DEV`
               : `${t("rdyReady")} · DEV`
             : !nvSupported
-              ? "WINDOWS · RTX ONLY"
+              ? t("windowsRtxOnly")
               : doctor?.ok
                 ? kind === "nvidia_afx_aec"
                   ? t("active")

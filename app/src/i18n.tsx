@@ -45,7 +45,9 @@ const D: Record<string, { en: string; zh: string }> = {
   reference: { en: "Reference", zh: "Reference" },
   noLoopback: { en: "No Loopback", zh: "No Loopback" },
   installCable: { en: "install virtual cable", zh: "安装虚拟声卡" },
+  inAppPickMic: { en: "in app pick {name} as mic", zh: "通话软件麦克风选 {name}" },
   reduceNoise: { en: "Reduce background noise", zh: "抑制背景噪声" },
+  aec3Only: { en: "AEC3 only", zh: "仅 AEC3" },
   lvqeNsHint: {
     en: "on = v1.3 · off = v1.4 pure aec",
     zh: "开 = v1.3 · 关 = v1.4 纯回声消除",
@@ -87,6 +89,7 @@ const D: Record<string, { en: string; zh: string }> = {
     en: "Windows + RTX GPU only · unavailable on this OS",
     zh: "仅 Windows + RTX 显卡 · 当前系统不可用",
   },
+  windowsRtxOnly: { en: "WINDOWS · RTX ONLY", zh: "仅 WINDOWS · RTX" },
   engNoGpu: { en: "no NVIDIA GPU detected", zh: "未检测到 NVIDIA GPU" },
   engRecheck: { en: "recheck", zh: "重检" },
   engPickModel: { en: "pick .gguf model…", zh: "选择 .gguf 模型…" },

@@ -1637,8 +1637,8 @@ function useAppController() {
               </span>
             ) : (
               <span className="meta">
-                <span className="mk">&gt;&gt;&gt;</span> in app pick{" "}
-                <b>{cableName}</b> as mic
+                <span className="mk">&gt;&gt;&gt;</span>{" "}
+                {t("inAppPickMic").replace("{name}", cableName)}
               </span>
             )}
             <span className="ico">
@@ -1676,7 +1676,7 @@ function useAppController() {
                 ? t("lvqeNsHint")
                 : nsSupported
                   ? t("reduceNoise")
-                  : "AEC3 only"}
+                  : t("aec3Only")}
             </span>
             <span className="ico">
               <IcoNoise />
