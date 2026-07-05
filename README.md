@@ -104,3 +104,9 @@ Linux job 构建 Rust workspace、准备 LocalVQE `.so` native runtime,并打包
 分发约定:LocalVQE **native runtime 随包**,**模型走 HF 按需下载**
 (`~/Library/Application Support/Echoless` / `%LOCALAPPDATA%\Echoless`);
 NVAFX runtime 按需下载(~1 GB,不随包)。
+
+NVAFX 引擎由 [NVIDIA Maxine](https://developer.nvidia.com/maxine) 提供
+(AEC powered by NVIDIA Maxine)。其 runtime/模型包再分发自 Maxine AFX SDK
+的可再分发组件,仅供 Echoless 安装使用,受
+[NVIDIA SDK License](https://developer.nvidia.com/downloads/maxine-sdk-license)
+约束(release 资产附完整许可与 NOTICE)。NVIDIA、Maxine 为 NVIDIA Corporation 商标。
