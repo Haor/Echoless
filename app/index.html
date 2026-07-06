@@ -4,6 +4,16 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Echoless</title>
+    <!-- 消除 bundle/CSS 就位前的白屏:内联底色,先于任何样式表生效。 -->
+    <style>
+      html,
+      body,
+      #root {
+        margin: 0;
+        height: 100%;
+        background: #1d1d1b;
+      }
+    </style>
   </head>
   <body>
     <div id="root"></div>

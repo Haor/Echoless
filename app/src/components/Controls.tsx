@@ -33,12 +33,18 @@ export function Field({
   placeholder,
   onCommit,
   wide,
+  min,
+  max,
+  integer,
 }: {
   value: unknown;
   numeric: boolean;
   placeholder: string;
   onCommit: (v: unknown) => void;
   wide?: boolean;
+  min?: number;
+  max?: number;
+  integer?: boolean;
 }) {
   const valueText = value == null ? "" : String(value);
   const [draft, setDraft] = useState({ source: valueText, text: valueText });
@@ -47,8 +53,12 @@ export function Field({
     const s = txt.trim();
     if (s === "") return onCommit(null);
     if (numeric) {
-      const n = Number(s);
-      return onCommit(Number.isFinite(n) ? n : null);
+      let n = Number(s);
+      if (!Number.isFinite(n)) return onCommit(null);
+      if (integer) n = Math.round(n);
+      if (min != null) n = Math.max(min, n);
+      if (max != null) n = Math.min(max, n);
+      return onCommit(n);
     }
     onCommit(s);
   };
@@ -58,7 +68,10 @@ export function Field({
       value={txt}
       placeholder={placeholder}
       aria-label={placeholder}
-      inputMode={numeric ? "decimal" : "text"}
+      inputMode={numeric ? (integer ? "numeric" : "decimal") : "text"}
+      min={min}
+      max={max}
+      step={numeric && integer ? 1 : undefined}
       spellCheck={false}
       onChange={(e) => setDraft({ source: valueText, text: e.target.value })}
       onBlur={commit}

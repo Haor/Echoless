@@ -6,7 +6,7 @@ import { useI18n } from "../i18n";
 import { Field } from "../components/Controls";
 import { Toggle } from "../components/Toggle";
 
-interface Props {
+export interface DiagnosticsPageProps {
   rec: boolean;
   seconds: number | null;
   diagDir: string;
@@ -30,7 +30,7 @@ export function DiagnosticsPage({
   onRec,
   onSeconds,
   onDir,
-}: Props) {
+}: DiagnosticsPageProps) {
   const { t } = useI18n();
   const active = rec && running;
 
@@ -61,6 +61,8 @@ export function DiagnosticsPage({
     { label: "input drops", value: health.input_drops, warn: health.input_drops > 0 },
     { label: "ref underruns", value: health.ref_underruns, warn: health.ref_underruns > 0 },
     { label: "output underruns", value: health.output_underruns, warn: health.output_underruns > 0 },
+    { label: "mic stale", value: health.mic_stale_drops, warn: health.mic_stale_drops > 0 },
+    { label: "ref stale", value: health.ref_stale_drops, warn: health.ref_stale_drops > 0 },
     { label: "stale drops", value: health.stale_drops, warn: health.stale_drops > 0 },
     { label: "runtime errors", value: health.runtime_errors, warn: health.runtime_errors > 0 },
     { label: "diverged", value: health.diverged ? "YES" : "NO", warn: health.diverged },
@@ -104,6 +106,8 @@ export function DiagnosticsPage({
             <Field
               value={seconds}
               numeric
+              min={1}
+              integer
               placeholder={t("unlimited")}
               onCommit={(v) => onSeconds(v as number | null)}
             />

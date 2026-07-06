@@ -185,6 +185,7 @@ final class ProcessTapRecorder {
     private var firstHostTime: UInt64?
     private var lastHostTime: UInt64?
     private var streamData = Data()
+    private var droppedStreamBytes: UInt64 = 0
 
     init(options: Options) {
         self.options = options
@@ -235,6 +236,9 @@ final class ProcessTapRecorder {
               format.mBitsPerChannel == 32
         else {
             throw TapError(operation: "Unsupported tap format: \(formatSummary(format))", status: -2)
+        }
+        if options.streamStdout {
+            streamData.reserveCapacity(streamBufferLimitBytes())
         }
 
         let aggregateDescription: [String: Any] = [
@@ -306,13 +310,15 @@ final class ProcessTapRecorder {
         return (capturedFrames, callbackCount, peak, rms)
     }
 
-    func drainStreamData() -> Data {
+    func drainStreamData() -> (data: Data, droppedBytes: UInt64) {
         lock.lock()
         defer { lock.unlock() }
 
         let data = streamData
+        let dropped = droppedStreamBytes
         streamData.removeAll(keepingCapacity: true)
-        return data
+        droppedStreamBytes = 0
+        return (data, dropped)
     }
 
     func writeWav(to path: String) throws {
@@ -403,11 +409,22 @@ final class ProcessTapRecorder {
     }
 
     private func appendStreamData(samples: [Float]) {
-        streamData.reserveCapacity(streamData.count + samples.count * MemoryLayout<Float>.size)
-        for sample in samples {
-            var bits = sample.bitPattern.littleEndian
-            streamData.append(Data(bytes: &bits, count: MemoryLayout<UInt32>.size))
+        let byteCount = samples.count * MemoryLayout<Float>.size
+        if streamData.count + byteCount > streamBufferLimitBytes() {
+            droppedStreamBytes += UInt64(byteCount)
+            return
         }
+        samples.withUnsafeBufferPointer { buffer in
+            guard let base = buffer.baseAddress else { return }
+            let bytes = UnsafeRawBufferPointer(start: base, count: byteCount)
+            streamData.append(contentsOf: bytes)
+        }
+    }
+
+    private func streamBufferLimitBytes() -> Int {
+        let rate = max(Int(format.mSampleRate.rounded()), 48_000)
+        let channelCount = max(channels, 1)
+        return rate * channelCount * MemoryLayout<Float>.size
     }
 }
 
@@ -482,6 +499,19 @@ func preflightAudioCapturePermission() -> String {
     }
 }
 
+func currentExecutablePath() -> String? {
+    var size: UInt32 = 0
+    _ = _NSGetExecutablePath(nil, &size)
+    let buffer = UnsafeMutablePointer<CChar>.allocate(capacity: Int(size))
+    defer { buffer.deallocate() }
+    guard _NSGetExecutablePath(buffer, &size) == 0 else { return nil }
+    guard let resolved = realpath(buffer, nil) else {
+        return String(cString: buffer)
+    }
+    defer { free(resolved) }
+    return String(cString: resolved)
+}
+
 // TCC 责任人自立(disclaim,AudioCap 同款架构)。不做这步时,授权归属启动链
 // 上层的 responsible process —— dev 下就是终端 App(Cursor/Warp/Terminal):
 // 终端一自动更新记录即失效(面板里开关还开着但签名失配),Warp 这类缺
@@ -507,8 +537,11 @@ func selfDisclaimIfNeeded() {
     else { return }
 
     // SETEXEC:用带 disclaim 的自身镜像原地替换当前进程(pid/stdio 不变),
-    // 环境标记防循环;posix_spawn 成功即不返回,失败则以未 disclaim 状态继续。
-    let exePath = Bundle.main.executablePath ?? CommandLine.arguments[0]
+    // 环境标记防循环;posix_spawn 成功即不返回,失败会明确打到 stderr。
+    guard let exePath = currentExecutablePath() else {
+        fputs("self-disclaim: failed to resolve executable path\n", stderr)
+        return
+    }
     var argv: [UnsafeMutablePointer<CChar>?] = CommandLine.arguments.map { strdup($0) }
     argv.append(nil)
     var envs: [UnsafeMutablePointer<CChar>?] = ProcessInfo.processInfo.environment.map {
@@ -516,7 +549,18 @@ func selfDisclaimIfNeeded() {
     }
     envs.append(strdup("\(marker)=1"))
     envs.append(nil)
-    _ = posix_spawn(nil, exePath, nil, &attr, argv, envs)
+    defer {
+        for ptr in argv {
+            if let ptr { free(ptr) }
+        }
+        for ptr in envs {
+            if let ptr { free(ptr) }
+        }
+    }
+    let status = posix_spawn(nil, exePath, nil, &attr, argv, envs)
+    if status != 0 {
+        fputs("self-disclaim: posix_spawn failed: \(String(cString: strerror(status)))\n", stderr)
+    }
 }
 selfDisclaimIfNeeded()
 
@@ -568,6 +612,26 @@ if options.probePermission {
 
 let recorder = ProcessTapRecorder(options: options)
 
+// ── 进程回收自愈(审计 B-01)────────────────────────────────────────────
+// 默认信号动作会跳过 recorder.stop(),遗留 tap/聚合设备占用系统音频
+// (录音指示器长亮)。SIGTERM/SIGINT 改走干净清理;SIGPIPE 忽略后由流循环
+// 的 write 错误分支主动清理(见下)。流模式主线程阻塞在 sleep 循环,
+// 信号源必须挂全局队列才能得到调度。
+signal(SIGTERM, SIG_IGN)
+signal(SIGINT, SIG_IGN)
+signal(SIGPIPE, SIG_IGN)
+let cleanupSignalSources: [DispatchSourceSignal] = [SIGTERM, SIGINT].map { sig in
+    let source = DispatchSource.makeSignalSource(signal: sig, queue: DispatchQueue.global())
+    source.setEventHandler {
+        fputs("received signal \(sig); releasing Process Tap\n", stderr)
+        recorder.stop()
+        exit(0)
+    }
+    source.resume()
+    return source
+}
+_ = cleanupSignalSources
+
 do {
     try recorder.start()
     fputs("started Process Tap: \(recorder.formatDescription)\n", stderr)
@@ -590,13 +654,36 @@ if options.probePermission {
         var le = value.littleEndian
         withUnsafeBytes(of: &le) { header.append(contentsOf: $0) }
     }
-    FileHandle.standardOutput.write(header)
+    do {
+        try FileHandle.standardOutput.write(contentsOf: header)
+    } catch {
+        fputs("stdout closed before streaming started: \(error)\n", stderr)
+        recorder.stop()
+        exit(1)
+    }
     fputs("streaming raw Float32 PCM to stdout (\(recorder.formatDescription))\n", stderr)
     while true {
         Thread.sleep(forTimeInterval: 0.005)
-        let data = recorder.drainStreamData()
+        // 父死自愈:CLI 被 SIGKILL/崩溃时本进程被收养(ppid=1),SIGKILL 不可
+        // 捕获,轮询是唯一可靠防线;系统静音期 tap 无数据、不写管道,不能指望
+        // SIGPIPE/写错误兜底(审计 B-01)。
+        if getppid() == 1 {
+            fputs("parent process exited; releasing Process Tap\n", stderr)
+            recorder.stop()
+            exit(0)
+        }
+        let (data, droppedBytes) = recorder.drainStreamData()
+        if droppedBytes > 0 {
+            fputs("stream buffer full; dropped \(droppedBytes) bytes\n", stderr)
+        }
         if !data.isEmpty {
-            FileHandle.standardOutput.write(data)
+            do {
+                try FileHandle.standardOutput.write(contentsOf: data)
+            } catch {
+                fputs("stdout write failed (consumer gone); releasing Process Tap\n", stderr)
+                recorder.stop()
+                exit(0)
+            }
         }
     }
 } else {

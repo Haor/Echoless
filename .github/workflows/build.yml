@@ -32,7 +32,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
 
       - name: Install Rust stable
         shell: bash
@@ -45,7 +45,7 @@ jobs:
           cargo --version
 
       - name: Install Node
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
         with:
           node-version: 22
 
@@ -57,20 +57,29 @@ jobs:
         working-directory: app
         run: pnpm install --frozen-lockfile
 
+      # 缓存 ~/.cargo + 三个 workspace 的 target;冷编→热编,Windows 提速最明显。
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2.9.1
+        with:
+          workspaces: |
+            .
+            aec3
+            app/src-tauri
+
+      # 装预编译二进制,不再从源码编 cargo-audit(Windows 上原本 ~6min → 数秒)。
       - name: Install cargo-audit
-        run: cargo install cargo-audit --locked
+        uses: taiki-e/install-action@4684b8405694ae9dd42c9f39ba901a70ae83f4a3 # v2.82.9
+        with:
+          tool: cargo-audit@0.22.2
 
       - name: Rust fmt
         shell: bash
         run: |
           set -euo pipefail
-          cargo fmt \
-            -p echoless-audio-io \
-            -p echoless-processors \
-            -p echoless-core \
-            -p echoless-cli \
-            --check
+          # --all 覆盖全部 workspace 成员(含 echoless-paths,此前逐 -p 漏掉;审计 T-04)。
+          cargo fmt --all --check
           (cd app/src-tauri && cargo fmt --check)
+          (cd aec3 && cargo fmt --all --check)
 
       - name: Test
         run: cargo test --workspace --locked
@@ -80,11 +89,13 @@ jobs:
 
       - name: AEC3 tests
         working-directory: aec3
-        run: cargo test -p aec3-apm -p aec3-core --locked
+        # 全 workspace(此前只 apm/core,ns/agc2/fft/simd/common-audio 的
+        # 329 个数值内核测试从不在 CI 运行;审计 T-01)。
+        run: cargo test --workspace --locked
 
       - name: AEC3 clippy
         working-directory: aec3
-        run: cargo clippy -p aec3-apm -p aec3-core --all-targets --locked -- -D warnings
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
       - name: Build release
         run: cargo build --release --workspace --locked
@@ -105,6 +116,10 @@ jobs:
         working-directory: app
         run: pnpm exec tsc --noEmit
 
+      - name: Frontend tests
+        working-directory: app
+        run: pnpm test
+
       - name: Tauri build smoke
         working-directory: app
         run: pnpm tauri build --debug --no-bundle --ci
@@ -117,8 +132,8 @@ jobs:
           # app/src-tauri 的 ignore 均为 tauri v2 锁死的传递依赖,等上游升级后移除:
           #   RUSTSEC-2024-0429  glib 0.18(VariantStrIter unsound;仅 Linux 目标编译)
           #   RUSTSEC-2026-0186  memmap2 0.5.10(linicon 托盘图标链;仅 Linux)
-          #   RUSTSEC-2026-0194/0195  quick-xml 0.39(DoS 类解析问题;补丁在 0.41,
-          #     tauri 系 pin ^0.39,无法本地升级)
+          #   RUSTSEC-2026-0194/0195  quick-xml 0.39(解析 DoS,非 Linux 专属;
+          #     补丁在 0.41,tauri 系 pin ^0.39,无法本地升级)
           (cd app/src-tauri && cargo audit \
             --ignore RUSTSEC-2024-0429 \
             --ignore RUSTSEC-2026-0186 \
@@ -198,16 +213,6 @@ jobs:
           set -euo pipefail
           shared_build="${RUNNER_TEMP}/localvqe-shared-build"
           regression_build="${RUNNER_TEMP}/localvqe-regression-build"
-          model_name="localvqe-v1.3-4.8M-f32.gguf"
-          model="${regression_build}/bench_assets/${model_name}"
-          if [[ ! -f "${model}" ]]; then
-            model="$(find "${regression_build}" -name "${model_name}" -print -quit)"
-          fi
-          if [[ -z "${model}" || ! -f "${model}" ]]; then
-            echo "LocalVQE smoke model not found under ${regression_build}" >&2
-            exit 1
-          fi
-
           if [[ "${RUNNER_OS}" == "Windows" ]]; then
             shared_dir="${shared_build}/bin/Release"
             lib="${shared_dir}/localvqe.dll"
@@ -217,7 +222,6 @@ jobs:
             fi
             export PATH="${shared_dir}:${PATH}"
             lib="$(cygpath -w "${lib}")"
-            model="$(cygpath -w "${model}")"
           else
             shared_dir="${shared_build}/bin"
             lib="$(find "${shared_build}" -name 'liblocalvqe*.dylib' -print -quit)"
@@ -229,9 +233,24 @@ jobs:
             export DYLD_FALLBACK_LIBRARY_PATH="${shared_dir}:${DYLD_FALLBACK_LIBRARY_PATH:-}"
           fi
 
-          ECHOLESS_LOCALVQE_LIBRARY="${lib}" \
-          ECHOLESS_LOCALVQE_MODEL="${model}" \
-            cargo test -p echoless-processors localvqe_ffi_smoke -- --ignored --nocapture
+          for model_name in \
+            "localvqe-v1.3-4.8M-f32.gguf" \
+            "localvqe-v1.4-aec-200K-f32.gguf"; do
+            model="${regression_build}/bench_assets/${model_name}"
+            if [[ ! -f "${model}" ]]; then
+              model="$(find "${regression_build}" -name "${model_name}" -print -quit)"
+            fi
+            if [[ -z "${model}" || ! -f "${model}" ]]; then
+              echo "LocalVQE smoke model not found under ${regression_build}: ${model_name}" >&2
+              exit 1
+            fi
+            if [[ "${RUNNER_OS}" == "Windows" ]]; then
+              model="$(cygpath -w "${model}")"
+            fi
+            ECHOLESS_LOCALVQE_LIBRARY="${lib}" \
+            ECHOLESS_LOCALVQE_MODEL="${model}" \
+              cargo test -p echoless-processors localvqe_ffi_smoke -- --ignored --nocapture
+          done
 
       # native runtime 随包分发(2026-07-05 定案;模型不随包,走 HF 下载)
       - name: Prepare Tauri LocalVQE native runtime
@@ -256,9 +275,9 @@ jobs:
           fi
 
           ECHOLESS_LOCALVQE_LIBRARY="${lib}" \
-            pnpm prepare:tauri-assets --skip-cli-build --require-localvqe-assets
+            pnpm prepare:tauri-assets --skip-cli-build --require-localvqe-assets --require-helper-assets
 
-      - name: Tauri bundle smoke
+      - name: Tauri bundle asset-presence smoke
         shell: bash
         working-directory: app
         run: |
@@ -276,6 +295,10 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p dist
+          # 许可证随 CLI 包分发(审计 D-03):MIT + AEC3 BSD-3 + 第三方汇总。
+          cp LICENSE dist/LICENSE.txt
+          cp aec3/LICENSE dist/AEC3-LICENSE.txt
+          cp THIRD-PARTY-LICENSES.md dist/
           if [[ "${RUNNER_OS}" == "Windows" ]]; then
             cp target/release/echoless.exe dist/
             cp configs/example.toml dist/
@@ -301,7 +324,7 @@ jobs:
           ./echoless processors
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: echoless-${{ matrix.package }}-${{ runner.arch }}
           path: |
@@ -318,7 +341,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
 
       - name: Install Linux packaging dependencies
         shell: bash
@@ -338,11 +361,12 @@ jobs:
           set -euo pipefail
           rustup toolchain install stable --profile minimal
           rustup default stable
+          rustup component add clippy rustfmt
           rustc --version
           cargo --version
 
       - name: Install Node
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
         with:
           node-version: 22
 
@@ -353,6 +377,24 @@ jobs:
       - name: Install frontend dependencies
         working-directory: app
         run: pnpm install --frozen-lockfile
+
+      # 缓存 ~/.cargo + 三个 workspace 的 target(与 build job 一致)。
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2.9.1
+        with:
+          workspaces: |
+            .
+            aec3
+            app/src-tauri
+
+      # Linux 独有代码路径(null-sink / pactl / monitor 映射 / beep 播放)此前
+      # 无任何质量门,带 #[cfg(target_os="linux")] 的测试在别的平台被条件编译
+      # 掉、等于从没跑过(审计 T-03)。与 win/mac matrix 对齐 test/clippy。
+      - name: Test
+        run: cargo test --workspace --locked
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
       - name: Build Rust workspace
         run: cargo build --release --workspace --locked
@@ -407,7 +449,7 @@ jobs:
         run: pnpm tauri build --ci --bundles deb,appimage
 
       - name: Upload Linux artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: echoless-linux-${{ runner.arch }}
           path: |

@@ -1,0 +1,433 @@
+use std::path::{Path, PathBuf};
+use std::process::Command;
+#[cfg(unix)]
+use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use serde_json::json;
+use serde_json::Value;
+
+use crate::bin_resolve::find_localvqe_library_in_dir;
+use crate::localvqe::{
+    localvqe_model_pin, migrate_legacy_localvqe_models_from_base, verify_localvqe_model_file,
+    LocalVqeModelPin,
+};
+use crate::platform::{
+    browser_open_command, cleanup_run_config, default_diag_dir, validate_browser_url,
+    validate_open_path, write_toml_create_new, write_transient_config_toml,
+};
+use crate::proc::{
+    command_output_with_timeout, parse_jsonl_line_event, push_tail_line, run_state_guard,
+    terminate_run, JsonlLineEvent, RunChild, RunState,
+};
+use crate::sidecar::bypass_control_line;
+#[cfg(unix)]
+use crate::sidecar::write_run_control_line;
+use crate::tray::{set_tray_prefs_inner, TrayPrefs};
+
+static DATA_ROOT_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+fn unique_temp_dir(name: &str) -> PathBuf {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("{name}-{}-{nanos}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+fn with_test_data_root<T>(root: &Path, run: impl FnOnce() -> T) -> T {
+    let _guard = DATA_ROOT_ENV_LOCK.lock().unwrap();
+    let previous = std::env::var_os(echoless_paths::DATA_ROOT_ENV_VAR);
+    std::env::set_var(echoless_paths::DATA_ROOT_ENV_VAR, root);
+    let result = run();
+    if let Some(previous) = previous {
+        std::env::set_var(echoless_paths::DATA_ROOT_ENV_VAR, previous);
+    } else {
+        std::env::remove_var(echoless_paths::DATA_ROOT_ENV_VAR);
+    }
+    result
+}
+
+#[cfg(unix)]
+fn slow_child_command() -> Command {
+    let mut command = Command::new("sh");
+    command.args(["-c", "sleep 2"]);
+    command
+}
+
+#[cfg(windows)]
+fn slow_child_command() -> Command {
+    let mut command = Command::new("cmd");
+    command.args(["/C", "ping -n 3 127.0.0.1 > nul"]);
+    command
+}
+
+#[cfg(unix)]
+fn exited_child_with_open_stdin_command() -> Command {
+    let mut command = Command::new("sh");
+    command.args(["-c", "cat >/dev/null & exit 0"]);
+    command.stdin(Stdio::piped());
+    command
+}
+
+#[test]
+fn command_timeout_kills_hung_child() {
+    let mut command = slow_child_command();
+    let started = Instant::now();
+    let err =
+        command_output_with_timeout(&mut command, Duration::from_millis(80), "slow child test")
+            .unwrap_err();
+
+    assert!(err.contains("timed out"), "{err}");
+    assert!(started.elapsed() < Duration::from_secs(2));
+}
+
+#[test]
+fn run_state_guard_recovers_poisoned_lock() {
+    let state = RunState(Mutex::new(None));
+    let _ = std::panic::catch_unwind(|| {
+        let _guard = state.0.lock().expect("test lock should start healthy");
+        panic!("poison run state");
+    });
+
+    assert!(state.0.is_poisoned());
+    let guard = run_state_guard(&state);
+    assert!(guard.is_none());
+}
+
+#[test]
+fn bypass_control_line_matches_runtime_contract() {
+    let enabled: Value = serde_json::from_str(&bypass_control_line(true)).unwrap();
+    assert_eq!(enabled["cmd"], "set_bypass");
+    assert_eq!(enabled["enabled"], true);
+
+    let disabled: Value = serde_json::from_str(&bypass_control_line(false)).unwrap();
+    assert_eq!(disabled["cmd"], "set_bypass");
+    assert_eq!(disabled["enabled"], false);
+}
+
+#[test]
+fn jsonl_line_event_classifies_status_lines() {
+    assert_eq!(parse_jsonl_line_event("   "), JsonlLineEvent::Empty);
+    assert_eq!(
+        parse_jsonl_line_event(r#"{"type":"status","ok":true}"#),
+        JsonlLineEvent::Json(json!({"type": "status", "ok": true}))
+    );
+    assert_eq!(
+        parse_jsonl_line_event("not json"),
+        JsonlLineEvent::Unparsed("not json".to_string())
+    );
+}
+
+#[test]
+fn push_tail_line_truncates_without_splitting_utf8() {
+    let mut tail = String::new();
+    push_tail_line(&mut tail, "ascii-prefix", 32);
+    push_tail_line(&mut tail, "错误错误错误错误错误", 16);
+
+    assert!(tail.len() <= 16, "{tail:?}");
+    assert!(tail.ends_with('\n'));
+    assert!(std::str::from_utf8(tail.as_bytes()).is_ok());
+}
+
+#[test]
+fn default_diag_dir_uses_brand_data_root() {
+    let root = unique_temp_dir("echoless-diag-root");
+    with_test_data_root(&root, || {
+        assert_eq!(PathBuf::from(default_diag_dir()), root.join("diagnostics"));
+    });
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn migrate_legacy_localvqe_models_moves_only_missing_gguf_files() {
+    let legacy_base = unique_temp_dir("echoless-legacy-localvqe");
+    let legacy_models = legacy_base.join("localvqe").join("models");
+    std::fs::create_dir_all(&legacy_models).unwrap();
+    let dest = unique_temp_dir("echoless-localvqe-dest");
+
+    std::fs::write(legacy_models.join("move-me.gguf"), b"new").unwrap();
+    std::fs::write(legacy_models.join("keep-existing.gguf"), b"legacy").unwrap();
+    std::fs::write(legacy_models.join("notes.txt"), b"ignore").unwrap();
+    std::fs::write(dest.join("keep-existing.gguf"), b"dest").unwrap();
+
+    migrate_legacy_localvqe_models_from_base(&legacy_base, &dest);
+
+    assert_eq!(std::fs::read(dest.join("move-me.gguf")).unwrap(), b"new");
+    assert!(!legacy_models.join("move-me.gguf").exists());
+    assert_eq!(
+        std::fs::read(dest.join("keep-existing.gguf")).unwrap(),
+        b"dest"
+    );
+    assert!(legacy_models.join("keep-existing.gguf").exists());
+    assert!(!dest.join("notes.txt").exists());
+
+    let _ = std::fs::remove_dir_all(legacy_base);
+    let _ = std::fs::remove_dir_all(dest);
+}
+
+#[test]
+fn terminate_run_marks_stopping_waits_and_cleans_config() {
+    let dir = unique_temp_dir("echoless-terminate-run");
+    let config_path = dir.join("run.toml");
+    std::fs::write(&config_path, "stub = true").unwrap();
+    let stopping = Arc::new(AtomicBool::new(false));
+    let child = slow_child_command().spawn().unwrap();
+    let state = RunState(Mutex::new(Some(RunChild {
+        child,
+        stopping: stopping.clone(),
+        config_path: config_path.clone(),
+    })));
+
+    terminate_run(&state);
+
+    assert!(stopping.load(Ordering::SeqCst));
+    assert!(run_state_guard(&state).is_none());
+    assert!(!config_path.exists());
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[cfg(unix)]
+#[test]
+fn write_run_control_line_reaps_exited_child_after_successful_write() {
+    let dir = unique_temp_dir("echoless-run-control-exited");
+    let config_path = dir.join("run.toml");
+    std::fs::write(&config_path, "stub = true").unwrap();
+    let stopping = Arc::new(AtomicBool::new(false));
+    let child = exited_child_with_open_stdin_command().spawn().unwrap();
+    let state = RunState(Mutex::new(Some(RunChild {
+        child,
+        stopping: stopping.clone(),
+        config_path: config_path.clone(),
+    })));
+
+    for _ in 0..50 {
+        let exited = run_state_guard(&state)
+            .as_mut()
+            .and_then(|rc| rc.child.try_wait().ok().flatten())
+            .is_some();
+        if exited {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    let err = write_run_control_line(&state, &bypass_control_line(true)).unwrap_err();
+
+    assert!(
+        err.contains("exited before control command was applied"),
+        "{err}"
+    );
+    assert!(stopping.load(Ordering::SeqCst));
+    assert!(run_state_guard(&state).is_none());
+    assert!(!config_path.exists());
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn tray_prefs_default_false_and_follow_platform_gate() {
+    let prefs = TrayPrefs::default();
+    assert!(!prefs.close_to_tray.load(Ordering::SeqCst));
+
+    set_tray_prefs_inner(&prefs, true);
+
+    #[cfg(target_os = "windows")]
+    assert!(prefs.close_to_tray.load(Ordering::SeqCst));
+    #[cfg(not(target_os = "windows"))]
+    assert!(!prefs.close_to_tray.load(Ordering::SeqCst));
+}
+
+#[test]
+fn finds_platform_localvqe_native_library() {
+    let dir = unique_temp_dir("echoless-localvqe-native");
+    let name = if cfg!(target_os = "windows") {
+        "localvqe.dll"
+    } else if cfg!(target_os = "macos") {
+        "liblocalvqe.0.1.0.dylib"
+    } else {
+        "liblocalvqe.so"
+    };
+    let expected = dir.join(name);
+    std::fs::write(&expected, b"stub").unwrap();
+    std::fs::write(dir.join("not-localvqe.txt"), b"stub").unwrap();
+    std::fs::write(dir.join("readme.solutions"), b"stub").unwrap();
+    std::fs::write(dir.join("liblocalvqe.so.notes"), b"stub").unwrap();
+
+    assert_eq!(
+        find_localvqe_library_in_dir(&dir).as_deref(),
+        Some(expected.as_path())
+    );
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn validates_only_allowlisted_browser_urls() {
+    assert_eq!(
+        validate_browser_url(" https://vb-audio.com/Cable/?x=1 ").unwrap(),
+        "https://vb-audio.com/Cable/?x=1"
+    );
+    assert_eq!(
+        validate_browser_url("https://www.nvidia.com/Download/index.aspx").unwrap(),
+        "https://www.nvidia.com/Download/index.aspx"
+    );
+    assert_eq!(
+        validate_browser_url("https://aka.ms/vs/17/release/vc_redist.x64.exe").unwrap(),
+        "https://aka.ms/vs/17/release/vc_redist.x64.exe"
+    );
+    // 系统设置深链白名单(隐私面板跳转)。
+    assert_eq!(
+        validate_browser_url(
+            "x-apple.systempreferences:com.apple.preference.security?Privacy_AudioCapture"
+        )
+        .unwrap(),
+        "x-apple.systempreferences:com.apple.preference.security?Privacy_AudioCapture"
+    );
+
+    for bad in [
+        "",
+        "https://",
+        "file:///etc/passwd",
+        "javascript:alert(1)",
+        "mailto:test@example.com",
+        "/Applications/Echoless.app",
+        "https://example.com/a b",
+        "https://example.com/\ncmd",
+        "http://vb-audio.com/Cable/",
+        "https://vb-audio.com.evil.example/Cable/",
+        "x-apple.systempreferences:com.apple.preference.security?General",
+    ] {
+        assert!(validate_browser_url(bad).is_err(), "{bad}");
+    }
+}
+
+#[test]
+fn validate_open_path_stays_under_brand_data_root() {
+    let root = unique_temp_dir("echoless-open-path-root");
+    let diagnostics = root.join("diagnostics").join("session-1");
+    let models = root.join("localvqe").join("models");
+    let external = unique_temp_dir("echoless-open-path-external");
+    std::fs::create_dir_all(&diagnostics).unwrap();
+    std::fs::create_dir_all(&models).unwrap();
+
+    with_test_data_root(&root, || {
+        assert_eq!(
+            validate_open_path(diagnostics.to_str().unwrap()).unwrap(),
+            diagnostics.canonicalize().unwrap()
+        );
+        assert_eq!(
+            validate_open_path(models.to_str().unwrap()).unwrap(),
+            models.canonicalize().unwrap()
+        );
+        assert!(validate_open_path(root.join("missing").to_str().unwrap()).is_err());
+        assert!(validate_open_path(external.to_str().unwrap()).is_err());
+    });
+
+    let _ = std::fs::remove_dir_all(root);
+    let _ = std::fs::remove_dir_all(external);
+}
+
+#[test]
+fn browser_open_command_avoids_windows_cmd_shell() {
+    let (prog, args) = browser_open_command("https://example.com");
+    #[cfg(target_os = "windows")]
+    {
+        assert_eq!(prog, "rundll32.exe");
+        assert!(!args.iter().any(|arg| arg == "cmd" || arg == "/C"));
+    }
+    #[cfg(target_os = "macos")]
+    assert_eq!(
+        (prog, args),
+        ("open", vec!["https://example.com".to_string()])
+    );
+    #[cfg(target_os = "linux")]
+    assert_eq!(
+        (prog, args),
+        ("xdg-open", vec!["https://example.com".to_string()])
+    );
+}
+
+#[test]
+fn config_writer_uses_create_new_and_refuses_existing_path() {
+    let dir = unique_temp_dir("echoless-config-create-new");
+    let path = dir.join("existing.toml");
+    std::fs::write(&path, "old = true").unwrap();
+
+    let err = write_toml_create_new(&path, "new = true").unwrap_err();
+    assert!(err.contains("创建配置文件失败"), "{err}");
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "old = true");
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn transient_config_writer_creates_unique_files() {
+    let dir = unique_temp_dir("echoless-transient-config");
+    let first = write_transient_config_toml(&dir, "run", "one = true").unwrap();
+    let second = write_transient_config_toml(&dir, "run", "two = true").unwrap();
+
+    assert_ne!(first, second);
+    assert_ne!(
+        first.file_name().and_then(|name| name.to_str()),
+        Some("echoless-run.toml")
+    );
+    assert_ne!(
+        second.file_name().and_then(|name| name.to_str()),
+        Some("echoless-run.toml")
+    );
+    assert_eq!(std::fs::read_to_string(&first).unwrap(), "one = true");
+    assert_eq!(std::fs::read_to_string(&second).unwrap(), "two = true");
+
+    cleanup_run_config(&first);
+    cleanup_run_config(&second);
+    assert!(!first.exists());
+    assert!(!second.exists());
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn localvqe_model_pins_reject_unknown_filenames() {
+    assert!(localvqe_model_pin("localvqe-v1.3-4.8M-f32.gguf").is_some());
+    assert!(localvqe_model_pin("localvqe-v1.2-1.3M-f32.gguf").is_some());
+    assert!(localvqe_model_pin("../localvqe-v1.3-4.8M-f32.gguf").is_none());
+    assert!(localvqe_model_pin("localvqe-v1.3-4.8M-f32.gguf.part").is_none());
+    assert!(localvqe_model_pin("unknown.gguf").is_none());
+}
+
+#[test]
+fn localvqe_model_verification_checks_size_and_sha256() {
+    let dir = unique_temp_dir("echoless-localvqe-model-verify");
+    let path = dir.join("model.gguf");
+    std::fs::write(&path, b"abc").unwrap();
+
+    let good = LocalVqeModelPin {
+        filename: "model.gguf",
+        sha256: "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+        size: 3,
+    };
+    verify_localvqe_model_file(&path, &good).unwrap();
+
+    let wrong_hash = LocalVqeModelPin {
+        sha256: "0000000000000000000000000000000000000000000000000000000000000000",
+        ..good
+    };
+    let err = verify_localvqe_model_file(&path, &wrong_hash)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("SHA256 不匹配"), "{err}");
+
+    let wrong_size = LocalVqeModelPin { size: 4, ..good };
+    let err = verify_localvqe_model_file(&path, &wrong_size)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("大小不匹配"), "{err}");
+
+    let _ = std::fs::remove_dir_all(dir);
+}

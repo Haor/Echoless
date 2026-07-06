@@ -1,4 +1,6 @@
 #!/usr/bin/env node
+// Asset-presence smoke: verifies packaged executables/resources are present and wired.
+// It intentionally does not launch the GUI process.
 import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
@@ -8,6 +10,7 @@ const scriptDir = path.dirname(fileURLToPath(import.meta.url));
 const appDir = path.resolve(scriptDir, "..");
 const repoRoot = path.resolve(appDir, "..");
 const srcTauriDir = path.join(appDir, "src-tauri");
+const sharedObjectSuffix = /\.so(\.\d+)*$/i;
 
 const args = process.argv.slice(2);
 const valueOf = (flag) => {
@@ -236,13 +239,16 @@ function smoke() {
       ? (f) => f.toLowerCase() === "localvqe.dll"
       : process.platform === "darwin"
         ? (f) => f.startsWith("liblocalvqe") && f.endsWith(".dylib")
-        : (f) => f.startsWith("liblocalvqe") && f.includes(".so");
+        : (f) => f.startsWith("liblocalvqe") && sharedObjectSuffix.test(f);
   const nativeLib = existsDir(nativeDir) && fs.readdirSync(nativeDir).some(libName);
   if (!nativeLib) {
     throw new Error(`LocalVQE native library missing under ${nativeDir}`);
   }
   console.log("bundle-smoke: LocalVQE native runtime present");
 
+  if (process.platform === "darwin" && !layout.helper) {
+    throw new Error("Process Tap helper missing from macOS bundle resources");
+  }
   if (layout.helper) {
     assertExecutable(layout.helper, "Process Tap helper");
   }

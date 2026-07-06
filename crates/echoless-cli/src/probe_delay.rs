@@ -4,8 +4,15 @@ use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc::{channel, Receiver};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 
 use anyhow::{bail, Context, Result};
 use clap::Args;
@@ -67,6 +74,12 @@ pub(crate) fn cmd_probe_delay(a: ProbeDelayArgs) -> Result<()> {
     if a.beeps == 0 {
         bail!("--beeps 必须大于 0");
     }
+    let cancel = Arc::new(AtomicBool::new(false));
+    ctrlc::set_handler({
+        let cancel = Arc::clone(&cancel);
+        move || cancel.store(true, Ordering::SeqCst)
+    })
+    .context("安装 probe-delay 取消处理器失败")?;
 
     let (result, cleanup_dirs, session_retained) = if let Some(session_dir) = &a.analyze_only {
         (analyze_probe_session(&a, session_dir)?, Vec::new(), true)
@@ -75,7 +88,8 @@ pub(crate) fn cmd_probe_delay(a: ProbeDelayArgs) -> Result<()> {
         let (probe_out_dir, probe_temp_dir, retain_session) = probe_output_dir(&a)?;
         let beep_duration = write_probe_beep_train(&a, &beep_path)?;
         probe_log(a.json, format!("beep_duration_s: {beep_duration:.2}"));
-        let session_dir = run_native_delay_probe(&a, &probe_out_dir, &beep_path, beep_duration)?;
+        let session_dir =
+            run_native_delay_probe(&a, &probe_out_dir, &beep_path, beep_duration, &cancel)?;
         let result = analyze_probe_session(&a, &session_dir)?;
         let mut cleanup_dirs = Vec::new();
         if let Some(temp_dir) = temp_dir {
@@ -232,12 +246,14 @@ fn run_native_delay_probe(
     out_dir: &Path,
     beep_path: &Path,
     beep_duration_s: f64,
+    cancel: &AtomicBool,
 ) -> Result<PathBuf> {
     create_dir_all(out_dir)
         .with_context(|| format!("创建 diagnostics 输出目录失败: {}", out_dir.display()))?;
     let diagnostic_seconds = (a.startup_delay + beep_duration_s + 1.0).ceil().max(1.0) as u32;
     let current_exe = env::current_exe().context("定位当前 echoless 可执行文件失败")?;
-    let mut child = Command::new(current_exe)
+    let mut command = Command::new(current_exe);
+    command
         .arg("run")
         .arg("--processor")
         .arg("passthrough")
@@ -263,7 +279,12 @@ fn run_native_delay_probe(
         .arg("--stats-interval-ms")
         .arg("1000")
         .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
+        .stderr(Stdio::inherit());
+    #[cfg(unix)]
+    {
+        command.process_group(0);
+    }
+    let mut child = command
         .spawn()
         .context("启动 echoless run probe 子进程失败")?;
 
@@ -274,6 +295,10 @@ fn run_native_delay_probe(
 
     let startup_deadline = Instant::now() + Duration::from_secs_f64(a.startup_delay);
     while Instant::now() < startup_deadline {
+        if cancel.load(Ordering::SeqCst) {
+            stop_probe_child(&mut child)?;
+            bail!("probe-delay cancelled");
+        }
         drain_probe_output(&rx, a.json, &mut session_dir, &mut saw_done);
         if let Some(status) = child.try_wait()? {
             bail!("echoless run probe 过早退出: {status}");
@@ -304,6 +329,10 @@ fn run_native_delay_probe(
 
     let finish_deadline = Instant::now() + Duration::from_secs(u64::from(diagnostic_seconds) + 2);
     while Instant::now() < finish_deadline {
+        if cancel.load(Ordering::SeqCst) {
+            stop_probe_child(&mut child)?;
+            bail!("probe-delay cancelled");
+        }
         drain_probe_output(&rx, a.json, &mut session_dir, &mut saw_done);
         if saw_done {
             break;
@@ -501,7 +530,7 @@ fn stop_probe_child(child: &mut std::process::Child) -> Result<()> {
     }
     let _ = Command::new("kill")
         .arg("-INT")
-        .arg(child.id().to_string())
+        .arg(probe_child_signal_target(child))
         .status();
 
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -511,9 +540,28 @@ fn stop_probe_child(child: &mut std::process::Child) -> Result<()> {
         }
         thread::sleep(Duration::from_millis(50));
     }
+    #[cfg(unix)]
+    {
+        let _ = Command::new("kill")
+            .arg("-KILL")
+            .arg(probe_child_signal_target(child))
+            .status();
+    }
+    #[cfg(not(unix))]
     child.kill().context("停止 probe 子进程失败")?;
     let _ = child.wait();
     Ok(())
+}
+
+fn probe_child_signal_target(child: &std::process::Child) -> String {
+    #[cfg(unix)]
+    {
+        format!("-{}", child.id())
+    }
+    #[cfg(not(unix))]
+    {
+        child.id().to_string()
+    }
 }
 
 fn newest_probe_session(out_dir: &Path) -> Result<PathBuf> {

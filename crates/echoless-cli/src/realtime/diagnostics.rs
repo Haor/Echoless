@@ -2,7 +2,7 @@ use std::fs::{create_dir, create_dir_all, rename, File};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
+use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TryRecvError, TrySendError};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -100,6 +100,7 @@ impl DiagnosticDoneReason {
 }
 
 enum DiagnosticCommand {
+    // Box 让 channel 只搬 8 字节指针;堆块本身随回收池循环,不在音频线程新增分配。
     Frame(Box<DiagnosticFrame>),
     Finish(DiagnosticDoneReason),
 }
@@ -117,6 +118,8 @@ struct DiagnosticFrame {
     out_q: usize,
     mic_input_drops: u64,
     ref_input_drops: u64,
+    mic_stale_drops: u64,
+    ref_stale_drops: u64,
     stale_drops: u64,
     ref_underruns: u64,
     output_overruns: u64,
@@ -130,37 +133,83 @@ struct DiagnosticFrame {
 }
 
 impl DiagnosticFrame {
-    fn from_sample(sample: &StatsSample<'_>) -> Self {
+    fn empty() -> Self {
         Self {
-            frame_size: sample.frame_size,
-            algorithmic_latency_ms: sample.algorithmic_latency_ms,
-            near_delay_ms: sample.near_delay_ms,
-            near_delay_buffered_samples: sample.near_delay_buffered_samples,
-            near: sample.near.to_vec(),
-            far: sample.far.to_vec(),
-            out: sample.out.to_vec(),
-            mic_q: sample.mic_q,
-            ref_q: sample.ref_q,
-            out_q: sample.out_q,
-            mic_input_drops: sample.mic_input_drops,
-            ref_input_drops: sample.ref_input_drops,
-            stale_drops: sample.stale_drops,
-            ref_underruns: sample.ref_underruns,
-            output_overruns: sample.output_overruns,
-            output_underruns: sample.output_underruns,
-            node_process_time_ms: aggregate_process_time_ms(sample.node_stats),
-            node_runtime_errors: aggregate_runtime_errors(sample.node_stats),
-            aec_estimated_delay_ms: aggregate_estimated_delay_ms(sample.node_stats),
-            aec3_delay_blocks: aggregate_aec3_delay_blocks(sample.node_stats),
-            node_diverged: aggregate_diverged(sample.node_stats),
-            node_last_error: aggregate_last_error(sample.node_stats),
+            frame_size: 0,
+            algorithmic_latency_ms: 0.0,
+            near_delay_ms: 0,
+            near_delay_buffered_samples: 0,
+            near: Vec::new(),
+            far: Vec::new(),
+            out: Vec::new(),
+            mic_q: 0,
+            ref_q: 0,
+            out_q: 0,
+            mic_input_drops: 0,
+            ref_input_drops: 0,
+            mic_stale_drops: 0,
+            ref_stale_drops: 0,
+            stale_drops: 0,
+            ref_underruns: 0,
+            output_overruns: 0,
+            output_underruns: 0,
+            node_process_time_ms: 0.0,
+            node_runtime_errors: 0,
+            aec_estimated_delay_ms: 0,
+            aec3_delay_blocks: None,
+            node_diverged: false,
+            node_last_error: None,
         }
+    }
+
+    fn fill_from_sample(&mut self, sample: &StatsSample<'_>) {
+        self.frame_size = sample.frame_size;
+        self.algorithmic_latency_ms = sample.algorithmic_latency_ms;
+        self.near_delay_ms = sample.near_delay_ms;
+        self.near_delay_buffered_samples = sample.near_delay_buffered_samples;
+        self.replace_near(sample.near);
+        self.replace_far(sample.far);
+        self.replace_out(sample.out);
+        self.mic_q = sample.mic_q;
+        self.ref_q = sample.ref_q;
+        self.out_q = sample.out_q;
+        self.mic_input_drops = sample.mic_input_drops;
+        self.ref_input_drops = sample.ref_input_drops;
+        self.mic_stale_drops = sample.mic_stale_drops;
+        self.ref_stale_drops = sample.ref_stale_drops;
+        self.stale_drops = sample.mic_stale_drops + sample.ref_stale_drops;
+        self.ref_underruns = sample.ref_underruns;
+        self.output_overruns = sample.output_overruns;
+        self.output_underruns = sample.output_underruns;
+        self.node_process_time_ms = aggregate_process_time_ms(sample.node_stats);
+        self.node_runtime_errors = aggregate_runtime_errors(sample.node_stats);
+        self.aec_estimated_delay_ms = aggregate_estimated_delay_ms(sample.node_stats);
+        self.aec3_delay_blocks = aggregate_aec3_delay_blocks(sample.node_stats);
+        self.node_diverged = aggregate_diverged(sample.node_stats);
+        self.node_last_error = aggregate_last_error(sample.node_stats);
+    }
+
+    fn replace_near(&mut self, samples: &[f32]) {
+        self.near.clear();
+        self.near.extend_from_slice(samples);
+    }
+
+    fn replace_far(&mut self, samples: &[f32]) {
+        self.far.clear();
+        self.far.extend_from_slice(samples);
+    }
+
+    fn replace_out(&mut self, samples: &[f32]) {
+        self.out.clear();
+        self.out.extend_from_slice(samples);
     }
 }
 
 pub(super) struct DiagnosticRecorder {
     dir: PathBuf,
     sender: Option<SyncSender<DiagnosticCommand>>,
+    recycle_sender: SyncSender<Box<DiagnosticFrame>>,
+    recycle_receiver: Receiver<Box<DiagnosticFrame>>,
     writer: Option<JoinHandle<()>>,
     status: DiagnosticsStatusHandle,
 }
@@ -223,13 +272,14 @@ impl DiagnosticRecorder {
         );
         writeln!(
             stats,
-            "frame_index,frames,near_delay_ms,near_delay_buffered_samples,mic_dbfs,ref_dbfs,out_dbfs,mic_q,ref_q,out_q,input_queue_latency_ms,output_queue_latency_ms,estimated_user_latency_ms,aec_estimated_delay_ms,aec3_delay_blocks,mic_input_drops,ref_input_drops,input_drops,stale_drops,ref_underruns,output_overruns,output_underruns,node_process_time_ms,node_runtime_errors,node_diverged,node_last_error"
+            "frame_index,frames,near_delay_ms,near_delay_buffered_samples,mic_dbfs,ref_dbfs,out_dbfs,mic_q,ref_q,out_q,input_queue_latency_ms,output_queue_latency_ms,estimated_user_latency_ms,aec_estimated_delay_ms,aec3_delay_blocks,mic_input_drops,ref_input_drops,input_drops,mic_stale_drops,ref_stale_drops,stale_drops,ref_underruns,output_overruns,output_underruns,node_process_time_ms,node_runtime_errors,node_diverged,node_last_error"
         )?;
 
         let mic_part_path = dir.join("mic.wav.part");
         let ref_part_path = dir.join("ref.wav.part");
         let out_part_path = dir.join("out.wav.part");
         let status = DiagnosticsStatusHandle::new(config.sample_rate);
+        let (recycle_sender, recycle_receiver) = sync_channel(DIAGNOSTIC_QUEUE_FRAMES);
         let writer = DiagnosticWriter {
             dir: dir.clone(),
             mic: Some(WavWriter::create(&mic_part_path, spec)?),
@@ -252,6 +302,7 @@ impl DiagnosticRecorder {
             human_to_stderr: config.status_json,
             status_json: config.status_json,
             status: status.clone(),
+            recycle_sender: recycle_sender.clone(),
         };
         let (sender, receiver) = sync_channel(DIAGNOSTIC_QUEUE_FRAMES);
         let writer = thread::spawn(move || writer.run(receiver));
@@ -263,6 +314,8 @@ impl DiagnosticRecorder {
         Ok(Some(Self {
             dir,
             sender: Some(sender),
+            recycle_sender,
+            recycle_receiver,
             writer: Some(writer),
             status,
         }))
@@ -284,20 +337,32 @@ impl DiagnosticRecorder {
         if !self.status.is_recording() {
             return Ok(false);
         }
-        let Some(sender) = self.sender.as_ref() else {
+        let Some(sender) = self.sender.clone() else {
             return Ok(false);
         };
-        match sender.try_send(DiagnosticCommand::Frame(Box::new(
-            DiagnosticFrame::from_sample(sample),
-        ))) {
+        let mut frame = self.take_frame();
+        frame.fill_from_sample(sample);
+        match sender.try_send(DiagnosticCommand::Frame(frame)) {
             Ok(()) => Ok(true),
-            Err(TrySendError::Full(_)) => {
+            Err(TrySendError::Full(command)) => {
+                if let DiagnosticCommand::Frame(frame) = command {
+                    let _ = self.recycle_sender.try_send(frame);
+                }
                 self.status.increment_drops();
                 Ok(true)
             }
             Err(TrySendError::Disconnected(_)) => {
                 self.status.set_recording(false);
                 bail!("诊断 writer 线程已退出")
+            }
+        }
+    }
+
+    fn take_frame(&mut self) -> Box<DiagnosticFrame> {
+        match self.recycle_receiver.try_recv() {
+            Ok(frame) => frame,
+            Err(TryRecvError::Empty | TryRecvError::Disconnected) => {
+                Box::new(DiagnosticFrame::empty())
             }
         }
     }
@@ -354,6 +419,7 @@ struct DiagnosticWriter {
     human_to_stderr: bool,
     status_json: bool,
     status: DiagnosticsStatusHandle,
+    recycle_sender: SyncSender<Box<DiagnosticFrame>>,
 }
 
 impl DiagnosticWriter {
@@ -362,19 +428,23 @@ impl DiagnosticWriter {
         let mut ok = true;
         while let Ok(command) = receiver.recv() {
             match command {
-                DiagnosticCommand::Frame(frame) => match self.write_frame(&frame) {
-                    Ok(true) => {}
-                    Ok(false) => {
-                        reason = DiagnosticDoneReason::MaxSeconds;
-                        break;
+                DiagnosticCommand::Frame(frame) => {
+                    let result = self.write_frame(&frame);
+                    self.recycle_frame(frame);
+                    match result {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            reason = DiagnosticDoneReason::MaxSeconds;
+                            break;
+                        }
+                        Err(err) => {
+                            eprintln!("诊断写入失败: {err:#}");
+                            reason = DiagnosticDoneReason::Error;
+                            ok = false;
+                            break;
+                        }
                     }
-                    Err(err) => {
-                        eprintln!("诊断写入失败: {err:#}");
-                        reason = DiagnosticDoneReason::Error;
-                        ok = false;
-                        break;
-                    }
-                },
+                }
                 DiagnosticCommand::Finish(done_reason) => {
                     reason = done_reason;
                     break;
@@ -382,6 +452,10 @@ impl DiagnosticWriter {
             }
         }
         self.finish(reason, ok);
+    }
+
+    fn recycle_frame(&self, frame: Box<DiagnosticFrame>) {
+        let _ = self.recycle_sender.try_send(frame);
     }
 
     fn write_frame(&mut self, frame: &DiagnosticFrame) -> Result<bool> {
@@ -413,7 +487,7 @@ impl DiagnosticWriter {
         };
         writeln!(
             stats,
-            "{},{},{},{},{:.2},{:.2},{:.2},{},{},{},{:.2},{:.2},{:.2},{},{},{},{},{},{},{},{},{},{:.3},{},{},{}",
+            "{},{},{},{},{:.2},{:.2},{:.2},{},{},{},{:.2},{:.2},{:.2},{},{},{},{},{},{},{},{},{},{},{},{:.3},{},{},{}",
             self.frame_index,
             frame.frame_size,
             frame.near_delay_ms,
@@ -442,6 +516,8 @@ impl DiagnosticWriter {
             frame.mic_input_drops,
             frame.ref_input_drops,
             frame.mic_input_drops + frame.ref_input_drops,
+            frame.mic_stale_drops,
+            frame.ref_stale_drops,
             frame.stale_drops,
             frame.ref_underruns,
             frame.output_overruns,
@@ -639,6 +715,76 @@ mod tests {
     }
 
     #[test]
+    fn diagnostic_frame_fill_reuses_audio_buffers() {
+        let node_stats: [ProcessorStats; 0] = [];
+        let near = vec![0.1f32; 480];
+        let far = vec![0.2f32; 960];
+        let out = vec![0.3f32; 480];
+        let mut frame = DiagnosticFrame::empty();
+        frame.fill_from_sample(&StatsSample {
+            algorithmic_latency_ms: 0.0,
+            near_delay_ms: 0,
+            near_delay_buffered_samples: 0,
+            frame_size: near.len(),
+            near: &near,
+            far: &far,
+            out: &out,
+            mic_q: 0,
+            ref_q: 0,
+            out_q: 0,
+            mic_input_drops: 0,
+            ref_input_drops: 0,
+            mic_stale_drops: 0,
+            ref_stale_drops: 0,
+            ref_underruns: 0,
+            output_overruns: 0,
+            output_underruns: 0,
+            node_stats: &node_stats,
+        });
+        let capacities = (
+            frame.near.capacity(),
+            frame.far.capacity(),
+            frame.out.capacity(),
+        );
+
+        let near_short = [0.4f32; 16];
+        let far_short = [0.5f32; 32];
+        let out_short = [0.6f32; 16];
+        frame.fill_from_sample(&StatsSample {
+            algorithmic_latency_ms: 0.0,
+            near_delay_ms: 0,
+            near_delay_buffered_samples: 0,
+            frame_size: near_short.len(),
+            near: &near_short,
+            far: &far_short,
+            out: &out_short,
+            mic_q: 0,
+            ref_q: 0,
+            out_q: 0,
+            mic_input_drops: 0,
+            ref_input_drops: 0,
+            mic_stale_drops: 0,
+            ref_stale_drops: 0,
+            ref_underruns: 0,
+            output_overruns: 0,
+            output_underruns: 0,
+            node_stats: &node_stats,
+        });
+
+        assert_eq!(frame.near, near_short);
+        assert_eq!(frame.far, far_short);
+        assert_eq!(frame.out, out_short);
+        assert_eq!(
+            (
+                frame.near.capacity(),
+                frame.far.capacity(),
+                frame.out.capacity(),
+            ),
+            capacities
+        );
+    }
+
+    #[test]
     fn diagnostic_recorder_writes_audio_and_stats() -> Result<()> {
         let base = temp_diagnostic_dir("echoless-diagnostic-test");
         let cfg = DiagnosticsConfig {
@@ -674,7 +820,8 @@ mod tests {
             out_q: 0,
             mic_input_drops: 0,
             ref_input_drops: 0,
-            stale_drops: 0,
+            mic_stale_drops: 0,
+            ref_stale_drops: 0,
             ref_underruns: 0,
             output_overruns: 0,
             output_underruns: 0,
@@ -743,7 +890,8 @@ mod tests {
             out_q: 0,
             mic_input_drops: 0,
             ref_input_drops: 0,
-            stale_drops: 0,
+            mic_stale_drops: 0,
+            ref_stale_drops: 0,
             ref_underruns: 0,
             output_overruns: 0,
             output_underruns: 0,
@@ -809,7 +957,8 @@ mod tests {
             out_q: 0,
             mic_input_drops: 0,
             ref_input_drops: 0,
-            stale_drops: 0,
+            mic_stale_drops: 0,
+            ref_stale_drops: 0,
             ref_underruns: 0,
             output_overruns: 0,
             output_underruns: 0,

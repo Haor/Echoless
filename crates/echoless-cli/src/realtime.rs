@@ -15,6 +15,7 @@
 mod control;
 mod devices;
 mod diagnostics;
+mod emit;
 #[cfg(target_os = "macos")]
 mod macos_process_tap;
 mod resample;
@@ -54,7 +55,7 @@ use self::devices::{
     format_device_description, is_virtual_audio_name, system_audio_permission_state,
 };
 use self::diagnostics::{DiagnosticRecorder, DiagnosticRecorderConfig, DiagnosticsStatusHandle};
-use self::resample::{InterleavedLinearResampler, OutputLinearResampler};
+use self::resample::{InterleavedInputResampler, OutputDeviceResampler};
 use self::stats::{RealtimeStats, RealtimeStatsConfig, StatsSample};
 use echoless_core::{
     apply_output_level, apply_reference_channels_to_chain, output_level_gain_db, PipelineConfig,
@@ -62,7 +63,6 @@ use echoless_core::{
 };
 use echoless_processors::{chain_from_nodes, ProcessorChain};
 
-const BYPASS_KEEP_WARM: bool = true;
 const BYPASS_CROSSFADE_MS: u32 = 15;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -157,7 +157,11 @@ impl BypassCrossfade {
             self.to_bypassed = to_bypassed;
             return;
         }
-        self.position = 0;
+        self.position = if self.is_active() {
+            self.reversed_position_from_last_alpha()
+        } else {
+            0
+        };
         self.from_bypassed = from_bypassed;
         self.to_bypassed = to_bypassed;
     }
@@ -170,13 +174,18 @@ impl BypassCrossfade {
         self.is_active().then_some(self.to_bypassed)
     }
 
+    fn reversed_position_from_last_alpha(&self) -> usize {
+        let last_alpha_position = self.position.saturating_sub(1);
+        self.total_samples.saturating_sub(last_alpha_position)
+    }
+
     fn next_sample(&mut self) -> Option<(bool, bool, f32)> {
         if !self.is_active() {
             return None;
         }
-        self.position += 1;
         let alpha = (self.position as f32 / self.total_samples as f32).min(1.0);
         let sample = (self.from_bypassed, self.to_bypassed, alpha);
+        self.position += 1;
         if self.position >= self.total_samples {
             self.position = self.total_samples;
         }
@@ -338,12 +347,14 @@ pub fn run_with_options(cfg: &PipelineConfig, options: RuntimeOptions) -> Result
         "mic",
         InputChannelMode::MonoDownmix,
         counters.mic_input_drops.clone(),
+        stream_error_handler("mic", running.clone(), options.status_json),
     )?;
     let output_stream = build_output_stream(
         &output_device.device,
         &output_config,
         out_cons,
         counters.output_underruns.clone(),
+        stream_error_handler("output", running.clone(), options.status_json),
     )?;
     let mut render_prod = render_prod;
     let render_stream = match (&reference_source, render_config.as_ref()) {
@@ -356,6 +367,7 @@ pub fn run_with_options(cfg: &PipelineConfig, options: RuntimeOptions) -> Result
                 "ref",
                 InputChannelMode::from_reference_channels(cfg.reference_channels),
                 counters.ref_input_drops.clone(),
+                stream_error_handler("reference", running.clone(), options.status_json),
             )?)
         }
         _ => None,
@@ -400,7 +412,9 @@ pub fn run_with_options(cfg: &PipelineConfig, options: RuntimeOptions) -> Result
         .as_ref()
         .map(DiagnosticRecorder::session_dir_string);
     let diagnostics_status = diagnostic.as_ref().map(DiagnosticRecorder::status_handle);
-    let control = options.status_json.then(spawn_control_reader);
+    // 控制线程无条件启动(不再只限 --status-json):stdin EOF = 停机契约的
+    // 感知通道,GUI/管道调用方关闭 stdin 即优雅停机(审计 B-01)。
+    let control = Some(spawn_control_reader());
     let started_event = json!({
         "type": "started",
         "cli_version": env!("CARGO_PKG_VERSION"),
@@ -546,6 +560,7 @@ fn process_loop<M, R, O>(
                 output_level: &mut runtime.output_level,
                 bypassed: &mut runtime.bypassed,
                 status_json: runtime.status_json,
+                running: &running,
             },
         );
         let current_bypass_target = bypass_crossfade
@@ -561,7 +576,7 @@ fn process_loop<M, R, O>(
             continue;
         }
         // 控制积压(简单 drift/堆积处理):超 4 帧丢旧的。
-        let mut stale_drops = skip_stale(&mut mic_cons, frame_size);
+        let mic_stale_drops = skip_stale(&mut mic_cons, frame_size);
         mic_cons.pop_slice(&mut mic_frame);
         let near_delay_buffered_samples = apply_near_delay(
             &mut near_delay,
@@ -571,8 +586,9 @@ fn process_loop<M, R, O>(
         );
 
         let mut ref_underrun = 0;
+        let mut ref_stale_drops = 0;
         if let Some(rc) = render_cons.as_mut() {
-            stale_drops += skip_stale(rc, far_samples_per_frame);
+            ref_stale_drops = skip_stale(rc, far_samples_per_frame);
             if rc.occupied_len() >= far_samples_per_frame {
                 rc.pop_slice(&mut far);
             } else {
@@ -588,16 +604,12 @@ fn process_loop<M, R, O>(
             BypassFrameInputs {
                 near: &near,
                 far: &far,
-                raw_near: &mic_frame,
             },
             BypassFrameOutputs {
                 processed: &mut processed,
                 out: &mut out,
             },
-            BypassFrameConfig {
-                bypassed: runtime.bypassed,
-                keep_warm: BYPASS_KEEP_WARM,
-            },
+            runtime.bypassed,
             &mut bypass_crossfade,
         );
         apply_output_level(&mut out, runtime.output_level);
@@ -621,7 +633,8 @@ fn process_loop<M, R, O>(
             out_q: out_prod.occupied_len(),
             mic_input_drops: runtime.counters.mic_input_drops.swap(0, Ordering::Relaxed),
             ref_input_drops: runtime.counters.ref_input_drops.swap(0, Ordering::Relaxed),
-            stale_drops: stale_drops as u64,
+            mic_stale_drops: mic_stale_drops as u64,
+            ref_stale_drops: ref_stale_drops as u64,
             ref_underruns: ref_underrun,
             output_overruns,
             output_underruns: runtime.counters.output_underruns.swap(0, Ordering::Relaxed),
@@ -643,16 +656,9 @@ fn process_loop<M, R, O>(
     }
 }
 
-#[derive(Clone, Copy, Debug)]
-struct BypassFrameConfig {
-    bypassed: bool,
-    keep_warm: bool,
-}
-
 struct BypassFrameInputs<'a> {
     near: &'a [f32],
     far: &'a [f32],
-    raw_near: &'a [f32],
 }
 
 struct BypassFrameOutputs<'a> {
@@ -668,51 +674,52 @@ fn process_bypass_frame(
     chain: &mut ProcessorChain,
     inputs: BypassFrameInputs<'_>,
     outputs: BypassFrameOutputs<'_>,
-    config: BypassFrameConfig,
+    bypassed: bool,
     crossfade: &mut BypassCrossfade,
 ) {
-    if should_process_for_bypass(config.bypassed, config.keep_warm, crossfade.is_active()) {
-        chain.process(
-            inputs.near,
-            inputs.far,
-            outputs.processed,
-            outputs.out.len() as u32,
-        );
-    }
+    // bypass 时链也恒跑(keep-warm):AEC3 滤波器/有状态节点持续收敛,
+    // 解旁路瞬间无重收敛间隙;bypass 只决定输出选源(审计 B-09,DECISIONS #4)。
+    chain.process(
+        inputs.near,
+        inputs.far,
+        outputs.processed,
+        outputs.out.len() as u32,
+    );
     write_bypass_output(
         outputs.processed,
-        inputs.raw_near,
+        inputs.near,
         outputs.out,
-        config.bypassed,
+        bypassed,
         crossfade,
     );
 }
 
-fn should_process_for_bypass(bypassed: bool, keep_warm: bool, crossfade_active: bool) -> bool {
-    !bypassed || keep_warm || crossfade_active
-}
-
 fn write_bypass_output(
     processed: &[f32],
-    raw_near: &[f32],
+    bypass_near: &[f32],
     out: &mut [f32],
     bypassed: bool,
     crossfade: &mut BypassCrossfade,
 ) {
     for (index, sample) in out.iter_mut().enumerate() {
         if let Some((from_bypassed, to_bypassed, alpha)) = crossfade.next_sample() {
-            let from = bypass_source_sample(processed, raw_near, index, from_bypassed);
-            let to = bypass_source_sample(processed, raw_near, index, to_bypassed);
+            let from = bypass_source_sample(processed, bypass_near, index, from_bypassed);
+            let to = bypass_source_sample(processed, bypass_near, index, to_bypassed);
             *sample = from + (to - from) * alpha;
         } else {
-            *sample = bypass_source_sample(processed, raw_near, index, bypassed);
+            *sample = bypass_source_sample(processed, bypass_near, index, bypassed);
         }
     }
 }
 
-fn bypass_source_sample(processed: &[f32], raw_near: &[f32], index: usize, bypassed: bool) -> f32 {
+fn bypass_source_sample(
+    processed: &[f32],
+    bypass_near: &[f32],
+    index: usize,
+    bypassed: bool,
+) -> f32 {
     if bypassed {
-        raw_near.get(index).copied().unwrap_or(0.0)
+        bypass_near.get(index).copied().unwrap_or(0.0)
     } else {
         processed.get(index).copied().unwrap_or(0.0)
     }
@@ -753,25 +760,55 @@ fn apply_near_delay(
 macro_rules! dispatch_format {
     ($fmt:expr, $build:ident, $($arg:expr),+) => {
         match $fmt {
-            SampleFormat::I16 => $build::<i16, _>($($arg),+),
-            SampleFormat::I32 => $build::<i32, _>($($arg),+),
-            SampleFormat::F32 => $build::<f32, _>($($arg),+),
-            SampleFormat::U16 => $build::<u16, _>($($arg),+),
+            SampleFormat::I16 => $build::<i16, _, _>($($arg),+),
+            SampleFormat::I32 => $build::<i32, _, _>($($arg),+),
+            SampleFormat::F32 => $build::<f32, _, _>($($arg),+),
+            SampleFormat::U16 => $build::<u16, _, _>($($arg),+),
             other => bail!("不支持的采样格式 {other}"),
         }
     };
 }
 
-fn build_input_stream<P>(
+/// 流错误回调(审计 B-03):结构化上报 + 致命错误(设备消失)置停机。
+/// 此前只 eprintln,设备拔出后进程带着死流装活:输出恒静音、GUI 无感知。
+/// 停机会让 GUI 收到非 intentional 的 exit 事件并给出明确提示。
+fn stream_error_handler(
+    label: &'static str,
+    running: Arc<AtomicBool>,
+    status_json: bool,
+) -> impl FnMut(cpal::StreamError) {
+    move |err| {
+        let fatal = matches!(err, cpal::StreamError::DeviceNotAvailable);
+        eprintln!("{label} 流错误: {err}");
+        if status_json {
+            emit::emit_stdout_line(
+                json!({
+                    "type": "stream_error",
+                    "stream": label,
+                    "message": err.to_string(),
+                    "fatal": fatal,
+                })
+                .to_string(),
+            );
+        }
+        if fatal {
+            running.store(false, Ordering::SeqCst);
+        }
+    }
+}
+
+fn build_input_stream<P, E>(
     device: &Device,
     config: &StreamConfigChoice,
     producer: P,
     label: &'static str,
     channel_mode: InputChannelMode,
     drops: Arc<AtomicU64>,
+    on_error: E,
 ) -> Result<Stream>
 where
     P: Producer<Item = f32> + Send + 'static,
+    E: FnMut(cpal::StreamError) + Send + 'static,
 {
     dispatch_format!(
         config.sample_format(),
@@ -781,43 +818,46 @@ where
         producer,
         label,
         channel_mode,
-        drops
+        drops,
+        on_error
     )
 }
 
-fn build_input_stream_t<T, P>(
+fn build_input_stream_t<T, P, E>(
     device: &Device,
     choice: &StreamConfigChoice,
     mut producer: P,
     label: &'static str,
     channel_mode: InputChannelMode,
     drops: Arc<AtomicU64>,
+    on_error: E,
 ) -> Result<Stream>
 where
     T: SizedSample + Copy + Send + 'static,
     f32: FromSample<T>,
     P: Producer<Item = f32> + Send + 'static,
+    E: FnMut(cpal::StreamError) + Send + 'static,
 {
     let config = choice.config();
     let channels = usize::from(config.channels);
     let pipeline_channels = channel_mode.output_channels();
-    let mut resampler = InterleavedLinearResampler::new(
+    let mut resampler = InterleavedInputResampler::new(
         choice.stream_sample_rate(),
         choice.pipeline_sample_rate,
         pipeline_channels,
     );
+    let mut mapped = Vec::<f32>::new();
     let needs_resampling = choice.requires_resampling();
     device
         .build_input_stream(
             &config,
             move |data: &[T], _: &cpal::InputCallbackInfo| {
                 if needs_resampling {
-                    let mut mapped =
-                        Vec::with_capacity((data.len() / channels) * pipeline_channels);
+                    mapped.clear();
                     for frame in data.chunks(channels) {
                         map_input_frame(frame, channel_mode, &mut mapped);
                     }
-                    for sample in resampler.process(&mapped) {
+                    for &sample in resampler.process(&mapped) {
                         if producer.try_push(sample).is_err() {
                             drops.fetch_add(1, Ordering::Relaxed);
                         }
@@ -828,7 +868,7 @@ where
                     }
                 }
             },
-            move |err| eprintln!("{label} 流错误: {err}"),
+            on_error,
             None,
         )
         .with_context(|| format!("构建 {label} 输入流失败"))
@@ -890,14 +930,16 @@ where
     }
 }
 
-fn build_output_stream<C>(
+fn build_output_stream<C, E>(
     device: &Device,
     config: &StreamConfigChoice,
     consumer: C,
     underruns: Arc<AtomicU64>,
+    on_error: E,
 ) -> Result<Stream>
 where
     C: Consumer<Item = f32> + Send + 'static,
+    E: FnMut(cpal::StreamError) + Send + 'static,
 {
     dispatch_format!(
         config.sample_format(),
@@ -905,48 +947,60 @@ where
         device,
         config,
         consumer,
-        underruns
+        underruns,
+        on_error
     )
 }
 
-fn build_output_stream_t<T, C>(
+fn build_output_stream_t<T, C, E>(
     device: &Device,
     choice: &StreamConfigChoice,
     mut consumer: C,
     underruns: Arc<AtomicU64>,
+    on_error: E,
 ) -> Result<Stream>
 where
     T: SizedSample + FromSample<f32> + Copy + Send + 'static,
     C: Consumer<Item = f32> + Send + 'static,
+    E: FnMut(cpal::StreamError) + Send + 'static,
 {
     let config = choice.config();
     let channels = usize::from(config.channels);
     let mut resampler =
-        OutputLinearResampler::new(choice.pipeline_sample_rate, choice.stream_sample_rate());
+        OutputDeviceResampler::new(choice.pipeline_sample_rate, choice.stream_sample_rate());
     let needs_resampling = choice.requires_resampling();
     device
         .build_output_stream(
             &config,
             move |data: &mut [T], _: &cpal::OutputCallbackInfo| {
-                for frame in data.chunks_mut(channels) {
-                    let sample = if needs_resampling {
-                        resampler.next_sample(&mut consumer, &underruns)
-                    } else {
-                        match consumer.try_pop() {
-                            Some(v) => v.clamp(-1.0, 1.0),
-                            None => {
-                                underruns.fetch_add(1, Ordering::Relaxed);
-                                0.0
-                            }
+                if needs_resampling {
+                    let samples =
+                        resampler.next_chunk(data.len() / channels, &mut consumer, &underruns);
+                    for (frame_index, frame) in data.chunks_mut(channels).enumerate() {
+                        let s = T::from_sample(samples.get(frame_index).copied().unwrap_or(0.0));
+                        for out in frame {
+                            *out = s; // 单声道铺到所有输出声道
                         }
-                    };
-                    let s = T::from_sample(sample);
-                    for out in frame {
-                        *out = s; // 单声道铺到所有输出声道
                     }
-                }
+                } else {
+                    for frame in data.chunks_mut(channels) {
+                        let sample = {
+                            match consumer.try_pop() {
+                                Some(v) => v.clamp(-1.0, 1.0),
+                                None => {
+                                    underruns.fetch_add(1, Ordering::Relaxed);
+                                    0.0
+                                }
+                            }
+                        };
+                        let s = T::from_sample(sample);
+                        for out in frame {
+                            *out = s; // 单声道铺到所有输出声道
+                        }
+                    }
+                };
             },
-            |err| eprintln!("输出流错误: {err}"),
+            on_error,
             None,
         )
         .context("构建输出流失败")
@@ -1025,6 +1079,12 @@ where
     let config = choice.config();
     let channels = usize::from(config.channels);
     let stream_sample_rate = choice.stream_sample_rate();
+    let done_after_stream_frame = player_done_after_stream_frame(
+        samples.len(),
+        source_sample_rate,
+        stream_sample_rate,
+        stream_sample_rate / 10,
+    );
     let mut stream_frame = 0u64;
     device
         .build_output_stream(
@@ -1036,10 +1096,12 @@ where
                     let sample = if source_pos < samples.len() as f64 {
                         interpolated_sample(&samples, source_pos).clamp(-1.0, 1.0)
                     } else {
-                        done.store(true, Ordering::Relaxed);
                         0.0
                     };
                     stream_frame += 1;
+                    if stream_frame >= done_after_stream_frame {
+                        done.store(true, Ordering::Relaxed);
+                    }
                     let out_sample = T::from_sample(sample);
                     for out in frame {
                         *out = out_sample;
@@ -1050,6 +1112,23 @@ where
             None,
         )
         .context("构建蜂鸣输出流失败")
+}
+
+#[cfg(any(test, windows, target_os = "linux"))]
+fn player_done_after_stream_frame(
+    source_samples: usize,
+    source_sample_rate: u32,
+    stream_sample_rate: u32,
+    drain_frames: u32,
+) -> u64 {
+    if source_sample_rate == 0 || stream_sample_rate == 0 {
+        return source_samples as u64;
+    }
+    let source_samples = source_samples as u128;
+    let stream_sample_rate = stream_sample_rate as u128;
+    let source_sample_rate = source_sample_rate as u128;
+    let source_end = (source_samples * stream_sample_rate).div_ceil(source_sample_rate) as u64;
+    source_end + u64::from(drain_frames.max(1))
 }
 
 #[cfg(any(windows, target_os = "linux"))]
@@ -1204,11 +1283,10 @@ mod tests {
     }
 
     #[test]
-    fn bypass_outputs_raw_near_without_near_delay_and_keeps_output_level() {
+    fn bypass_outputs_delayed_near_to_match_processing_timeline_and_keeps_output_level() {
         let mut chain = ProcessorChain::new(48_000, 1);
         chain.push(Box::new(InvertingProcessor));
-        let near_after_delay = [0.9, -0.9, 0.5, -0.5];
-        let raw_near = [0.1, -0.2, 0.25, -0.25];
+        let near_after_delay = [0.1, -0.2, 0.25, -0.25];
         let far = [0.0; 4];
         let mut processed = [0.0; 4];
         let mut out = [0.0; 4];
@@ -1219,36 +1297,29 @@ mod tests {
             BypassFrameInputs {
                 near: &near_after_delay,
                 far: &far,
-                raw_near: &raw_near,
             },
             BypassFrameOutputs {
                 processed: &mut processed,
                 out: &mut out,
             },
-            BypassFrameConfig {
-                bypassed: true,
-                keep_warm: true,
-            },
+            true,
             &mut crossfade,
         );
         apply_output_level(&mut out, MAX_OUTPUT_LEVEL);
 
-        assert_eq!(processed, [-0.9, 0.9, -0.5, 0.5]);
+        assert_eq!(processed, [-0.1, 0.2, -0.25, 0.25]);
         approx_slice(&out, &[0.3, -0.6, 0.75, -0.75], 0.001);
     }
 
+    // 冷路径(bypass 期间停喂 chain)已随审计 B-09 删除:该路径解旁路后残差是
+    // 保温路径的 5 倍以上(重收敛间隙),产品语义要求 OFF=穿透时引擎恒保温。
     #[test]
-    fn keep_warm_adapts_processor_during_bypass_before_restore() {
-        let warm = restore_rms_after_bypass(true);
-        let cold = restore_rms_after_bypass(false);
+    fn bypass_keeps_chain_warm_for_clean_restore() {
+        let warm = restore_rms_after_bypass();
 
         assert!(
             warm < 0.03,
             "keep-warm restore residual too high: {warm:.4}"
-        );
-        assert!(
-            cold > warm * 5.0,
-            "non-warm path should show a clear reconvergence gap: warm={warm:.4} cold={cold:.4}"
         );
     }
 
@@ -1264,9 +1335,9 @@ mod tests {
         write_bypass_output(&processed, &raw, &mut out_a, true, &mut crossfade);
         write_bypass_output(&processed, &raw, &mut out_b, true, &mut crossfade);
 
-        approx_eq(out_a[0], 0.125, 0.001);
-        approx_eq(out_a[3], 0.5, 0.001);
-        approx_eq(out_b[3], 1.0, 0.001);
+        approx_eq(out_a[0], 0.0, 0.001);
+        approx_eq(out_a[3], 0.375, 0.001);
+        approx_eq(out_b[3], 0.875, 0.001);
         let mut previous = 0.0;
         for sample in out_a.into_iter().chain(out_b) {
             assert!(
@@ -1278,10 +1349,53 @@ mod tests {
     }
 
     #[test]
+    fn bypass_crossfade_reversal_preserves_current_level() {
+        let processed = [0.0f32; 8];
+        let raw = [1.0f32; 8];
+        let mut out_a = [0.0f32; 4];
+        let mut out_b = [0.0f32; 4];
+        let mut crossfade = BypassCrossfade::new(8);
+        crossfade.start(false, true);
+
+        write_bypass_output(&processed, &raw, &mut out_a, true, &mut crossfade);
+        crossfade.start(true, false);
+        write_bypass_output(&processed, &raw, &mut out_b, false, &mut crossfade);
+
+        approx_eq(out_b[0], out_a[3], 0.001);
+        let mut previous = out_a[3];
+        for sample in out_b {
+            assert!(
+                (sample - previous).abs() <= 0.126,
+                "reversed crossfade adjacent step too large: previous={previous} sample={sample}"
+            );
+            previous = sample;
+        }
+    }
+
+    #[test]
+    fn beep_player_done_frame_includes_drain() {
+        assert_eq!(
+            player_done_after_stream_frame(48_000, 48_000, 48_000, 4_800),
+            52_800
+        );
+        assert_eq!(
+            player_done_after_stream_frame(16_000, 16_000, 48_000, 4_800),
+            52_800
+        );
+        assert_eq!(
+            player_done_after_stream_frame(16_000, 0, 48_000, 4_800),
+            16_000
+        );
+        assert_eq!(
+            player_done_after_stream_frame(16_000, 16_000, 48_000, 0),
+            48_001
+        );
+    }
+
+    #[test]
     fn bypass_selection_and_crossfade_allocate_no_heap() {
         let near = [0.1f32; 16];
         let far = [0.0f32; 16];
-        let raw = [0.2f32; 16];
         let mut processed = [0.0f32; 16];
         let mut out = [0.0f32; 16];
         let mut chain = ProcessorChain::new(48_000, 1);
@@ -1295,16 +1409,12 @@ mod tests {
                 BypassFrameInputs {
                     near: &near,
                     far: &far,
-                    raw_near: &raw,
                 },
                 BypassFrameOutputs {
                     processed: &mut processed,
                     out: &mut out,
                 },
-                BypassFrameConfig {
-                    bypassed: true,
-                    keep_warm: false,
-                },
+                true,
                 &mut inactive_crossfade,
             );
             process_bypass_frame(
@@ -1312,16 +1422,12 @@ mod tests {
                 BypassFrameInputs {
                     near: &near,
                     far: &far,
-                    raw_near: &raw,
                 },
                 BypassFrameOutputs {
                     processed: &mut processed,
                     out: &mut out,
                 },
-                BypassFrameConfig {
-                    bypassed: true,
-                    keep_warm: false,
-                },
+                true,
                 &mut active_crossfade,
             );
             apply_output_level(&mut out, MAX_OUTPUT_LEVEL);
@@ -1330,7 +1436,7 @@ mod tests {
         assert_eq!(allocations, 0);
     }
 
-    fn restore_rms_after_bypass(keep_warm: bool) -> f32 {
+    fn restore_rms_after_bypass() -> f32 {
         const FRAME: usize = 480;
         let mut chain = ProcessorChain::new(48_000, 1);
         chain.push(Box::new(AdaptiveEchoSuppressor {
@@ -1351,16 +1457,12 @@ mod tests {
                 BypassFrameInputs {
                     near: &near,
                     far: &far,
-                    raw_near: &near,
                 },
                 BypassFrameOutputs {
                     processed: &mut processed,
                     out: &mut out,
                 },
-                BypassFrameConfig {
-                    bypassed: false,
-                    keep_warm,
-                },
+                false,
                 &mut crossfade,
             );
             frame_index += 1;
@@ -1374,16 +1476,12 @@ mod tests {
                 BypassFrameInputs {
                     near: &near,
                     far: &far,
-                    raw_near: &near,
                 },
                 BypassFrameOutputs {
                     processed: &mut processed,
                     out: &mut out,
                 },
-                BypassFrameConfig {
-                    bypassed: true,
-                    keep_warm,
-                },
+                true,
                 &mut crossfade,
             );
             frame_index += 1;
@@ -1396,16 +1494,12 @@ mod tests {
             BypassFrameInputs {
                 near: &near,
                 far: &far,
-                raw_near: &near,
             },
             BypassFrameOutputs {
                 processed: &mut processed,
                 out: &mut out,
             },
-            BypassFrameConfig {
-                bypassed: false,
-                keep_warm,
-            },
+            false,
             &mut crossfade,
         );
         frame_index += 1;
@@ -1416,16 +1510,12 @@ mod tests {
             BypassFrameInputs {
                 near: &near,
                 far: &far,
-                raw_near: &near,
             },
             BypassFrameOutputs {
                 processed: &mut processed,
                 out: &mut out,
             },
-            BypassFrameConfig {
-                bypassed: false,
-                keep_warm,
-            },
+            false,
             &mut crossfade,
         );
 

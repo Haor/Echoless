@@ -22,7 +22,9 @@ const skipCliBuild = has("--skip-cli-build");
 const skipHelperBuild = has("--skip-helper-build");
 // 发布打包必须带上 LocalVQE native runtime(随包分发,2026-07-05 定案;模型走 HF 下载)。
 const requireLocalvqe = has("--require-localvqe-assets");
+const requireHelper = has("--require-helper-assets");
 const profile = dev ? "debug" : "release";
+const sharedObjectSuffix = /\.so(\.\d+)*$/i;
 
 function run(cmd, cmdArgs, options = {}) {
   const result = spawnSync(cmd, cmdArgs, {
@@ -166,6 +168,11 @@ function firstFile(root, predicate) {
     if (predicate(file)) matches.push(file);
   }
   matches.sort();
+  if (matches.length > 1) {
+    console.warn(
+      `asset warning: multiple matching files under ${root}; using ${matches[0]}; candidates=${matches.join(", ")}`,
+    );
+  }
   return matches[0] ?? null;
 }
 
@@ -207,7 +214,9 @@ function prepareProcessTapHelper() {
     helper = existsFile(built) ? built : null;
   }
   if (!helper) {
-    console.warn("asset warning: Process Tap helper not found; macOS system reference will need ECHOLESS_PROCESS_TAP_HELPER");
+    const message = "Process Tap helper not found; macOS system reference will be unavailable";
+    if (requireHelper) throw new Error(message);
+    console.warn(`asset warning: ${message}; set ECHOLESS_PROCESS_TAP_HELPER or allow helper build`);
     return;
   }
 
@@ -221,13 +230,13 @@ function localvqeLibraryName(file) {
   const name = path.basename(file);
   if (process.platform === "win32") return name.toLowerCase() === "localvqe.dll";
   if (process.platform === "darwin") return name.startsWith("liblocalvqe") && name.endsWith(".dylib");
-  return name.startsWith("liblocalvqe") && name.includes(".so");
+  return name.startsWith("liblocalvqe") && sharedObjectSuffix.test(name);
 }
 
 function companionLibrary(file) {
   const name = path.basename(file).toLowerCase();
   if (process.platform === "win32") return name.endsWith(".dll");
-  return name.endsWith(".dylib") || name.includes(".so");
+  return name.endsWith(".dylib") || sharedObjectSuffix.test(name);
 }
 
 // LocalVQE native runtime 随包分发(模型不随包,走 HF 下载)。
@@ -239,6 +248,9 @@ function prepareLocalvqeNative() {
     : null;
   if (!library && process.env.RUNNER_TEMP) {
     library = firstFile(process.env.RUNNER_TEMP, localvqeLibraryName);
+    if (library) {
+      console.warn(`asset warning: using LocalVQE native library discovered under RUNNER_TEMP: ${library}`);
+    }
   }
   if (!library) {
     library = firstFile(nativeDir, localvqeLibraryName);

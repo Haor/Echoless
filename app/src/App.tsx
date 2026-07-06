@@ -1,4 +1,12 @@
-import { useCallback, useEffect, useReducer, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useReducer,
+  useRef,
+  useState,
+  type Dispatch,
+  type MutableRefObject,
+} from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { getVersion } from "@tauri-apps/api/app";
 import type { UnlistenFn } from "@tauri-apps/api/event";
@@ -73,22 +81,26 @@ import { MicSetupPage } from "./pages/MicSetupPage";
 import { simNvafxDoctor, type RtxState } from "./nvafx";
 import { simMicDoctor, type MicState } from "./mic";
 import {
+  lvqeNoiseTargetFile,
+  lvqePureAec,
+  isNearDelayOnlyPatch,
+  hotInitialDelayValue,
+  hotLocalvqeNoiseGateValue,
+  platformNearDelayDefault,
+  createSerialQueue,
+  bypassToggleTarget,
+  settleBypassObservation,
+  clearBypassPending,
+} from "./engineLogic";
+import {
   publishRuntimeStatus,
   resetRuntimeHealth,
   resetRuntimeLive,
   setDiagnosticsSessionDir,
 } from "./runtimeTelemetry";
+import { REQUIRED_RUN_CONTROLS } from "./runtimeControls";
 
 const appWindow = getCurrentWindow();
-const REQUIRED_RUN_CONTROLS = [
-  "start_diagnostics",
-  "stop_diagnostics",
-  "set_output_level",
-  "set_near_delay_ms",
-  "set_initial_delay_ms",
-  "set_aec3_ns",
-  "set_aec3_agc",
-];
 
 const DEVICE_SELECTION_KEY = "echoless.deviceSelection.v1";
 
@@ -203,12 +215,6 @@ const MODELS: { kind: string; label: string }[] = [
   { kind: "nvidia_afx_aec", label: "NVAFX" },
 ];
 
-// LocalVQE 官方描述:v1.4 = 纯 AEC(无降噪),v1.3 = AEC + 降噪。
-// 首页 NOISE 开关在 LVQE 下的语义 = 在这两个版本间切换(文件名 "-aec-" 标记纯 AEC)。
-const LVQE_NS_ON_FILE = "localvqe-v1.3-4.8M-f32.gguf";
-const LVQE_NS_OFF_FILE = "localvqe-v1.4-aec-200K-f32.gguf";
-const lvqePureAec = (model: unknown) => String(model ?? "").includes("-aec-");
-
 function modelName(kind: string): string {
   return MODELS.find((m) => m.kind === kind)?.label ?? kind.toUpperCase();
 }
@@ -235,30 +241,6 @@ const EMPTY_DEVICES: DeviceList = {
   outputs: [],
   reference_sources: [],
 };
-
-function isNearDelayOnlyPatch(patch: Partial<PipelineCfg>): boolean {
-  const keys = Object.keys(patch);
-  return keys.length === 1 && keys[0] === "near_delay_ms";
-}
-
-function hotInitialDelayValue(value: unknown): number | null {
-  if (value == null || value === "") return 0;
-  const delayMs = Number(value);
-  if (!Number.isFinite(delayMs)) return null;
-  return Math.round(delayMs);
-}
-
-function hotLocalvqeNoiseGateValue(next: Record<string, unknown>): {
-  enabled: boolean;
-  thresholdDbfs: number;
-} | null {
-  const threshold =
-    next.noise_gate_threshold_dbfs == null || next.noise_gate_threshold_dbfs === ""
-      ? -45
-      : Number(next.noise_gate_threshold_dbfs);
-  if (!Number.isFinite(threshold)) return null;
-  return { enabled: Boolean(next.noise_gate), thresholdDbfs: threshold };
-}
 
 type View =
   | "overview"
@@ -292,6 +274,7 @@ type AppState = {
   rec: boolean;
   // P8-D1:穿透中(sidecar 活着,mic 直通,AEC 保温)。UI 的「电源 OFF」= 此态。
   bypassed: boolean;
+  bypassPending: boolean | null;
   diagSeconds: number | null;
   diagDir: string;
 };
@@ -307,6 +290,15 @@ type EngineState = {
   pipeline: PipelineCfg;
   params: Record<string, unknown>;
 };
+
+type Override = Partial<{
+  mic: string;
+  output: string;
+  reference: string;
+  kind: string;
+  pipeline: PipelineCfg;
+  params: Record<string, unknown>;
+}>;
 
 type Patch<T> = Partial<T> | ((state: T) => T);
 
@@ -338,6 +330,7 @@ const INITIAL_APP_STATE: AppState = {
   io: null,
   rec: false,
   bypassed: false,
+  bypassPending: null,
   diagSeconds: null,
   diagDir: "",
 };
@@ -438,123 +431,34 @@ function initAppState(): AppState {
   }
 }
 
-function useAppController() {
-  const [appState, updateApp] = useReducer(
-    patchReducer<AppState>,
-    undefined,
-    initAppState,
-  );
+type DeviceEnumerationDeps = {
+  doctorRef: MutableRefObject<DoctorAudio | null>;
+  powerOnRef: MutableRefObject<boolean>;
+  telRef: MutableRefObject<Telemetry>;
+  applyChangeRef: MutableRefObject<(next: Override) => void>;
+  updateApp: Dispatch<Patch<AppState>>;
+  noteError: (err: string | null) => void;
+};
+
+function useDeviceEnumeration({
+  doctorRef,
+  powerOnRef,
+  telRef,
+  applyChangeRef,
+  updateApp,
+  noteError,
+}: DeviceEnumerationDeps) {
   const [selection, updateSelection] = useReducer(
     patchReducer<SelectionState>,
     undefined,
     initSelection,
   );
-  const [engineState, updateEngine] = useReducer(
-    patchReducer<EngineState>,
-    undefined,
-    initEngineState,
-  );
-  const {
-    platform,
-    devices,
-    processors,
-    powerOn,
-    busy,
-    err,
-    view,
-    doctor,
-    nvafx,
-    nvafxBusy,
-    dev,
-    devRtxState,
-    devMicState,
-    devPlatform,
-    io,
-    rec,
-    bypassed,
-    diagSeconds,
-    diagDir,
-  } = appState;
-  const { selInput, selOutput, reference } = selection;
-  const { kind, pipeline, params } = engineState;
-
-  const telRef = useRef<Telemetry>({ mic: -120, ref: -120, out: -120, on: false });
-  // 当前 run 实际生效的参考源(由 started 给出),供 status 判断是否 Process Tap。
-  const refSourceRef = useRef<string | null>(null);
-  const cliVersionRef = useRef<string | null>(null);
-  const runControlsRef = useRef<Set<string> | null>(null);
-  // 子进程最近一条 stderr 日志(用于在非预期退出时报错)。
-  const lastLogRef = useRef<string>("");
-  const powerOnRef = useRef(powerOn);
-  powerOnRef.current = powerOn;
-  // 供 refreshDevices(mount 时创建的稳定回调)读到最新选择 / 触发最新 applyChange,
-  // 避免闭包里的陈旧 selection 把用户后来改过的设备写回 toml。
   const selectionRef = useRef(selection);
   selectionRef.current = selection;
-  const applyChangeRef = useRef(applyChange);
-  applyChangeRef.current = applyChange;
-  const doctorRef = useRef(doctor);
-  doctorRef.current = doctor;
-  const pipelineRef = useRef(pipeline);
-  pipelineRef.current = pipeline;
-  const paramsRef = useRef(params);
-  paramsRef.current = params;
-  // 记住每个引擎的参数(如 LocalVQE 选的模型),切换引擎再切回来不丢。跨重启持久化。
-  const paramsByKind = useRef<Record<string, Record<string, unknown>>>(
-    SAVED_ENGINE.paramsByKind ?? {},
-  );
-  const recRef = useRef(rec);
-  recRef.current = rec;
-  const diagSecondsRef = useRef(diagSeconds);
-  diagSecondsRef.current = diagSeconds;
-  const diagDirRef = useRef(diagDir);
-  diagDirRef.current = diagDir;
-  const { t } = useI18n();
 
-  const noteError = useCallback((err: string | null) => {
-    updateApp({ err });
-  }, []);
-
-  const gotoView = useCallback((view: View) => {
-    updateApp({ view });
-  }, []);
-
-  const chooseDevRtxState = useCallback((devRtxState: RtxState) => {
-    updateApp({ devRtxState });
-  }, []);
-
-  const chooseDevMicState = useCallback((devMicState: MicState) => {
-    updateApp({ devMicState });
-  }, []);
-
-  const kindRef = useRef(kind);
-  kindRef.current = kind;
-
-  const hasRunControl = useCallback((cmd: string): boolean => {
-    return runControlsRef.current?.has(cmd) ?? false;
-  }, []);
-
-  const reportMissingRunControl = useCallback((cmd: string) => {
-    noteError(
-      `CLI ${cliVersionRef.current ?? "unknown"} does not support runtime control "${cmd}". Rebuild or replace the bundled echoless CLI.`,
-    );
-  }, [noteError]);
-
-  // 录制就地起停命令(运行中改录制态用 stdin,不重启 run)。
-  const startDiag = useCallback(() => {
-    if (!hasRunControl("start_diagnostics")) {
-      reportMissingRunControl("start_diagnostics");
-      return;
-    }
-    if (diagDirRef.current) {
-      startDiagnostics(diagDirRef.current, diagSecondsRef.current).catch((e) =>
-        noteError(String(e)),
-      );
-    }
-  }, [hasRunControl, noteError, reportMissingRunControl]);
-
+  // 返回 promise 供就绪门等待首次枚举完成(后续热插拔刷新忽略返回值即可)。
   const refreshDevices = useCallback(() => {
-    listDevices()
+    return listDevices()
       .then((d) => {
         updateApp({ devices: d });
         const cur = selectionRef.current;
@@ -607,61 +511,332 @@ function useAppController() {
         }
       })
       .catch((e) => noteError(String(e)));
-  }, [noteError]);
+  }, [applyChangeRef, doctorRef, noteError, powerOnRef, telRef, updateApp]);
 
-  // 平台 + 设备/处理器枚举 + 事件订阅
+  useEffect(() => {
+    saveDeviceSelection({
+      input: selection.selInput,
+      output: selection.selOutput,
+      reference: selection.reference,
+    });
+  }, [selection.selInput, selection.selOutput, selection.reference]);
+
+  return { selection, updateSelection, refreshDevices };
+}
+
+type EngineConfigDeps = {
+  processors: Processor[];
+  platform: Platform;
+  dev: boolean;
+  nvafx: NvafxDoctor | null;
+  powerOnRef: MutableRefObject<boolean>;
+  applyChangeRef: MutableRefObject<(next: Override) => void>;
+  noteError: (err: string | null) => void;
+  gotoView: (view: View) => void;
+  hasRunControl: (cmd: string) => boolean;
+  reportMissingRunControl: (cmd: string) => void;
+};
+
+function useEngineConfig({
+  processors,
+  platform,
+  dev,
+  nvafx,
+  powerOnRef,
+  applyChangeRef,
+  noteError,
+  gotoView,
+  hasRunControl,
+  reportMissingRunControl,
+}: EngineConfigDeps) {
+  const [engineState, updateEngine] = useReducer(
+    patchReducer<EngineState>,
+    undefined,
+    initEngineState,
+  );
+  const { kind, pipeline, params } = engineState;
+  const pipelineRef = useRef(pipeline);
+  pipelineRef.current = pipeline;
+  const paramsRef = useRef(params);
+  paramsRef.current = params;
+  // 记住每个引擎的参数(如 LocalVQE 选的模型),切换引擎再切回来不丢。跨重启持久化。
+  const paramsByKind = useRef<Record<string, Record<string, unknown>>>(
+    SAVED_ENGINE.paramsByKind ?? {},
+  );
+  const kindRef = useRef(kind);
+  kindRef.current = kind;
+
+  // 引擎就绪判定:AEC3 永远就绪;LocalVQE 需模型;NVAFX 需平台支持 + doctor 通过。
+  // 开发态(dev)临时解开 NVAFX 的平台/doctor 门槛,用于走通前端流程。
+  function engineReady(k: string): boolean {
+    const proc = processors.find((p) => p.kind === k);
+    if (proc && !proc.platforms.includes(platform) && !dev) return false;
+    // LocalVQE 是否就绪要看它自己持久化的模型(可能当前激活的是别的引擎),
+    // 否则在 AEC3 激活时点 LocalVQE 会因 params.model 为空而误判未就绪、每次跳引擎页。
+    if (k === "localvqe")
+      return Boolean(
+        k === kind ? params.model : paramsByKind.current["localvqe"]?.model,
+      );
+    if (k === "nvidia_afx_aec") return dev || Boolean(nvafx?.ok);
+    return true;
+  }
+
+  // 切 backend:优先恢复该引擎上次的参数(保住 LocalVQE 选过的模型),否则用 manifest 默认。
+  function changeKind(k: string) {
+    paramsByKind.current[kind] = paramsRef.current; // 存下当前引擎的参数
+    const np =
+      paramsByKind.current[k] ??
+      defaultParams(processors.find((p) => p.kind === k));
+    updateEngine({ kind: k, params: np });
+    applyChangeRef.current({ kind: k, params: np });
+  }
+
+  // 改单个 chain 参数(NOISE / Advanced)。
+  function setParam(key: string, val: unknown) {
+    const np = { ...paramsRef.current, [key]: val };
+    paramsRef.current = np; // 同步更新 ref:探测后自动恢复引擎时能立刻读到新 initial_delay_ms
+    paramsByKind.current[kind] = np;
+    updateEngine({ params: np });
+    if (kind === "aec3" && key === "initial_delay_ms") {
+      if (powerOnRef.current) {
+        if (!hasRunControl("set_initial_delay_ms")) {
+          reportMissingRunControl("set_initial_delay_ms");
+          return;
+        }
+        const delayMs = hotInitialDelayValue(val);
+        if (delayMs == null) {
+          noteError("initial_delay_ms must be a finite number");
+          return;
+        }
+        setInitialDelayMs(delayMs).catch((e) => noteError(String(e)));
+      }
+      return;
+    }
+    if (kind === "aec3" && (key === "ns" || key === "ns_level")) {
+      if (powerOnRef.current) {
+        if (!hasRunControl("set_aec3_ns")) {
+          reportMissingRunControl("set_aec3_ns");
+          return;
+        }
+        setAec3Ns(Boolean(np.ns), String(np.ns_level ?? "low")).catch((e) =>
+          noteError(String(e)),
+        );
+      }
+      return;
+    }
+    if (kind === "aec3" && key === "agc") {
+      if (powerOnRef.current) {
+        if (!hasRunControl("set_aec3_agc")) {
+          reportMissingRunControl("set_aec3_agc");
+          return;
+        }
+        setAec3Agc(Boolean(val)).catch((e) => noteError(String(e)));
+      }
+      return;
+    }
+    if (
+      kind === "localvqe" &&
+      (key === "noise_gate" || key === "noise_gate_threshold_dbfs")
+    ) {
+      if (powerOnRef.current) {
+        if (!hasRunControl("set_localvqe_noise_gate")) {
+          reportMissingRunControl("set_localvqe_noise_gate");
+          return;
+        }
+        const gate = hotLocalvqeNoiseGateValue(np);
+        if (gate == null) {
+          noteError("noise_gate_threshold_dbfs must be a finite number");
+          return;
+        }
+        setLocalvqeNoiseGate(gate.enabled, gate.thresholdDbfs).catch((e) =>
+          noteError(String(e)),
+        );
+      }
+      return;
+    }
+    applyChangeRef.current({ params: np });
+  }
+
+  // LVQE 下的 NOISE 开关 = 切模型版本(ON→v1.3 AEC+降噪,OFF→v1.4 纯 AEC)。
+  // 目标版本未下载时跳 Engine 页(那里有下载入口),不生成缺文件的配置。
+  function setLvqeNoise(on: boolean) {
+    const curOn = !lvqePureAec(paramsRef.current.model);
+    if (on === curOn) return; // 已处于目标态
+    const target = lvqeNoiseTargetFile(on);
+    localvqeAssets()
+      .then((a) => {
+        const found = a.models.find((m) => m.filename === target);
+        if (found) pickLocalvqeModel(found.path);
+        else gotoView("engine");
+      })
+      .catch((e) => noteError(String(e)));
+  }
+
+  // 选 LocalVQE 模型(清单常驻):原子地切到 localvqe 引擎并设 model,避免把 model 写到当前引擎上。
+  function pickLocalvqeModel(path: string) {
+    const base =
+      paramsByKind.current["localvqe"] ??
+      defaultParams(processors.find((p) => p.kind === "localvqe"));
+    const np = { ...base, model: path };
+    paramsByKind.current[kind] = paramsRef.current; // 存下当前引擎
+    paramsByKind.current["localvqe"] = np;
+    updateEngine({ kind: "localvqe", params: np });
+    applyChangeRef.current({ kind: "localvqe", params: np });
+  }
+
+  function hotNearDelayValue(next: PipelineCfg): number {
+    return next.near_delay_ms ?? platformNearDelayDefault(platform);
+  }
+
+  // 改管线项。near_delay_ms 可运行中热控;采样率/帧长/参考声道仍需重启。
+  function changePipeline(patch: Partial<PipelineCfg>) {
+    const npl = { ...pipelineRef.current, ...patch };
+    pipelineRef.current = npl; // 同步更新 ref:探测后自动恢复引擎时能立刻读到新 near_delay
+    updateEngine({ pipeline: npl });
+    if (isNearDelayOnlyPatch(patch)) {
+      if (powerOnRef.current) {
+        if (!hasRunControl("set_near_delay_ms")) {
+          reportMissingRunControl("set_near_delay_ms");
+          return;
+        }
+        setNearDelayMs(hotNearDelayValue(npl)).catch((e) =>
+          noteError(String(e)),
+        );
+      }
+      return;
+    }
+    applyChangeRef.current({ pipeline: npl });
+  }
+
+  // 输出音量(滚轮 0-100):落进 pipeline(下次 start 用);运行中走 stdin 实时控制,
+  // 逐 buffer 生效、零掉音(不 applyChange —— 那会 stop+start 抖音频)。
+  function changeOutVolume(v: number) {
+    const npl = { ...pipelineRef.current, output_level: v };
+    pipelineRef.current = npl;
+    updateEngine({ pipeline: npl });
+    if (powerOnRef.current) {
+      if (!hasRunControl("set_output_level")) {
+        reportMissingRunControl("set_output_level");
+        return;
+      }
+      setOutputLevel(v).catch((e) => noteError(String(e)));
+    }
+  }
+
+  // 引擎配置持久化:kind/pipeline/params 任一变更即写回(paramsByKind 随写,
+  // 切引擎再切回、重启 app 都不丢)。
+  useEffect(() => {
+    paramsByKind.current[kind] = params;
+    try {
+      localStorage.setItem(
+        ENGINE_STATE_KEY,
+        JSON.stringify({ kind, pipeline, paramsByKind: paramsByKind.current }),
+      );
+    } catch {
+      /* 持久化失败不阻塞 */
+    }
+  }, [kind, pipeline, params]);
+
+  return {
+    engineState,
+    updateEngine,
+    kindRef,
+    pipelineRef,
+    paramsRef,
+    paramsByKind,
+    engineReady,
+    changeKind,
+    setParam,
+    setLvqeNoise,
+    pickLocalvqeModel,
+    changePipeline,
+    changeOutVolume,
+  };
+}
+
+type RunLifecycleDeps = {
+  busy: boolean;
+  powerOn: boolean;
+  bypassed: boolean;
+  bypassPending: boolean | null;
+  rec: boolean;
+  diagSeconds: number | null;
+  diagDir: string;
+  selInput: string;
+  selOutput: string;
+  reference: string;
+  kind: string;
+  engineReady: (kind: string) => boolean;
+  pipelineRef: MutableRefObject<PipelineCfg>;
+  paramsRef: MutableRefObject<Record<string, unknown>>;
+  telRef: MutableRefObject<Telemetry>;
+  cliVersionRef: MutableRefObject<string | null>;
+  runControlsRef: MutableRefObject<Set<string> | null>;
+  powerOnRef: MutableRefObject<boolean>;
+  applyChangeRef: MutableRefObject<(next: Override) => void>;
+  updateApp: Dispatch<Patch<AppState>>;
+  noteError: (err: string | null) => void;
+  gotoView: (view: View) => void;
+  hasRunControl: (cmd: string) => boolean;
+  reportMissingRunControl: (cmd: string) => void;
+};
+
+function useRunLifecycle({
+  busy,
+  powerOn,
+  bypassed,
+  bypassPending,
+  rec,
+  diagSeconds,
+  diagDir,
+  selInput,
+  selOutput,
+  reference,
+  kind,
+  engineReady,
+  pipelineRef,
+  paramsRef,
+  telRef,
+  cliVersionRef,
+  runControlsRef,
+  powerOnRef,
+  applyChangeRef,
+  updateApp,
+  noteError,
+  gotoView,
+  hasRunControl,
+  reportMissingRunControl,
+}: RunLifecycleDeps) {
+  // 当前 run 实际生效的参考源(由 started 给出),供 status 判断是否 Process Tap。
+  const refSourceRef = useRef<string | null>(null);
+  // 子进程最近一条 stderr 日志(用于在非预期退出时报错)。
+  const lastLogRef = useRef<string>("");
+  const probeBorrowedRunRef = useRef(false);
+  const recRef = useRef(rec);
+  recRef.current = rec;
+  const diagSecondsRef = useRef(diagSeconds);
+  diagSecondsRef.current = diagSeconds;
+  const diagDirRef = useRef(diagDir);
+  diagDirRef.current = diagDir;
+
+  // 录制就地起停命令(运行中改录制态用 stdin,不重启 run)。
+  const startDiag = useCallback(() => {
+    if (!hasRunControl("start_diagnostics")) {
+      reportMissingRunControl("start_diagnostics");
+      return;
+    }
+    if (diagDirRef.current) {
+      startDiagnostics(diagDirRef.current, diagSecondsRef.current).catch((e) =>
+        noteError(String(e)),
+      );
+    }
+  }, [hasRunControl, noteError, reportMissingRunControl]);
+
   useEffect(() => {
     // 清理可能残留的 sidecar(前端 reload 后 Rust 子进程可能还活着 → 状态脱同步)。
     stopRun().catch(() => {});
-    getPlatform()
-      .then((platform) => updateApp({ platform }))
-      .catch(() => {});
-    refreshDevices();
-    listProcessors()
-      .then((m) => {
-        updateApp({ processors: m.processors });
-        const proc = m.processors.find((p) => p.kind === kindRef.current);
-        // manifest defaults 打底 + 持久化参数覆盖:新版本新增参数时老存档不缺键。
-        updateEngine((cur) => ({
-          ...cur,
-          params: {
-            ...defaultParams(proc),
-            ...(Object.keys(cur.params).length
-              ? cur.params
-              : (paramsByKind.current[kindRef.current] ?? {})),
-          },
-        }));
-      })
-      .catch((e) => noteError(String(e)));
-    doctorAudio()
-      .then((doctor) => updateApp({ doctor }))
-      .catch(() => {});
-    nvafxDoctor()
-      .then((nvafx) => updateApp({ nvafx }))
-      .catch(() => {});
-    defaultDiagDir()
-      .then((diagDir) => updateApp({ diagDir }))
-      .catch(() => {});
-
-    // 设备热插拔:三路触发 → 同一个防抖刷新。
-    //   ① 原生 CoreAudio 监听(macOS;WKWebView 不触发 devicechange)
-    //   ② webview devicechange(Windows WebView2 可靠)
-    //   ③ 窗口聚焦 + 下拉展开(兜底)
-    // 300ms 防抖合并连发——一次插拔常触发多个事件,每次刷新都 spawn 一次 CLI 枚举。
-    let devChangeTimer = 0;
-    const refreshDevicesSoon = () => {
-      window.clearTimeout(devChangeTimer);
-      devChangeTimer = window.setTimeout(refreshDevices, 300);
-    };
-    navigator.mediaDevices?.addEventListener?.(
-      "devicechange",
-      refreshDevicesSoon,
-    );
-    window.addEventListener("focus", refreshDevicesSoon);
-
     const uns: UnlistenFn[] = [];
     (async () => {
-      uns.push(await onDevicesChanged(refreshDevicesSoon));
       uns.push(
         await onRunEvent((ev) => {
           if (ev.type === "started") {
@@ -699,6 +874,12 @@ function useAppController() {
             return; // 等 diagnostics_done 收尾
           }
           if (ev.type === "control_error") {
+            if (ev.cmd === "set_bypass") {
+              updateApp((state) => ({
+                ...state,
+                ...clearBypassPending(state),
+              }));
+            }
             noteError(`${ev.cmd}: ${ev.message}`);
             return;
           }
@@ -720,13 +901,12 @@ function useAppController() {
           if (ev.type === "localvqe_noise_gate_changed") {
             return;
           }
-          // 穿透回执:以后端为准校准(乐观更新失败时会被拉回)。
+          // 穿透回执:pending 只由后端回执/status 落定,避免写入竞态把假状态钉死。
           if (ev.type === "bypass_changed") {
-            updateApp((state) =>
-              state.bypassed === ev.bypassed
-                ? state
-                : { ...state, bypassed: ev.bypassed },
-            );
+            updateApp((state) => ({
+              ...state,
+              ...settleBypassObservation(state, ev.bypassed),
+            }));
             return;
           }
           // 诊断录制收尾:writer 已 finalize 文件。「录满 max_seconds」和
@@ -768,9 +948,10 @@ function useAppController() {
           // status 常驻 bypassed 字段:兜底同步(如回执丢失/前端重载)。
           if (typeof s.bypassed === "boolean") {
             const sb = s.bypassed;
-            updateApp((state) =>
-              state.bypassed === sb ? state : { ...state, bypassed: sb },
-            );
+            updateApp((state) => ({
+              ...state,
+              ...settleBypassObservation(state, sb),
+            }));
           }
           const tel = telRef.current;
           tel.mic = s.mic_dbfs;
@@ -787,7 +968,7 @@ function useAppController() {
         await onRunExit((ev) => {
           telRef.current.on = false;
           resetRuntimeLive(); // 清掉停机后残留的 dBFS / 延迟读数
-          updateApp({ io: null, bypassed: false });
+          updateApp({ io: null, bypassed: false, bypassPending: null });
           refSourceRef.current = null;
           cliVersionRef.current = null;
           runControlsRef.current = null;
@@ -813,6 +994,427 @@ function useAppController() {
       );
     })();
     return () => {
+      uns.forEach((u) => u());
+    };
+  }, [hasRunControl, noteError, startDiag, updateApp]);
+
+  function currentToml(over?: Override) {
+    return buildConfigToml({
+      mic: over?.mic ?? selInput,
+      output: over?.output ?? selOutput,
+      reference: over?.reference ?? reference,
+      kind: over?.kind ?? kind,
+      pipeline: over?.pipeline ?? pipelineRef.current,
+      params: over?.params ?? paramsRef.current,
+      // 录制改由 stdin 就地控制(start/stop_diagnostics),不再写进 toml。
+      diagnostics: null,
+    });
+  }
+
+  async function start() {
+    updateApp({ busy: true, err: null });
+    resetRuntimeHealth();
+    resetRuntimeLive();
+    lastLogRef.current = ""; // 清掉上次的 stderr,避免旧错误误报
+    try {
+      const toml = currentToml();
+      const v = await validateConfig(toml);
+      if (!v.ok) {
+        updateApp({
+          err: v.errors.map((e) => `${e.path}: ${e.message}`).join("; "),
+          busy: false,
+        });
+        return;
+      }
+      telRef.current.on = true;
+      await startRun(toml, 80);
+      probeBorrowedRunRef.current = false;
+      // 启动即 AEC on(toml 不写 bypass,后端默认 false)。
+      updateApp({ powerOn: true, bypassed: false, bypassPending: null });
+    } catch (e) {
+      noteError(String(e));
+      telRef.current.on = false;
+    } finally {
+      updateApp({ busy: false });
+    }
+  }
+
+  async function stop() {
+    updateApp({ busy: true });
+    try {
+      await stopRun();
+    } catch (e) {
+      noteError(String(e));
+    } finally {
+      telRef.current.on = false;
+      updateApp({
+        powerOn: false,
+        bypassed: false,
+        bypassPending: null,
+        busy: false,
+      });
+    }
+  }
+
+  // 延迟侦测专用:probe 需独占麦克风/输出 → AdvancedPage 在探测前后调这个停/起引擎。
+  // 恢复时走 start(),会用上探测刚写入的 near_delay/initial_delay(refs 已同步)。
+  async function setRunForProbe(on: boolean) {
+    if (on) {
+      if (!probeBorrowedRunRef.current) return;
+      probeBorrowedRunRef.current = false;
+      await start();
+      return;
+    }
+    probeBorrowedRunRef.current = powerOnRef.current;
+    if (probeBorrowedRunRef.current) await stop();
+  }
+
+  // P8-D1 语义(用户拍板 2026-07-04):电源 OFF = 穿透,mic 绝不变哑。
+  //   sidecar 未跑 → 启动(AEC on);
+  //   AEC on     → set_bypass(true):mic 直通,引擎保温,15ms crossfade;
+  //   穿透中     → set_bypass(false):瞬时恢复 AEC(零重收敛)。
+  // 「完全停机」不是用户级操作(退出应用 = 停);stop() 只服务重启/probe/错误路径。
+  async function togglePower() {
+    if (busy) return;
+    if (powerOn) {
+      if (!hasRunControl("set_bypass")) {
+        // 旧 CLI 兼容:没有热穿透命令时退回整机停转。
+        await stop();
+        return;
+      }
+      const next = bypassToggleTarget({ bypassed, bypassPending });
+      if (next == null) return;
+      updateApp({ bypassPending: next });
+      setBypass(next).catch((e) => {
+        updateApp((state) => ({
+          ...state,
+          ...clearBypassPending(state, next),
+        }));
+        noteError(String(e));
+      });
+      return;
+    }
+    // 引擎未就绪(无模型 / doctor 未过)→ 先去 Engine 配置,避免启动即失败。
+    if (!engineReady(kind)) {
+      gotoView("engine");
+      return;
+    }
+    // A5 后:tap 采样率由 helper 上报并在后端重采样,系统参考不再要求 48k。
+    await start();
+  }
+
+  // Applies changes that still require rebuilding the sidecar runtime.
+  // Hot controls bypass this path to avoid an audio dropout.
+  // 审计 B-04:手动切换与热插拔自动刷新(devicechange → applyChangeRef)可
+  // 重叠,交错的 stop→start 可能终态「UI 显示 OFF 但 sidecar 仍在采集」。
+  // 串行队列合并 delta、只跑最后一次;run 经 ref 读最新 doApplyChange 避免闭包过期,
+  // 电源态在真正执行的时刻判定(排队期间可能已被关掉)。
+  const doApplyRef = useRef<(next: Override) => Promise<void>>(async () => {});
+  doApplyRef.current = doApplyChange;
+  const applyQueueRef = useRef(
+    createSerialQueue<Override>((merged) => {
+      if (!powerOnRef.current) return Promise.resolve();
+      return doApplyRef.current(merged);
+    }),
+  );
+
+  function applyChange(next: Override) {
+    applyQueueRef.current.enqueue(next);
+  }
+
+  applyChangeRef.current = applyChange;
+
+  async function doApplyChange(next: Override) {
+    updateApp({ busy: true });
+    try {
+      await stopRun();
+      const toml = currentToml(next);
+      const v = await validateConfig(toml);
+      if (!v.ok) {
+        updateApp({
+          err: v.errors.map((e) => `${e.path}: ${e.message}`).join("; "),
+          powerOn: false,
+          bypassed: false,
+          bypassPending: null,
+        });
+        telRef.current.on = false;
+        return;
+      }
+      telRef.current.on = true;
+      await startRun(toml, 80);
+      updateApp({ powerOn: true, bypassed: false, bypassPending: null });
+      noteError(null);
+    } catch (e) {
+      noteError(String(e));
+      telRef.current.on = false;
+      updateApp({ powerOn: false, bypassed: false, bypassPending: null });
+    } finally {
+      updateApp({ busy: false });
+    }
+  }
+
+  // 诊断录制开关:运行中 → 经 stdin 就地起停(不重启 run);未运行 → 仅置位,
+  // 等 run 启动后由 started 处理。
+  const setRecording = useCallback((on: boolean) => {
+    updateApp({ rec: on });
+    recRef.current = on;
+    if (!powerOnRef.current) return;
+    if (on) startDiag();
+    else {
+      if (!hasRunControl("stop_diagnostics")) {
+        reportMissingRunControl("stop_diagnostics");
+        return;
+      }
+      stopDiagnostics().catch((e) => noteError(String(e)));
+    }
+  }, [hasRunControl, noteError, reportMissingRunControl, startDiag, updateApp]);
+
+  // 时长 / 目录:仅更新状态。录制中改动 → 重发 start_diagnostics 让新参数立即生效
+  // (后端先收尾旧 session 再开新的)。
+  const setRecSeconds = useCallback((v: number | null) => {
+    updateApp({ diagSeconds: v });
+    diagSecondsRef.current = v;
+    if (powerOnRef.current && recRef.current) startDiag();
+  }, [startDiag, updateApp]);
+  const setRecDir = useCallback((v: string) => {
+    updateApp({ diagDir: v });
+    diagDirRef.current = v;
+    if (powerOnRef.current && recRef.current) startDiag();
+  }, [startDiag, updateApp]);
+
+  return {
+    applyChange,
+    setRunForProbe,
+    togglePower,
+    setRecording,
+    setRecSeconds,
+    setRecDir,
+  };
+}
+
+function AppShell() {
+  const [appState, updateApp] = useReducer(
+    patchReducer<AppState>,
+    undefined,
+    initAppState,
+  );
+  // 就绪门:首屏数据+字体就位前整窗隐藏,一次性淡入——消除空壳骨架闪烁与
+  // 字标 FOUT(fallback 字体宽度不同 → 点阵字标从窄变宽跳)。
+  const [booted, setBooted] = useState(false);
+  // 独立兜底:无论数据 effect 内部发生什么(异常/promise 不 resolve),
+  // 字体就绪即揭幕,最迟 1.2s 硬封顶保证绝不卡在空屏。字体本地 woff2
+  // 加载 <200ms,常态是数据 effect 先揭幕(见下),这里只兜底。
+  useEffect(() => {
+    let cancelled = false;
+    const lift = () => {
+      if (!cancelled) setBooted(true);
+    };
+    Promise.race([
+      document.fonts?.ready ?? Promise.resolve(),
+      new Promise((r) => setTimeout(r, 1200)),
+    ]).then(lift);
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+  // 窗口以 visible:false 创建;首屏就绪后再显示,彻底消除 WebView 初始化白闪。
+  // booted 有 1.2s 硬封顶保证必翻真;Rust 侧另有 5s 兜底防前端崩溃。
+  useEffect(() => {
+    if (!booted) return;
+    const w = getCurrentWindow();
+    w.show()
+      .then(() => w.setFocus())
+      .catch(() => {});
+  }, [booted]);
+  const {
+    platform,
+    devices,
+    processors,
+    powerOn,
+    busy,
+    err,
+    view,
+    doctor,
+    nvafx,
+    nvafxBusy,
+    dev,
+    devRtxState,
+    devMicState,
+    devPlatform,
+    io,
+    rec,
+    bypassed,
+    bypassPending,
+    diagSeconds,
+    diagDir,
+  } = appState;
+
+  const telRef = useRef<Telemetry>({ mic: -120, ref: -120, out: -120, on: false });
+  const cliVersionRef = useRef<string | null>(null);
+  const runControlsRef = useRef<Set<string> | null>(null);
+  const powerOnRef = useRef(powerOn);
+  powerOnRef.current = powerOn;
+  const applyChangeRef = useRef<(next: Override) => void>(() => {});
+  const doctorRef = useRef(doctor);
+  doctorRef.current = doctor;
+  const { t } = useI18n();
+
+  const noteError = useCallback((err: string | null) => {
+    updateApp({ err });
+  }, []);
+
+  const { selection, updateSelection, refreshDevices } = useDeviceEnumeration({
+    doctorRef,
+    powerOnRef,
+    telRef,
+    applyChangeRef,
+    updateApp,
+    noteError,
+  });
+  const { selInput, selOutput, reference } = selection;
+
+  const gotoView = useCallback((view: View) => {
+    updateApp({ view });
+  }, []);
+
+  const chooseDevRtxState = useCallback((devRtxState: RtxState) => {
+    updateApp({ devRtxState });
+  }, []);
+
+  const chooseDevMicState = useCallback((devMicState: MicState) => {
+    updateApp({ devMicState });
+  }, []);
+
+  const hasRunControl = useCallback((cmd: string): boolean => {
+    return runControlsRef.current?.has(cmd) ?? false;
+  }, []);
+
+  const reportMissingRunControl = useCallback((cmd: string) => {
+    noteError(
+      `CLI ${cliVersionRef.current ?? "unknown"} does not support runtime control "${cmd}". Rebuild or replace the bundled echoless CLI.`,
+    );
+  }, [noteError]);
+
+  const {
+    engineState,
+    updateEngine,
+    kindRef,
+    pipelineRef,
+    paramsRef,
+    paramsByKind,
+    engineReady,
+    changeKind,
+    setParam,
+    setLvqeNoise,
+    pickLocalvqeModel,
+    changePipeline,
+    changeOutVolume,
+  } = useEngineConfig({
+    processors,
+    platform,
+    dev,
+    nvafx,
+    powerOnRef,
+    applyChangeRef,
+    noteError,
+    gotoView,
+    hasRunControl,
+    reportMissingRunControl,
+  });
+  const { kind, pipeline, params } = engineState;
+
+  const {
+    applyChange,
+    setRunForProbe,
+    togglePower,
+    setRecording,
+    setRecSeconds,
+    setRecDir,
+  } = useRunLifecycle({
+    busy,
+    powerOn,
+    bypassed,
+    bypassPending,
+    rec,
+    diagSeconds,
+    diagDir,
+    selInput,
+    selOutput,
+    reference,
+    kind,
+    engineReady,
+    pipelineRef,
+    paramsRef,
+    telRef,
+    cliVersionRef,
+    runControlsRef,
+    powerOnRef,
+    applyChangeRef,
+    updateApp,
+    noteError,
+    gotoView,
+    hasRunControl,
+    reportMissingRunControl,
+  });
+
+  // 平台 + 设备/处理器枚举 + 设备热插拔
+  useEffect(() => {
+    const platformReady = getPlatform()
+      .then((platform) => updateApp({ platform }))
+      .catch(() => {});
+    const devicesReady = refreshDevices();
+    const processorsReady = listProcessors()
+      .then((m) => {
+        updateApp({ processors: m.processors });
+        const proc = m.processors.find((p) => p.kind === kindRef.current);
+        // manifest defaults 打底 + 持久化参数覆盖:新版本新增参数时老存档不缺键。
+        updateEngine((cur) => ({
+          ...cur,
+          params: {
+            ...defaultParams(proc),
+            ...(Object.keys(cur.params).length
+              ? cur.params
+              : (paramsByKind.current[kindRef.current] ?? {})),
+          },
+        }));
+      })
+      .catch((e) => noteError(String(e)));
+    // 常态揭幕:首批关键数据(平台/设备/引擎清单)就位即亮屏,通常远早于
+    // 上面的 1.2s 兜底。allSettled 不因单路失败而卡;硬封顶由独立 effect 兜底。
+    Promise.allSettled([platformReady, devicesReady, processorsReady]).then(
+      () => setBooted(true),
+    );
+    doctorAudio()
+      .then((doctor) => updateApp({ doctor }))
+      .catch(() => {});
+    nvafxDoctor()
+      .then((nvafx) => updateApp({ nvafx }))
+      .catch(() => {});
+    defaultDiagDir()
+      .then((diagDir) => updateApp({ diagDir }))
+      .catch(() => {});
+
+    // 设备热插拔:三路触发 → 同一个防抖刷新。
+    //   ① 原生 CoreAudio 监听(macOS;WKWebView 不触发 devicechange)
+    //   ② webview devicechange(Windows WebView2 可靠)
+    //   ③ 窗口聚焦 + 下拉展开(兜底)
+    // 300ms 防抖合并连发——一次插拔常触发多个事件,每次刷新都 spawn 一次 CLI 枚举。
+    let devChangeTimer = 0;
+    const refreshDevicesSoon = () => {
+      window.clearTimeout(devChangeTimer);
+      devChangeTimer = window.setTimeout(refreshDevices, 300);
+    };
+    navigator.mediaDevices?.addEventListener?.(
+      "devicechange",
+      refreshDevicesSoon,
+    );
+    window.addEventListener("focus", refreshDevicesSoon);
+
+    const uns: UnlistenFn[] = [];
+    (async () => {
+      uns.push(await onDevicesChanged(refreshDevicesSoon));
+    })();
+    return () => {
       window.clearTimeout(devChangeTimer);
       navigator.mediaDevices?.removeEventListener?.(
         "devicechange",
@@ -821,7 +1423,7 @@ function useAppController() {
       window.removeEventListener("focus", refreshDevicesSoon);
       uns.forEach((u) => u());
     };
-  }, [hasRunControl, noteError, refreshDevices, startDiag]);
+  }, [noteError, refreshDevices]);
 
   // Esc 始终有意义:在次级页按 Esc 返回 Overview。
   useEffect(() => {
@@ -832,14 +1434,6 @@ function useAppController() {
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, [gotoView, view]);
-
-  useEffect(() => {
-    saveDeviceSelection({
-      input: selInput,
-      output: selOutput,
-      reference,
-    });
-  }, [selInput, selOutput, reference]);
 
   // 桌面 app:禁用 Tab 键焦点移动(避免按钮出现键盘选中框)。
   useEffect(() => {
@@ -947,308 +1541,6 @@ function useAppController() {
       .catch((e) => noteError(String(e)))
       .finally(() => updateApp({ nvafxBusy: false }));
   }
-
-  // 引擎就绪判定:AEC3 永远就绪;LocalVQE 需模型;NVAFX 需平台支持 + doctor 通过。
-  // 开发态(dev)临时解开 NVAFX 的平台/doctor 门槛,用于走通前端流程。
-  function engineReady(k: string): boolean {
-    const proc = processors.find((p) => p.kind === k);
-    if (proc && !proc.platforms.includes(platform) && !dev) return false;
-    // LocalVQE 是否就绪要看它自己持久化的模型(可能当前激活的是别的引擎),
-    // 否则在 AEC3 激活时点 LocalVQE 会因 params.model 为空而误判未就绪、每次跳引擎页。
-    if (k === "localvqe")
-      return Boolean(
-        k === kind ? params.model : paramsByKind.current["localvqe"]?.model,
-      );
-    if (k === "nvidia_afx_aec") return dev || Boolean(nvafx?.ok);
-    return true;
-  }
-
-  type Override = Partial<{
-    mic: string;
-    output: string;
-    reference: string;
-    kind: string;
-    pipeline: PipelineCfg;
-    params: Record<string, unknown>;
-  }>;
-
-  function currentToml(over?: Override) {
-    return buildConfigToml({
-      mic: over?.mic ?? selInput,
-      output: over?.output ?? selOutput,
-      reference: over?.reference ?? reference,
-      kind: over?.kind ?? kind,
-      pipeline: over?.pipeline ?? pipelineRef.current,
-      params: over?.params ?? paramsRef.current,
-      // 录制改由 stdin 就地控制(start/stop_diagnostics),不再写进 toml。
-      diagnostics: null,
-    });
-  }
-
-  async function start() {
-    updateApp({ busy: true, err: null });
-    resetRuntimeHealth();
-    resetRuntimeLive();
-    lastLogRef.current = ""; // 清掉上次的 stderr,避免旧错误误报
-    try {
-      const toml = currentToml();
-      const v = await validateConfig(toml);
-      if (!v.ok) {
-        updateApp({
-          err: v.errors.map((e) => `${e.path}: ${e.message}`).join("; "),
-          busy: false,
-        });
-        return;
-      }
-      telRef.current.on = true;
-      await startRun(toml, 80);
-      // 启动即 AEC on(toml 不写 bypass,后端默认 false)。
-      updateApp({ powerOn: true, bypassed: false });
-    } catch (e) {
-      noteError(String(e));
-      telRef.current.on = false;
-    } finally {
-      updateApp({ busy: false });
-    }
-  }
-
-  async function stop() {
-    updateApp({ busy: true });
-    try {
-      await stopRun();
-    } catch (e) {
-      noteError(String(e));
-    } finally {
-      telRef.current.on = false;
-      updateApp({ powerOn: false, bypassed: false, busy: false });
-    }
-  }
-
-  // 延迟侦测专用:probe 需独占麦克风/输出 → AdvancedPage 在探测前后调这个停/起引擎。
-  // 恢复时走 start(),会用上探测刚写入的 near_delay/initial_delay(refs 已同步)。
-  async function setRunForProbe(on: boolean) {
-    if (on) await start();
-    else await stop();
-  }
-
-  // P8-D1 语义(用户拍板 2026-07-04):电源 OFF = 穿透,mic 绝不变哑。
-  //   sidecar 未跑 → 启动(AEC on);
-  //   AEC on     → set_bypass(true):mic 直通,引擎保温,15ms crossfade;
-  //   穿透中     → set_bypass(false):瞬时恢复 AEC(零重收敛)。
-  // 「完全停机」不是用户级操作(退出应用 = 停);stop() 只服务重启/probe/错误路径。
-  async function togglePower() {
-    if (busy) return;
-    if (powerOn) {
-      if (!hasRunControl("set_bypass")) {
-        // 旧 CLI 兼容:没有热穿透命令时退回整机停转。
-        await stop();
-        return;
-      }
-      const next = !bypassed;
-      updateApp({ bypassed: next }); // 乐观更新,回执/status 会再校准
-      setBypass(next).catch((e) => noteError(String(e)));
-      return;
-    }
-    // 引擎未就绪(无模型 / doctor 未过)→ 先去 Engine 配置,避免启动即失败。
-    if (!engineReady(kind)) {
-      gotoView("engine");
-      return;
-    }
-    // A5 后:tap 采样率由 helper 上报并在后端重采样,系统参考不再要求 48k。
-    await start();
-  }
-
-  // Applies changes that still require rebuilding the sidecar runtime.
-  // Hot controls bypass this path to avoid an audio dropout.
-  async function applyChange(next: Override) {
-    if (!powerOnRef.current) return;
-    updateApp({ busy: true });
-    try {
-      await stopRun();
-      const toml = currentToml(next);
-      const v = await validateConfig(toml);
-      if (!v.ok) {
-        updateApp({
-          err: v.errors.map((e) => `${e.path}: ${e.message}`).join("; "),
-          powerOn: false,
-        });
-        telRef.current.on = false;
-        return;
-      }
-      telRef.current.on = true;
-      await startRun(toml, 80);
-      noteError(null);
-    } catch (e) {
-      noteError(String(e));
-      telRef.current.on = false;
-      updateApp({ powerOn: false });
-    } finally {
-      updateApp({ busy: false });
-    }
-  }
-
-  // 切 backend:优先恢复该引擎上次的参数(保住 LocalVQE 选过的模型),否则用 manifest 默认。
-  function changeKind(k: string) {
-    paramsByKind.current[kind] = paramsRef.current; // 存下当前引擎的参数
-    const np =
-      paramsByKind.current[k] ??
-      defaultParams(processors.find((p) => p.kind === k));
-    updateEngine({ kind: k, params: np });
-    applyChange({ kind: k, params: np });
-  }
-  // 改单个 chain 参数(NOISE / Advanced)。
-  function setParam(key: string, val: unknown) {
-    const np = { ...paramsRef.current, [key]: val };
-    paramsRef.current = np; // 同步更新 ref:探测后自动恢复引擎时能立刻读到新 initial_delay_ms
-    paramsByKind.current[kind] = np;
-    updateEngine({ params: np });
-    if (kind === "aec3" && key === "initial_delay_ms") {
-      if (powerOnRef.current) {
-        if (!hasRunControl("set_initial_delay_ms")) {
-          reportMissingRunControl("set_initial_delay_ms");
-          return;
-        }
-        const delayMs = hotInitialDelayValue(val);
-        if (delayMs == null) {
-          noteError("initial_delay_ms must be a finite number");
-          return;
-        }
-        setInitialDelayMs(delayMs).catch((e) => noteError(String(e)));
-      }
-      return;
-    }
-    if (kind === "aec3" && (key === "ns" || key === "ns_level")) {
-      if (powerOnRef.current) {
-        if (!hasRunControl("set_aec3_ns")) {
-          reportMissingRunControl("set_aec3_ns");
-          return;
-        }
-        setAec3Ns(Boolean(np.ns), String(np.ns_level ?? "low")).catch((e) =>
-          noteError(String(e)),
-        );
-      }
-      return;
-    }
-    if (kind === "aec3" && key === "agc") {
-      if (powerOnRef.current) {
-        if (!hasRunControl("set_aec3_agc")) {
-          reportMissingRunControl("set_aec3_agc");
-          return;
-        }
-        setAec3Agc(Boolean(val)).catch((e) => noteError(String(e)));
-      }
-      return;
-    }
-    if (
-      kind === "localvqe" &&
-      (key === "noise_gate" || key === "noise_gate_threshold_dbfs")
-    ) {
-      if (powerOnRef.current) {
-        if (!hasRunControl("set_localvqe_noise_gate")) {
-          reportMissingRunControl("set_localvqe_noise_gate");
-          return;
-        }
-        const gate = hotLocalvqeNoiseGateValue(np);
-        if (gate == null) {
-          noteError("noise_gate_threshold_dbfs must be a finite number");
-          return;
-        }
-        setLocalvqeNoiseGate(gate.enabled, gate.thresholdDbfs).catch((e) =>
-          noteError(String(e)),
-        );
-      }
-      return;
-    }
-    applyChange({ params: np });
-  }
-  // LVQE 下的 NOISE 开关 = 切模型版本(ON→v1.3 AEC+降噪,OFF→v1.4 纯 AEC)。
-  // 目标版本未下载时跳 Engine 页(那里有下载入口),不生成缺文件的配置。
-  function setLvqeNoise(on: boolean) {
-    const curOn = !lvqePureAec(paramsRef.current.model);
-    if (on === curOn) return; // 已处于目标态
-    const target = on ? LVQE_NS_ON_FILE : LVQE_NS_OFF_FILE;
-    localvqeAssets()
-      .then((a) => {
-        const found = a.models.find((m) => m.filename === target);
-        if (found) pickLocalvqeModel(found.path);
-        else gotoView("engine");
-      })
-      .catch((e) => noteError(String(e)));
-  }
-  // 选 LocalVQE 模型(清单常驻):原子地切到 localvqe 引擎并设 model,避免把 model 写到当前引擎上。
-  function pickLocalvqeModel(path: string) {
-    const base =
-      paramsByKind.current["localvqe"] ??
-      defaultParams(processors.find((p) => p.kind === "localvqe"));
-    const np = { ...base, model: path };
-    paramsByKind.current[kind] = paramsRef.current; // 存下当前引擎
-    paramsByKind.current["localvqe"] = np;
-    updateEngine({ kind: "localvqe", params: np });
-    applyChange({ kind: "localvqe", params: np });
-  }
-  function hotNearDelayValue(next: PipelineCfg): number {
-    return next.near_delay_ms ?? (platform === "macos" ? 25 : 0);
-  }
-  // 改管线项。near_delay_ms 可运行中热控;采样率/帧长/参考声道仍需重启。
-  function changePipeline(patch: Partial<PipelineCfg>) {
-    const npl = { ...pipelineRef.current, ...patch };
-    pipelineRef.current = npl; // 同步更新 ref:探测后自动恢复引擎时能立刻读到新 near_delay
-    updateEngine({ pipeline: npl });
-    if (isNearDelayOnlyPatch(patch)) {
-      if (powerOnRef.current) {
-        if (!hasRunControl("set_near_delay_ms")) {
-          reportMissingRunControl("set_near_delay_ms");
-          return;
-        }
-        setNearDelayMs(hotNearDelayValue(npl)).catch((e) =>
-          noteError(String(e)),
-        );
-      }
-      return;
-    }
-    applyChange({ pipeline: npl });
-  }
-  // 输出音量(滚轮 0-100):落进 pipeline(下次 start 用);运行中走 stdin 实时控制,
-  // 逐 buffer 生效、零掉音(不 applyChange —— 那会 stop+start 抖音频)。
-  function changeOutVolume(v: number) {
-    const npl = { ...pipelineRef.current, output_level: v };
-    pipelineRef.current = npl;
-    updateEngine({ pipeline: npl });
-    if (powerOnRef.current) {
-      if (!hasRunControl("set_output_level")) {
-        reportMissingRunControl("set_output_level");
-        return;
-      }
-      setOutputLevel(v).catch((e) => noteError(String(e)));
-    }
-  }
-  // 诊断录制开关:运行中 → 经 stdin 就地起停(不重启 run);未运行 → 仅置位,
-  // 等 run 启动后由 started 处理。
-  const setRecording = useCallback((on: boolean) => {
-    updateApp({ rec: on });
-    recRef.current = on;
-    if (!powerOnRef.current) return;
-    if (on) startDiag();
-    else {
-      if (!hasRunControl("stop_diagnostics")) {
-        reportMissingRunControl("stop_diagnostics");
-        return;
-      }
-      stopDiagnostics().catch((e) => noteError(String(e)));
-    }
-  }, [hasRunControl, noteError, reportMissingRunControl, startDiag]);
-  // 时长 / 目录:仅更新状态。录制中改动 → 重发 start_diagnostics 让新参数立即生效
-  // (后端先收尾旧 session 再开新的)。
-  const setRecSeconds = useCallback((v: number | null) => {
-    updateApp({ diagSeconds: v });
-    diagSecondsRef.current = v;
-    if (powerOnRef.current && recRef.current) startDiag();
-  }, [startDiag]);
-  const setRecDir = useCallback((v: string) => {
-    updateApp({ diagDir: v });
-    diagDirRef.current = v;
-    if (powerOnRef.current && recRef.current) startDiag();
-  }, [startDiag]);
 
   const platformView: Platform = dev && devPlatform ? devPlatform : platform;
 
@@ -1372,20 +1664,6 @@ function useAppController() {
   // 运行五态(含 A4 防抖):状态盒 / srail 状态字 / zsub 共用同一判定。
   const statusKind = useRunStatusKind(powerOn, refSel, dev, bypassed);
 
-  // 引擎配置持久化:kind/pipeline/params 任一变更即写回(paramsByKind 随写,
-  // 切引擎再切回、重启 app 都不丢)。
-  useEffect(() => {
-    paramsByKind.current[kind] = params;
-    try {
-      localStorage.setItem(
-        ENGINE_STATE_KEY,
-        JSON.stringify({ kind, pipeline, paramsByKind: paramsByKind.current }),
-      );
-    } catch {
-      /* 持久化失败不阻塞 */
-    }
-  }, [kind, pipeline, params]);
-
   // Windows 托盘偏好:持久化 + 每次变更(含首个渲染 = 启动同步)推给 Rust。
   const [trayPrefs, updateTrayPrefs] = useState<TrayPrefsState>(readTrayPrefs);
   useEffect(() => {
@@ -1416,7 +1694,7 @@ function useAppController() {
 
   return (
     <div
-      className={`window ${isMac ? "mac" : "win"} ${uiOn ? "" : "sysoff"}`}
+      className={`window ${isMac ? "mac" : "win"} ${uiOn ? "" : "sysoff"} ${booted ? "" : "booting"}`}
     >
       {/* ---- titlebar ---- */}
       <header className="tbar" data-tauri-drag-region>
@@ -1483,7 +1761,11 @@ function useAppController() {
 
         <section className="zone zb">
           <div className="zhead">Power</div>
-          <SlideSwitch on={uiOn} onToggle={togglePower} disabled={busy} />
+          <SlideSwitch
+            on={uiOn}
+            onToggle={togglePower}
+            disabled={busy || bypassPending != null}
+          />
           <RuntimeStatusStrip statusKind={statusKind} />
           <RuntimeSubline
             statusKind={statusKind}
@@ -1611,8 +1893,8 @@ function useAppController() {
               </span>
             ) : (
               <span className="meta">
-                <span className="mk">&gt;&gt;&gt;</span> in app pick{" "}
-                <b>{cableName}</b> as mic
+                <span className="mk">&gt;&gt;&gt;</span>{" "}
+                {t("inAppPickMic").replace("{name}", cableName)}
               </span>
             )}
             <span className="ico">
@@ -1650,7 +1932,7 @@ function useAppController() {
                 ? t("lvqeNsHint")
                 : nsSupported
                   ? t("reduceNoise")
-                  : "AEC3 only"}
+                  : t("aec3Only")}
             </span>
             <span className="ico">
               <IcoNoise />
@@ -1697,7 +1979,6 @@ function useAppController() {
             dev={dev}
             devState={devRtxState}
             onDevState={chooseDevRtxState}
-            onBack={() => gotoView("engine")}
             onRecheck={recheckNvafx}
             onInstall={installNvafx}
             onDownloadInstall={downloadInstallNvafx}
@@ -1747,7 +2028,6 @@ function useAppController() {
             dev={dev}
             devState={devMicState}
             onDevState={chooseDevMicState}
-            onBack={() => gotoView("diagnostics")}
             onRecheck={recheckAudio}
           />
         )}
@@ -1993,7 +2273,7 @@ function TvNoise({ active }: { active: boolean }) {
 }
 
 export default function App() {
-  return useAppController();
+  return <AppShell />;
 }
 
 // UPTIME 走表:开机从零计,关机冻结最后读数(v3 原则 #5)。

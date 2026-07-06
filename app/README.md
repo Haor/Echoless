@@ -1,55 +1,69 @@
 # Echoless — Desktop GUI (Tauri)
 
-Echoless 控制电器主界面的 Tauri v2 + React/TS 实现。视觉/交互定稿真理源:
-`AEC/Design/overview.html` + `AEC/Design/Design.md`。
+English | [简体中文](README.zh-CN.md)
 
-## 架构
+Tauri v2 + React/TS implementation of the Echoless control-appliance main UI. The
+source of truth for the finalized visuals/interaction is
+`AEC/Design/overview.html` + `AEC/Design/Design.md`.
+
+## Architecture
 
 ```
-React/TS UI  ──invoke──▶  Tauri (Rust, src-tauri/src/lib.rs)
+React/TS UI  ──invoke──▶  Tauri (Rust, src-tauri/src/*)
    ▲                          │ spawn sidecar
    └── echoless://status ◀────┴── echoless CLI (--status-json JSONL)
 ```
 
-- 只消费 JSON / JSONL 契约(`types.ts` 镜像后端形状),不解析人类日志(走 stderr → `echoless://log`)。
-- 一次性命令:`list_devices` / `list_processors` / `validate_config`。
-- 实时:`start_run` spawn `echoless run --status-json --stats-interval-ms 80`,逐行解析后经 `echoless://status` 事件推前端;`stop_run` kill 子进程;关窗自动 kill。
+The Rust side is split into modules by responsibility (`src-tauri/src/`): `lib.rs`
+is entry point + setup only; `sidecar.rs` (run lifecycle / hot commands),
+`bin_resolve.rs` (binary resolution), `proc.rs`, `localvqe.rs`, `nvafx.rs`,
+`platform.rs`, `device_watch.rs`, `tray.rs`, `commands.rs` (thin
+`#[tauri::command]` wrappers).
 
-## echoless 二进制定位
+- Consumes only the JSON / JSONL contract (`types.ts` mirrors the backend shapes); it does not parse human-readable logs (those go through stderr → `echoless://log`).
+- One-shot commands: `list_devices` / `list_processors` / `validate_config`.
+- Real-time: `start_run` (`sidecar.rs`) spawns `echoless run --status-json --stats-interval-ms 80`, parses it line by line, and pushes it to the frontend via `echoless://status` events; `stop_run` closes stdin → waits with a timeout → kills (graceful shutdown); on exit (window close / Cmd+Q / ExitRequested) the child process is reaped automatically.
 
-`src-tauri/src/lib.rs::echoless_bin()`:
-1. 环境变量 `ECHOLESS_BIN`(打包后由 sidecar 资源注入)
-2. dev 回退:`../../target/release/echoless`(即本仓库 `cargo build --release` 产物)
+## Resolving the echoless binary
 
-dev 前先在仓库根构建 CLI:
+`src-tauri/src/bin_resolve.rs::echoless_bin()`:
+1. The `ECHOLESS_BIN` environment variable (injected from the sidecar resource after packaging).
+2. Dev fallback: `../../target/release/echoless` (i.e. the `cargo build --release` artifact of this repo).
+
+In dev, build the CLI at the repo root first:
 
 ```bash
 cd ..            # echoless/
 cargo build --release -p echoless-cli
 ```
 
-## 跑起来
+## Running it
 
 ```bash
 pnpm install
-pnpm tauri dev          # 开发(热重载前端 + Rust)
-pnpm tauri build        # 打包
+pnpm tauri dev          # development (hot-reloads the frontend + Rust)
+pnpm tauri build        # packaging
 ```
 
-## 平台标题栏(Design.md §5.1)
+## Platform title bar (Design.md §5.1)
 
-程序化建窗(`lib.rs` setup),平台镜像:
+The window is created programmatically (`lib.rs` setup), mirroring the platform:
 
-- **macOS**:`TitleBarStyle::Overlay` + `hidden_title`,保留系统红绿灯(OS 绘制,左上);标题栏左侧预留 82px。
-- **Windows / Linux**:`decorations(false)` + `shadow(true)`,自绘 caption 按钮(右上 `─ □ ✕`,close hover 红)。
+- **macOS**: `TitleBarStyle::Overlay` + `hidden_title`, keeping the system traffic lights (drawn by the OS, top-left); `set_traffic_lights_inset(16,13)` centers the traffic lights within the 40px title bar.
+- **Windows / Linux**: `decorations(false)` + `shadow(true)`, with self-drawn caption buttons (top-right `─ □ ✕`, close turns red on hover).
 
-平台由 `get_platform` 命令返回,前端切 `.window.mac` / `.window.win`。
+The platform is returned by the `get_platform` command, and the frontend switches between `.window.mac` / `.window.win`.
 
-## 已知 TODO
+The window is created with `visible(false)`; once the frontend's first screen is
+ready (`booted`, with fonts + the first batch of data in place, hard-capped at
+1.2s) it is shown via the core window show permission — eliminating the white
+flash during WebView initialization. The Rust side also has a 5s fallback to
+prevent the window from never appearing if the frontend crashes.
 
-- **真实波形**:目前三路示波是 dBFS 包络驱动的合成曲线(`Scope.tsx`)。后端若在 status event 加入 `mic_wave/ref_wave/out_wave`(降采样 peak/RMS 数组),`Scope` 已前向兼容,会自动改画真实波形。
-- **macOS 红绿灯垂直居中**:当前用 Overlay 默认位置。需要 inset 时接 `tauri-plugin-decorum` 的 `set_traffic_lights_inset` 或 trafficlights-positioner。
-- **sidecar 打包**:dev 走相对路径;`tauri build` 需把 `echoless` 配成 `externalBin` 并由 `ECHOLESS_BIN` 注入路径。
-- **虚拟声卡引导**:等后端 `doctor audio --json`(检测 VB-CABLE/BlackHole 安装态)。
-- **Advanced / Diagnostics**:页面待设计(footer 入口已占位)。
-- LocalVQE / RTX 选中后需各自必填参数(model 路径等),当前仅 AEC3 全链路打通。
+## Current boundaries
+
+- **Real waveforms**: the backend already emits `mic_wave/ref_wave/out_wave` (64-bucket peak envelope) in the status event, which `Scope.tsx` draws directly; it only falls back to a synthetic envelope when the waveform fields are absent.
+- **sidecar packaging**: `tauri.conf.json` already declares `externalBin` and bundle resources (including the third-party licenses under `licenses/`); before packaging locally you still need to build the release CLI first and run `pnpm prepare:tauri-assets`.
+- **Virtual sound card onboarding**: Mic Setup already integrates `doctor audio --json` detection and platform hints; driver installation is still done by the user.
+- **Advanced / Diagnostics**: the pages are usable; when adding new diagnostic fields, update `types.ts` and the page display in sync.
+- **LocalVQE / RTX**: the LocalVQE model download/selection and the RTX runtime install wizard are integrated, but they still depend on the corresponding platform-native assets being available.

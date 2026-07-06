@@ -1,5 +1,7 @@
 # `echoless` CLI reference
 
+English | [简体中文](CLI.zh-CN.md)
+
 The CLI is fully standalone — the desktop app is a front-end for it. Build
 with `cargo build --release` (binary at `target/release/echoless`), or use
 the copy shipped next to the app executable.
@@ -78,6 +80,11 @@ speakers while recording both paths, then cross-correlating per beep
 echoless probe-delay --json --mic default --reference system --output "CABLE Input"
 ```
 
+The command accepts `default` selectors, but its clap defaults are intentionally
+macOS-oriented (`MacBook Pro...` / `BlackHole 2ch`) for the maintainer's local
+calibration rig. Portable scripts should pass `--mic`, `--reference`, and
+`--output` explicitly rather than relying on those defaults.
+
 Stops nothing by itself — don't run it while another `run` holds the devices.
 Flags: `--beeps N` (12), `--startup-delay S` (4), `--volume 0..1` (0.35),
 `--out-dir/--keep-session/--keep-beep`, `--analyze-only <session>`.
@@ -97,6 +104,11 @@ echoless offline --mic mic.wav --reference ref.wav --out clean.wav --chain aec3
 echoless offline --mic mic.wav --reference ref.wav --out clean.wav --config my.toml
 ```
 
+`offline` validates processor topology and WAV-in/WAV-out behavior. It does not
+simulate the realtime device boundary, `near_delay_ms`, bypass crossfade, queue
+backpressure, or device sample-rate conversion path, so it should not be used as
+an exact live-latency or live-routing benchmark.
+
 ## doctor / processors / config
 
 ```bash
@@ -110,7 +122,7 @@ echoless config validate my.toml
 ```bash
 echoless nvafx doctor --json               # GPU / driver / VC++ / runtime checks
 echoless nvafx download-install --json     # fetch runtime + model for this GPU (~1 GB)
-echoless nvafx install --zip <file.zip>    # install from a local zip instead
+echoless nvafx install --common-zip <common.zip> --model-zip <model.zip>  # install from local zips
 echoless nvafx offline --mic ... --reference ... --out ...
 ```
 

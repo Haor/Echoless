@@ -5,16 +5,17 @@ use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
+use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use ringbuf::traits::Producer;
 
 use echoless_core::ReferenceChannels;
 
-use super::resample::InterleavedLinearResampler;
+use super::resample::InterleavedInputResampler;
 
 // tap 的默认/常见采样率;实际值由 helper 的 ELTP 流头上报(跟随系统输出设备),
-// 与管线不一致时 reader 线程插固定比率线性重采样(A5)。
+// 与管线不一致时 reader 线程插固定比率 rubato 重采样。
 pub const SAMPLE_RATE: u32 = 48_000;
 
 // --stream-stdout 流头:magic "ELTP" + u32 version + u32 sample_rate + u32 channels(全 LE)。
@@ -34,10 +35,28 @@ impl Drop for MacProcessTapStream {
     fn drop(&mut self) {
         self.running.store(false, Ordering::SeqCst);
         let _ = self.child.kill();
-        if let Some(reader) = self.reader.take() {
-            let _ = reader.join();
+        // kill 关闭 helper stdout 后,reader 的 read 返回 0 自然退出。但 helper
+        // 若陷入内核不可中断状态,SIGKILL 延迟生效,无限期 join 会拖住整个
+        // 停机(审计 B-19)。限时等待:超时则不 join 也不 wait(阻塞),reader
+        // 线程随本进程退出回收;孤儿 helper 由其 getppid 自愈兜底(B-01)。
+        let mut exited = false;
+        for _ in 0..20 {
+            match self.child.try_wait() {
+                Ok(Some(_)) => {
+                    exited = true;
+                    break;
+                }
+                Ok(None) => thread::sleep(Duration::from_millis(25)),
+                Err(_) => break,
+            }
         }
-        let _ = self.child.wait();
+        if exited {
+            if let Some(reader) = self.reader.take() {
+                let _ = reader.join();
+            }
+        } else {
+            eprintln!("macOS Process Tap helper 未及时退出,跳过 reader 回收(自愈兜底接管)");
+        }
     }
 }
 
@@ -90,6 +109,9 @@ pub fn preflight_permission() -> Option<&'static str> {
     }
     match String::from_utf8_lossy(&output.stdout).trim() {
         "granted" => Some("granted"),
+        // Current helper intentionally maps private-TCC denied/unknown outputs to
+        // "undetermined" so the UI can use the request path first. Keep this arm
+        // defensive for older helpers or future contract changes.
         "denied" => Some("denied"),
         "undetermined" => Some("undetermined"),
         _ => None,
@@ -183,9 +205,12 @@ fn read_pcm_stream<P>(
     let mut read_buf = [0u8; 16 * 1024];
     let mut pending = Vec::<u8>::with_capacity(16 * 1024);
     // 流头解析:None = 还没读够 16 字节判定
-    let mut resampler: Option<InterleavedLinearResampler> = None;
+    let mut resampler: Option<InterleavedInputResampler> = None;
     let mut header_done = false;
+    // tap 实际交织声道数;默认按请求值,流头上报不一致时以头为准(审计 B-05)。
+    let mut source_channels = channels;
     let mut samples = Vec::<f32>::with_capacity(4 * 1024);
+    let mut remapped = Vec::<f32>::with_capacity(4 * 1024);
 
     while running.load(Ordering::SeqCst) {
         match stdout.read(&mut read_buf) {
@@ -198,19 +223,29 @@ fn read_pcm_stream<P>(
                     }
                     if &pending[..4] == STREAM_HEADER_MAGIC {
                         let rate = u32::from_le_bytes(pending[8..12].try_into().unwrap());
+                        let hdr_channels = u32::from_le_bytes(pending[12..16].try_into().unwrap());
+                        // 声道协商(审计 B-05):helper 上报的是 tap 实际格式,
+                        // Core Audio 不保证严格满足 mono/stereo 请求;若仍按请求值
+                        // 解读交织流,整条参考会声道错位,AEC 静默失效。
+                        if hdr_channels != 0 && hdr_channels as usize != channels {
+                            eprintln!(
+                                "macOS Process Tap: tap 实际 {hdr_channels} 声道 ≠ 请求 {channels} 声道,按实际解读并适配"
+                            );
+                            source_channels = hdr_channels as usize;
+                        }
                         if rate != 0 && rate != target_rate {
                             eprintln!(
-                                "macOS Process Tap: 系统输出 {rate} Hz ≠ 管线 {target_rate} Hz,启用线性重采样"
+                                "macOS Process Tap: 系统输出 {rate} Hz ≠ 管线 {target_rate} Hz,启用 rubato 重采样"
                             );
                             resampler =
-                                Some(InterleavedLinearResampler::new(rate, target_rate, channels));
+                                Some(InterleavedInputResampler::new(rate, target_rate, channels));
                         }
                         pending.drain(..STREAM_HEADER_LEN);
                     } else {
                         // 旧版 helper 没有流头:按默认 48k 处理,这批字节就是 PCM。
                         eprintln!("macOS Process Tap: helper 未上报流头,按 {SAMPLE_RATE} Hz 处理");
                         if SAMPLE_RATE != target_rate {
-                            resampler = Some(InterleavedLinearResampler::new(
+                            resampler = Some(InterleavedInputResampler::new(
                                 SAMPLE_RATE,
                                 target_rate,
                                 channels,
@@ -219,7 +254,10 @@ fn read_pcm_stream<P>(
                     }
                     header_done = true;
                 }
-                let complete = pending.len() / 4 * 4;
+                // 按整帧消费(4 字节 × 实际声道):半帧留 pending 下轮,
+                // 否则声道适配的逐帧处理会丢样本导致交织错位。
+                let frame_bytes = 4 * source_channels;
+                let complete = pending.len() / frame_bytes * frame_bytes;
                 samples.clear();
                 for chunk in pending[..complete].chunks_exact(4) {
                     samples.push(f32::from_bits(u32::from_le_bytes([
@@ -229,14 +267,20 @@ fn read_pcm_stream<P>(
                 if complete > 0 {
                     pending.drain(..complete);
                 }
+                let adapted: &[f32] = if source_channels == channels {
+                    &samples
+                } else {
+                    remap_interleaved(&samples, source_channels, channels, &mut remapped);
+                    &remapped
+                };
                 if let Some(rs) = resampler.as_mut() {
-                    for sample in rs.process(&samples) {
+                    for &sample in rs.process(adapted) {
                         if producer.try_push(sample).is_err() {
                             drops.fetch_add(1, Ordering::Relaxed);
                         }
                     }
                 } else {
-                    for &sample in &samples {
+                    for &sample in adapted {
                         if producer.try_push(sample).is_err() {
                             drops.fetch_add(1, Ordering::Relaxed);
                         }
@@ -246,6 +290,20 @@ fn read_pcm_stream<P>(
             Err(err) => {
                 eprintln!("macOS Process Tap helper 读取失败: {err}");
                 break;
+            }
+        }
+    }
+}
+
+/// 交织声道适配:source→target。降声道 = 逐帧平均下混;升声道 = 循环复制源声道。
+fn remap_interleaved(samples: &[f32], source: usize, target: usize, out: &mut Vec<f32>) {
+    out.clear();
+    for frame in samples.chunks_exact(source) {
+        if target == 1 {
+            out.push(frame.iter().sum::<f32>() / source as f32);
+        } else {
+            for t in 0..target {
+                out.push(frame[t % source]);
             }
         }
     }
@@ -268,11 +326,49 @@ fn current_dir_ancestors() -> Result<Vec<PathBuf>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ringbuf::traits::{Consumer, Split};
+    use ringbuf::HeapRb;
 
     #[test]
     fn current_dir_ancestors_includes_current_directory() {
         let cwd = env::current_dir().unwrap();
         let ancestors = current_dir_ancestors().unwrap();
         assert_eq!(ancestors.first(), Some(&cwd));
+    }
+
+    // 审计 B-05:流头声道数与请求不一致时以头为准,逐帧下混到请求布局。
+    #[test]
+    fn stream_header_channel_mismatch_downmixes_to_requested_layout() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(STREAM_HEADER_MAGIC);
+        bytes.extend_from_slice(&1u32.to_le_bytes());
+        bytes.extend_from_slice(&48_000u32.to_le_bytes());
+        bytes.extend_from_slice(&2u32.to_le_bytes()); // tap 实际 stereo
+        for s in [1.0f32, 0.0, 0.5, 0.25] {
+            bytes.extend_from_slice(&s.to_le_bytes());
+        }
+
+        let (producer, mut consumer) = HeapRb::<f32>::new(16).split();
+        let drops = Arc::new(AtomicU64::new(0));
+        let running = Arc::new(AtomicBool::new(true));
+        read_pcm_stream(
+            std::io::Cursor::new(bytes),
+            1, // 管线请求 mono
+            48_000,
+            producer,
+            drops.clone(),
+            running,
+        );
+
+        let out: Vec<f32> = std::iter::from_fn(|| consumer.try_pop()).collect();
+        assert_eq!(out, vec![0.5, 0.375]);
+        assert_eq!(drops.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn remap_interleaved_upmixes_mono_to_stereo_by_duplication() {
+        let mut out = Vec::new();
+        remap_interleaved(&[0.1, -0.2], 1, 2, &mut out);
+        assert_eq!(out, vec![0.1, 0.1, -0.2, -0.2]);
     }
 }

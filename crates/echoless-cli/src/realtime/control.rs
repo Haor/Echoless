@@ -1,5 +1,6 @@
 use std::collections::VecDeque;
 use std::io::BufRead;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, TryRecvError};
 use std::thread;
 
@@ -12,6 +13,7 @@ use echoless_core::{
 };
 
 use super::diagnostics::{DiagnosticDoneReason, DiagnosticRecorder, DiagnosticRecorderConfig};
+use super::emit::emit_stdout_line;
 use super::stats::RealtimeStats;
 use echoless_processors::ProcessorChain;
 
@@ -213,6 +215,7 @@ pub(super) struct RuntimeControlContext<'a> {
     pub(super) output_level: &'a mut u32,
     pub(super) bypassed: &'a mut bool,
     pub(super) status_json: bool,
+    pub(super) running: &'a AtomicBool,
 }
 
 pub(super) fn handle_runtime_controls(
@@ -248,7 +251,11 @@ pub(super) fn handle_runtime_controls(
             }
             Err(TryRecvError::Empty) => break,
             Err(TryRecvError::Disconnected) => {
+                // stdin 关闭 = 停机契约(审计 B-01):GUI 优雅停止先关 stdin;
+                // GUI 崩溃/被杀时管道同样关闭。两种情况都收敛停机,
+                // 避免孤儿 CLI 继续占用麦克风/虚拟麦/Process Tap helper。
                 *control = None;
+                ctx.running.store(false, Ordering::SeqCst);
                 break;
             }
         }
@@ -571,7 +578,8 @@ fn emit_control_error(
 
 fn emit_runtime_json(status_json: bool, value: Value) {
     if status_json {
-        println!("{value}");
+        // 审计 B-02:命令回执在音频处理线程发出,走异步发射器,不同步碰 stdout。
+        emit_stdout_line(value.to_string());
     } else {
         eprintln!("{value}");
     }
