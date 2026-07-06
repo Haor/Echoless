@@ -1546,7 +1546,13 @@ button.ecard:disabled {
 .power::before {
   content: "";
   position: absolute;
-  inset: 2px;
+  top: 2px;
+  bottom: 2px;
+  left: 2px;
+  /* 右侧多留 24px(>最大平移 18px)缓冲:斜纹用 transform 平移(走 GPU 合成层,
+     慢速也亚像素平滑,消除 background-position 慢移的取整掉帧感);溢出由 .power
+     的 overflow:hidden 裁掉。 */
+  width: calc(100% - 4px + 24px);
   background-color: rgba(120, 118, 110, 0.13);
   background-image: linear-gradient(
     135deg,
@@ -1558,6 +1564,7 @@ button.ecard:disabled {
     transparent 75%
   );
   background-size: 6px 6px;
+  will-change: transform;
 }
 .power .slider {
   position: absolute;
@@ -1605,13 +1612,16 @@ button.ecard:disabled {
 .power.on:hover .slider {
   color: #ffa477;
 }
-/* v9:OFF 态招领 beacon —— 全页安静时每 3s 斜纹滑一拍+文字亮一下,引导开机 */
+/* v9/v18:OFF 态招领 beacon —— 斜纹缓慢常流(呼吸感),随 offbeacon 亮峰(84%)
+   提速冲一下再回落,像深吸一口气;3s 周期与 slider 呼吸同拍,引导开机。 */
 .power:not(.on)::before {
   animation: offdrift 3s linear infinite;
 }
 @keyframes offdrift {
-  0%, 74% { background-position: 0 0; }
-  100% { background-position: 12px 0; } /* 12px=2 tile,循环无缝 */
+  0%   { transform: translateX(0); }      /* 起点 */
+  70%  { transform: translateX(-6px); }   /* 前 70% 慢爬 1 tile —— 缓慢常流 */
+  86%  { transform: translateX(-15px); }  /* 呼吸峰:0.48s 冲 1.5 tile(~6.5× 加速) */
+  100% { transform: translateX(-18px); }  /* 收尾回落 0.5 tile;18px=3 tile 无缝循环 */
 }
 .power:not(.on) .slider {
   animation: offbeacon 3s ease-in-out infinite;
@@ -1620,9 +1630,14 @@ button.ecard:disabled {
   0%, 72%, 100% { color: var(--t-mut); }
   84% { color: var(--t-strong); }
 }
+/* hover:斜纹匀速快爬(0.6s/2 tile ≈ 20px/s,约慢流的 7×),回应指针悬停 */
 .power:not(.on):hover::before {
-  animation: powerdrift 1.6s linear infinite;
+  animation: offhover 0.6s linear infinite;
   background-color: rgba(120, 118, 110, 0.2);
+}
+@keyframes offhover {
+  from { transform: translateX(0); }
+  to   { transform: translateX(-12px); } /* 12px=2 tile,无缝快流 */
 }
 .power:not(.on):hover .slider {
   animation: none;
