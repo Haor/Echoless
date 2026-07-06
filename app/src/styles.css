@@ -890,6 +890,12 @@ button.ecard {
 button.ecard:disabled {
   cursor: default;
 }
+/* NVAFX / LocalVQE 卡因内含按钮不能用 <button>,是可点的 div —— button 卡自带
+   手型,这两张显式补上(na 不可选时不给)。整卡 hover 高亮由下方 :hover 复用。 */
+.ecard.wide:not(.na),
+.ecard.lvwide:not(.na) {
+  cursor: pointer;
+}
 .ecard.wide {
   margin-top: 14px;
 }
@@ -2318,10 +2324,19 @@ hr.hair {
   font: inherit;
   letter-spacing: inherit;
   text-transform: inherit;
+  cursor: pointer;
+  transition: color 0.15s;
+}
+.fbar .link:hover {
+  color: var(--t-strong);
 }
 .fbar .link .mk {
   color: var(--t-faint);
   letter-spacing: -1px;
+  transition: color 0.15s;
+}
+.fbar .link:hover .mk {
+  color: var(--t-mut);
 }
 .fbar .stamp.err {
   color: var(--warn);

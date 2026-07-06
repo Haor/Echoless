@@ -25,7 +25,9 @@ export function SlideSwitch({
       onClick={onToggle}
     >
       <span className="slider">
-        <ScrambleText text={on ? onLabel : offLabel} />
+        {/* ON/OFF 是短文本且切后长期不变,reveal 前沿残留无后续动画覆盖会
+            持久可见(文字上方两条线)—— 这里关掉前沿字符。 */}
+        <ScrambleText text={on ? onLabel : offLabel} cursor={false} />
       </span>
     </button>
   );

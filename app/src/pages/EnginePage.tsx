@@ -158,6 +158,16 @@ function NvafxCard({
       className={`ecard wide ${kind === "nvidia_afx_aec" ? "active" : ""} ${
         nvSupported ? "" : "na"
       }`}
+      role="button"
+      tabIndex={nvSupported ? 0 : -1}
+      aria-pressed={kind === "nvidia_afx_aec"}
+      onClick={() => nvSupported && onSelect("nvidia_afx_aec")}
+      onKeyDown={(e) => {
+        if (nvSupported && (e.key === "Enter" || e.key === " ")) {
+          e.preventDefault();
+          onSelect("nvidia_afx_aec");
+        }
+      }}
     >
       <div className="eh">
         <span className="en">
@@ -429,6 +439,16 @@ export function EnginePage({
       return (
         <div
           className={`ecard ${active ? "active" : ""} ${sup ? "" : "na"} lvwide`}
+          role="button"
+          tabIndex={sup ? 0 : -1}
+          aria-pressed={active}
+          onClick={() => sup && onSelect(p.kind)}
+          onKeyDown={(e) => {
+            if (sup && (e.key === "Enter" || e.key === " ")) {
+              e.preventDefault();
+              onSelect(p.kind);
+            }
+          }}
         >
           {body}
         </div>
