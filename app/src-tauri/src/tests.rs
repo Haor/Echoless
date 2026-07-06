@@ -1,5 +1,7 @@
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
+#[cfg(unix)]
+use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -20,7 +22,9 @@ use crate::proc::{
     command_output_with_timeout, parse_jsonl_line_event, push_tail_line, run_state_guard,
     terminate_run, JsonlLineEvent, RunChild, RunState,
 };
-use crate::sidecar::{bypass_control_line, write_run_control_line};
+use crate::sidecar::bypass_control_line;
+#[cfg(unix)]
+use crate::sidecar::write_run_control_line;
 use crate::tray::{set_tray_prefs_inner, TrayPrefs};
 
 static DATA_ROOT_ENV_LOCK: Mutex<()> = Mutex::new(());
