@@ -99,12 +99,15 @@ pub(crate) fn validate_browser_url(url: &str) -> Result<String, String> {
         return Err("URL 不能包含空白或控制字符".to_string());
     }
     // 系统设置深链只允许跳到隐私面板;不要把整个 scheme 当作通用白名单。
+    // 放行两种:隐私根面板 `?Privacy`(系统录音无稳定锚点,只能回退根面板),
+    // 以及带锚点的子面板 `?Privacy_Microphone` 等(`?Privacy_` 前缀)。
     if trimmed.starts_with("x-apple.systempreferences:") {
-        if !trimmed.starts_with("x-apple.systempreferences:com.apple.preference.security?Privacy_")
-        {
-            return Err("仅允许打开系统隐私设置面板".to_string());
+        const PRIVACY_ROOT: &str =
+            "x-apple.systempreferences:com.apple.preference.security?Privacy";
+        if trimmed == PRIVACY_ROOT || trimmed.starts_with(&format!("{PRIVACY_ROOT}_")) {
+            return Ok(trimmed.to_string());
         }
-        return Ok(trimmed.to_string());
+        return Err("仅允许打开系统隐私设置面板".to_string());
     }
     if !trimmed.starts_with("https://") {
         return Err("仅允许打开 https URL".to_string());
@@ -220,4 +223,32 @@ fn allowed_open_path_roots() -> Vec<PathBuf> {
     .into_iter()
     .filter_map(|path| path.canonicalize().ok())
     .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_browser_url;
+
+    #[test]
+    fn privacy_root_and_anchored_subpanels_allowed() {
+        // 系统录音无稳定锚点 → 回退隐私根面板;必须放行(S-01)。
+        let root = "x-apple.systempreferences:com.apple.preference.security?Privacy";
+        assert_eq!(validate_browser_url(root).as_deref(), Ok(root));
+        // 麦克风等带锚点子面板照常放行。
+        let mic = "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone";
+        assert_eq!(validate_browser_url(mic).as_deref(), Ok(mic));
+    }
+
+    #[test]
+    fn non_privacy_settings_deeplinks_rejected() {
+        // 非隐私面板的系统设置深链一律拒绝(不把整个 scheme 当白名单)。
+        assert!(
+            validate_browser_url("x-apple.systempreferences:com.apple.preference.network").is_err()
+        );
+        // `?Privacy` 之外的查询前缀也拒绝(防止 `?PrivacyEvil` 之类的伪前缀)。
+        assert!(validate_browser_url(
+            "x-apple.systempreferences:com.apple.preference.security?PrivacyEvil"
+        )
+        .is_err());
+    }
 }
