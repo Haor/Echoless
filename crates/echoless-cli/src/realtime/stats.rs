@@ -95,6 +95,10 @@ pub(super) fn estimate_user_latency_ms(
 }
 
 const STATUS_WAVE_BUCKETS: usize = 64;
+const CLOCK_SKEW_WINDOW_SECS: u64 = 5;
+const CLOCK_SKEW_ENTER_RATIO: f64 = 0.02;
+const CLOCK_SKEW_EXIT_RATIO: f64 = 0.01;
+const CLOCK_SKEW_REF_TOLERANCE_RATIO: f64 = 0.5;
 
 struct WaveBuckets {
     peaks: Vec<f32>,
@@ -149,6 +153,118 @@ impl WaveBuckets {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct ClockSkewSnapshot {
+    output_skew_pct: f64,
+    ref_skew_pct: f64,
+    ref_correlated: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ClockSkewEventKind {
+    Warning,
+    Resolved,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ClockSkewEvent {
+    kind: ClockSkewEventKind,
+    snapshot: ClockSkewSnapshot,
+}
+
+#[derive(Clone, Debug)]
+struct ClockSkewDetector {
+    min_window_samples: u64,
+    window_pushed_samples: u64,
+    window_output_underruns: u64,
+    window_ref_stale_drops: u64,
+    snapshot: ClockSkewSnapshot,
+    warning: bool,
+}
+
+impl ClockSkewDetector {
+    fn new(sample_rate: u32) -> Self {
+        Self {
+            min_window_samples: u64::from(sample_rate).saturating_mul(CLOCK_SKEW_WINDOW_SECS),
+            window_pushed_samples: 0,
+            window_output_underruns: 0,
+            window_ref_stale_drops: 0,
+            snapshot: ClockSkewSnapshot::default(),
+            warning: false,
+        }
+    }
+
+    fn observe(
+        &mut self,
+        pushed_samples: u64,
+        output_underruns: u64,
+        ref_stale_drops: u64,
+    ) -> Option<ClockSkewEvent> {
+        self.window_pushed_samples = self.window_pushed_samples.saturating_add(pushed_samples);
+        self.window_output_underruns = self
+            .window_output_underruns
+            .saturating_add(output_underruns);
+        self.window_ref_stale_drops = self.window_ref_stale_drops.saturating_add(ref_stale_drops);
+        self.snapshot = ClockSkewSnapshot::from_counts(
+            self.window_pushed_samples,
+            self.window_output_underruns,
+            self.window_ref_stale_drops,
+        );
+
+        if self.min_window_samples == 0 || self.window_pushed_samples < self.min_window_samples {
+            return None;
+        }
+
+        let output_ratio = ratio(self.window_output_underruns, self.window_pushed_samples);
+        let event = if !self.warning
+            && output_ratio > CLOCK_SKEW_ENTER_RATIO
+            && self.snapshot.ref_correlated
+        {
+            self.warning = true;
+            Some(ClockSkewEvent {
+                kind: ClockSkewEventKind::Warning,
+                snapshot: self.snapshot,
+            })
+        } else if self.warning
+            && (output_ratio < CLOCK_SKEW_EXIT_RATIO || !self.snapshot.ref_correlated)
+        {
+            self.warning = false;
+            Some(ClockSkewEvent {
+                kind: ClockSkewEventKind::Resolved,
+                snapshot: self.snapshot,
+            })
+        } else {
+            None
+        };
+
+        self.window_pushed_samples = 0;
+        self.window_output_underruns = 0;
+        self.window_ref_stale_drops = 0;
+        event
+    }
+}
+
+impl ClockSkewSnapshot {
+    fn from_counts(pushed_samples: u64, output_underruns: u64, ref_stale_drops: u64) -> Self {
+        let output_ratio = ratio(output_underruns, pushed_samples);
+        let ref_ratio = ratio(ref_stale_drops, pushed_samples);
+        let tolerance = output_ratio * CLOCK_SKEW_REF_TOLERANCE_RATIO;
+        Self {
+            output_skew_pct: output_ratio * 100.0,
+            ref_skew_pct: ref_ratio * 100.0,
+            ref_correlated: output_ratio > 0.0 && (output_ratio - ref_ratio).abs() <= tolerance,
+        }
+    }
+}
+
+fn ratio(numerator: u64, denominator: u64) -> f64 {
+    if denominator == 0 {
+        0.0
+    } else {
+        numerator as f64 / denominator as f64
+    }
+}
+
 pub(super) struct RealtimeStats {
     interval: Duration,
     started: Instant,
@@ -185,6 +301,8 @@ pub(super) struct RealtimeStats {
     ref_underruns: u64,
     output_overruns: u64,
     output_underruns: u64,
+    pushed_output_samples: u64,
+    clock_skew: ClockSkewDetector,
     node_process_time_ms: f32,
     node_runtime_errors: u64,
     aec_estimated_delay_ms: i32,
@@ -246,6 +364,8 @@ impl RealtimeStats {
             ref_underruns: 0,
             output_overruns: 0,
             output_underruns: 0,
+            pushed_output_samples: 0,
+            clock_skew: ClockSkewDetector::new(config.sample_rate),
             node_process_time_ms: 0.0,
             node_runtime_errors: 0,
             aec_estimated_delay_ms: 0,
@@ -300,6 +420,11 @@ impl RealtimeStats {
         self.ref_underruns += sample.ref_underruns;
         self.output_overruns += sample.output_overruns;
         self.output_underruns += sample.output_underruns;
+        self.pushed_output_samples += sample
+            .out
+            .len()
+            .saturating_sub(sample.output_overruns as usize)
+            as u64;
         self.node_process_time_ms = self
             .node_process_time_ms
             .max(aggregate_process_time_ms(sample.node_stats));
@@ -316,12 +441,20 @@ impl RealtimeStats {
         if now.duration_since(self.last_print) < self.interval {
             return;
         }
+        let clock_skew_event = self.clock_skew.observe(
+            self.pushed_output_samples,
+            self.output_underruns,
+            self.ref_stale_drops,
+        );
         // 审计 B-02:本方法在音频处理线程上执行,写出必须走异步发射器,
         // 不许同步碰 stdout(管道满会阻塞处理循环 → 爆音)。
         if self.status_json {
             emit_stdout_line(self.status_json_line(now));
         } else {
             emit_stdout_line(self.text_line(now));
+        }
+        if let Some(event) = clock_skew_event {
+            emit_stdout_line(self.clock_skew_event_line(event));
         }
         self.last_print = now;
         self.near_samples = 0;
@@ -340,6 +473,7 @@ impl RealtimeStats {
         self.ref_underruns = 0;
         self.output_overruns = 0;
         self.output_underruns = 0;
+        self.pushed_output_samples = 0;
         self.node_process_time_ms = 0.0;
         self.node_diverged = false;
         self.node_last_error = None;
@@ -377,6 +511,38 @@ impl RealtimeStats {
             self.node_runtime_errors,
             self.node_diverged,
         )
+    }
+
+    fn clock_skew_event_line(&self, event: ClockSkewEvent) -> String {
+        if self.status_json {
+            let event_type = match event.kind {
+                ClockSkewEventKind::Warning => "clock_skew_warning",
+                ClockSkewEventKind::Resolved => "clock_skew_resolved",
+            };
+            serde_json::to_string(&json!({
+                "type": event_type,
+                "output_skew_pct": event.snapshot.output_skew_pct,
+                "ref_skew_pct": event.snapshot.ref_skew_pct,
+                "ref_correlated": event.snapshot.ref_correlated,
+                "hint": clock_skew_hint(event.snapshot.output_skew_pct),
+            }))
+            .unwrap_or_else(|err| {
+                json!({ "type": "error", "message": err.to_string() }).to_string()
+            })
+        } else {
+            match event.kind {
+                ClockSkewEventKind::Warning => format!(
+                    "clock_skew_warning output_skew_pct={:.1} ref_skew_pct={:.1}: {}",
+                    event.snapshot.output_skew_pct,
+                    event.snapshot.ref_skew_pct,
+                    clock_skew_hint(event.snapshot.output_skew_pct)
+                ),
+                ClockSkewEventKind::Resolved => format!(
+                    "clock_skew_resolved output_skew_pct={:.1} ref_skew_pct={:.1}",
+                    event.snapshot.output_skew_pct, event.snapshot.ref_skew_pct
+                ),
+            }
+        }
     }
 
     fn status_json_line(&self, now: Instant) -> String {
@@ -444,6 +610,10 @@ impl RealtimeStats {
             "ref_underruns": self.ref_underruns,
             "output_underruns": self.output_underruns,
             "output_overruns": self.output_overruns,
+            "output_skew_pct": self.clock_skew.snapshot.output_skew_pct,
+            "ref_skew_pct": self.clock_skew.snapshot.ref_skew_pct,
+            "clock_skew_warning": self.clock_skew.warning,
+            "clock_skew_ref_correlated": self.clock_skew.snapshot.ref_correlated,
             "node_process_time_ms": self.node_process_time_ms,
             "runtime_errors": self.node_runtime_errors,
             "diverged": self.node_diverged,
@@ -455,6 +625,13 @@ impl RealtimeStats {
             "diagnostics_drops": diagnostics_drops,
         })
     }
+}
+
+fn clock_skew_hint(output_skew_pct: f64) -> String {
+    format!(
+        "输出设备时钟比麦克风快 {:.1}%,可能是虚拟音频设备采样率不一致;请将 Voicemeeter 及其虚拟端点、硬件输出统一设为 48000 Hz",
+        output_skew_pct
+    )
 }
 
 #[cfg(test)]
@@ -513,6 +690,12 @@ mod tests {
         stats.ref_input_drops = 2;
         stats.mic_stale_drops = 3;
         stats.ref_stale_drops = 5;
+        stats.clock_skew.snapshot = ClockSkewSnapshot {
+            output_skew_pct: 22.4,
+            ref_skew_pct: 22.1,
+            ref_correlated: true,
+        };
+        stats.clock_skew.warning = true;
         stats.aec_estimated_delay_ms = 48;
         stats.aec3_delay_blocks = Some(12);
 
@@ -533,6 +716,10 @@ mod tests {
         assert_eq!(value["estimated_user_latency_ms"], 106.0);
         assert_eq!(value["aec_estimated_delay_ms"], 48);
         assert_eq!(value["aec3_delay_blocks"], 12);
+        assert_eq!(value["output_skew_pct"], 22.4);
+        assert_eq!(value["ref_skew_pct"], 22.1);
+        assert_eq!(value["clock_skew_warning"], true);
+        assert_eq!(value["clock_skew_ref_correlated"], true);
         assert_eq!(value["diagnostics_session_dir"], "diagnostics/session-1");
         assert_eq!(value["recording"], false);
         assert_eq!(value["diagnostics_frames"], 0);
@@ -562,5 +749,51 @@ mod tests {
         stats.set_bypassed(false);
         let value = stats.status_value(stats.started + Duration::from_secs(4));
         assert_eq!(value["bypassed"], false);
+    }
+
+    #[test]
+    fn clock_skew_detector_warns_after_correlated_five_second_window() {
+        let mut detector = ClockSkewDetector::new(48_000);
+
+        for _ in 0..4 {
+            assert!(detector.observe(48_000, 10_752, 10_752).is_none());
+        }
+        let event = detector.observe(48_000, 10_752, 10_752).unwrap();
+
+        assert_eq!(event.kind, ClockSkewEventKind::Warning);
+        assert!(detector.warning);
+        assert!((event.snapshot.output_skew_pct - 22.4).abs() < 0.001);
+        assert!((event.snapshot.ref_skew_pct - 22.4).abs() < 0.001);
+        assert!(event.snapshot.ref_correlated);
+    }
+
+    #[test]
+    fn clock_skew_detector_uses_hysteresis_for_resolution() {
+        let mut detector = ClockSkewDetector::new(48_000);
+        for _ in 0..5 {
+            let _ = detector.observe(48_000, 10_752, 10_752);
+        }
+        assert!(detector.warning);
+
+        for _ in 0..4 {
+            assert!(detector.observe(48_000, 240, 240).is_none());
+        }
+        let event = detector.observe(48_000, 240, 240).unwrap();
+
+        assert_eq!(event.kind, ClockSkewEventKind::Resolved);
+        assert!(!detector.warning);
+        assert!((event.snapshot.output_skew_pct - 0.5).abs() < 0.001);
+    }
+
+    #[test]
+    fn clock_skew_detector_ignores_uncorrelated_ref_counts() {
+        let mut detector = ClockSkewDetector::new(48_000);
+
+        for _ in 0..4 {
+            assert!(detector.observe(48_000, 10_752, 0).is_none());
+        }
+
+        assert!(detector.observe(48_000, 10_752, 0).is_none());
+        assert!(!detector.warning);
     }
 }

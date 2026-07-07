@@ -64,6 +64,7 @@ use echoless_core::{
 use echoless_processors::{chain_from_nodes, ProcessorChain};
 
 const BYPASS_CROSSFADE_MS: u32 = 15;
+const OUTPUT_PREROLL_FRAMES: usize = 2;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum InputChannelMode {
@@ -332,7 +333,7 @@ pub fn run_with_options(cfg: &PipelineConfig, options: RuntimeOptions) -> Result
     let counters = RealtimeCounters::new();
 
     let (mic_prod, mic_cons) = HeapRb::<f32>::new(ring_size).split();
-    let (out_prod, out_cons) = HeapRb::<f32>::new(ring_size).split();
+    let (mut out_prod, out_cons) = HeapRb::<f32>::new(ring_size).split();
     let (render_prod, render_cons) = if reference_source.has_reference() {
         let (p, c) = HeapRb::<f32>::new(ring_size * reference_channels).split();
         (Some(p), Some(c))
@@ -412,6 +413,9 @@ pub fn run_with_options(cfg: &PipelineConfig, options: RuntimeOptions) -> Result
         .as_ref()
         .map(DiagnosticRecorder::session_dir_string);
     let diagnostics_status = diagnostic.as_ref().map(DiagnosticRecorder::status_handle);
+    let output_preroll_samples =
+        prime_output_ring(&mut out_prod, frame_size, OUTPUT_PREROLL_FRAMES);
+    let output_preroll_ms = samples_to_ms(output_preroll_samples, sample_rate);
     // 控制线程无条件启动(不再只限 --status-json):stdin EOF = 停机契约的
     // 感知通道,GUI/管道调用方关闭 stdin 即优雅停机(审计 B-01)。
     let control = Some(spawn_control_reader());
@@ -428,6 +432,9 @@ pub fn run_with_options(cfg: &PipelineConfig, options: RuntimeOptions) -> Result
         "output_gain_db": output_level_gain_db(cfg.output_level),
         "reference_channels": cfg.reference_channels.as_str(),
         "algorithmic_latency_ms": algorithmic_latency_ms,
+        "output_preroll_frames": OUTPUT_PREROLL_FRAMES,
+        "output_preroll_samples": output_preroll_samples,
+        "output_preroll_ms": output_preroll_ms,
         "reference_source": reference_source.status_name(),
         "diagnostics_session_dir": diagnostics_session_dir.as_deref(),
         "mic_device_sample_rate": mic_config.stream_sample_rate(),
@@ -753,6 +760,27 @@ fn apply_near_delay(
         *sample = delay.pop_front().unwrap_or(0.0);
     }
     delay.len()
+}
+
+fn prime_output_ring<P: Producer<Item = f32>>(
+    producer: &mut P,
+    frame_size: usize,
+    frames: usize,
+) -> usize {
+    let samples = frame_size.saturating_mul(frames);
+    if samples == 0 {
+        return 0;
+    }
+    let silence = vec![0.0f32; samples];
+    producer.push_slice(&silence)
+}
+
+fn samples_to_ms(samples: usize, sample_rate: u32) -> f64 {
+    if sample_rate == 0 {
+        0.0
+    } else {
+        samples as f64 / sample_rate as f64 * 1000.0
+    }
 }
 
 // ── 流构建(多采样格式)────────────────────────────────────────────────────────
@@ -1149,6 +1177,7 @@ mod tests {
 
     use cpal::{DeviceDescriptionBuilder, DeviceType, InterfaceType};
     use echoless_processors::{EchoProcessor, IoSpec, ProcessorStats};
+    use ringbuf::traits::Observer;
 
     struct CountingAllocator;
 
@@ -1321,6 +1350,20 @@ mod tests {
             warm < 0.03,
             "keep-warm restore residual too high: {warm:.4}"
         );
+    }
+
+    #[test]
+    fn output_preroll_primes_two_frames_of_silence() {
+        let (mut producer, mut consumer) = HeapRb::<f32>::new(16).split();
+
+        let pushed = prime_output_ring(&mut producer, 4, OUTPUT_PREROLL_FRAMES);
+
+        assert_eq!(pushed, 8);
+        assert_eq!(producer.occupied_len(), 8);
+        let mut samples = [1.0f32; 8];
+        consumer.pop_slice(&mut samples);
+        assert_eq!(samples, [0.0; 8]);
+        assert_eq!(samples_to_ms(pushed, 48_000), 1000.0 / 6000.0);
     }
 
     #[test]

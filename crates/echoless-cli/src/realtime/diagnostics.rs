@@ -294,11 +294,16 @@ impl DiagnosticRecorder {
             ref_path: dir.join("ref.wav"),
             out_path: dir.join("out.wav"),
             stats_path: dir.join("stats.csv"),
+            summary_path: dir.join("summary.txt"),
             sample_rate: config.sample_rate,
             frame_ms: config.frame_ms,
             max_frames,
             written_frames: 0,
             frame_index: 0,
+            output_pushed_samples: 0,
+            total_output_underruns: 0,
+            total_output_overruns: 0,
+            total_ref_stale_drops: 0,
             human_to_stderr: config.status_json,
             status_json: config.status_json,
             status: status.clone(),
@@ -411,11 +416,16 @@ struct DiagnosticWriter {
     ref_path: PathBuf,
     out_path: PathBuf,
     stats_path: PathBuf,
+    summary_path: PathBuf,
     sample_rate: u32,
     frame_ms: u32,
     max_frames: Option<u64>,
     written_frames: u64,
     frame_index: u64,
+    output_pushed_samples: u64,
+    total_output_underruns: u64,
+    total_output_overruns: u64,
+    total_ref_stale_drops: u64,
     human_to_stderr: bool,
     status_json: bool,
     status: DiagnosticsStatusHandle,
@@ -481,6 +491,21 @@ impl DiagnosticWriter {
                 writer.write_sample(*v)?;
             }
         }
+        self.output_pushed_samples = self.output_pushed_samples.saturating_add(
+            frame
+                .out
+                .len()
+                .saturating_sub(frame.output_overruns as usize) as u64,
+        );
+        self.total_output_underruns = self
+            .total_output_underruns
+            .saturating_add(frame.output_underruns);
+        self.total_output_overruns = self
+            .total_output_overruns
+            .saturating_add(frame.output_overruns);
+        self.total_ref_stale_drops = self
+            .total_ref_stale_drops
+            .saturating_add(frame.ref_stale_drops);
 
         let Some(stats) = self.stats.as_mut() else {
             bail!("诊断 stats writer 已关闭");
@@ -542,6 +567,7 @@ impl DiagnosticWriter {
         ok &= self.finalize_wav("ref.wav", DiagnosticWavKind::Ref);
         ok &= self.finalize_wav("out.wav", DiagnosticWavKind::Out);
         ok &= self.finalize_stats();
+        ok &= self.write_summary(reason);
 
         self.status.set_frames(self.written_frames);
         self.status.set_recording(false);
@@ -585,6 +611,50 @@ impl DiagnosticWriter {
         ok
     }
 
+    fn write_summary(&self, reason: DiagnosticDoneReason) -> bool {
+        let output_skew_pct = skew_pct(self.total_output_underruns, self.output_pushed_samples);
+        let ref_skew_pct = skew_pct(self.total_ref_stale_drops, self.output_pushed_samples);
+        let clock_skew_detected =
+            output_skew_pct > 2.0 && ref_skew_is_correlated(output_skew_pct, ref_skew_pct);
+        let mut file = match File::create(&self.summary_path) {
+            Ok(file) => BufWriter::new(file),
+            Err(err) => {
+                eprintln!("创建诊断 summary.txt 失败: {err}");
+                return false;
+            }
+        };
+        let result = (|| -> Result<()> {
+            writeln!(file, "reason={}", reason.as_str())?;
+            writeln!(file, "frames={}", self.written_frames)?;
+            writeln!(file, "seconds={:.3}", self.status.elapsed_s())?;
+            writeln!(file, "output_pushed_samples={}", self.output_pushed_samples)?;
+            writeln!(
+                file,
+                "output_underruns_total={}",
+                self.total_output_underruns
+            )?;
+            writeln!(file, "output_overruns_total={}", self.total_output_overruns)?;
+            writeln!(file, "ref_stale_drops_total={}", self.total_ref_stale_drops)?;
+            writeln!(file, "output_skew_pct={output_skew_pct:.3}")?;
+            writeln!(file, "ref_skew_pct={ref_skew_pct:.3}")?;
+            writeln!(file, "clock_skew_detected={clock_skew_detected}")?;
+            writeln!(file, "out_wav_capture_point=pre_output_ring")?;
+            writeln!(file, "out_wav_device_underrun_blind_spot=true")?;
+            writeln!(
+                file,
+                "note=out.wav is recorded before the output ring; device callback zero-fill is visible in output_underruns_total/output_skew_pct, not in out.wav"
+            )?;
+            file.flush()?;
+            Ok(())
+        })();
+        if let Err(err) = result {
+            eprintln!("写入诊断 summary.txt 失败: {err:#}");
+            false
+        } else {
+            true
+        }
+    }
+
     fn emit_done(&self, reason: DiagnosticDoneReason, ok: bool) {
         if self.status_json {
             let event = json!({
@@ -595,16 +665,24 @@ impl DiagnosticWriter {
                 "reason": reason.as_str(),
                 "drops": self.status.drops(),
                 "ok": ok,
+                "summary_path": self.summary_path.display().to_string(),
+                "output_underruns": self.total_output_underruns,
+                "output_overruns": self.total_output_overruns,
+                "ref_stale_drops": self.total_ref_stale_drops,
+                "output_skew_pct": skew_pct(self.total_output_underruns, self.output_pushed_samples),
+                "ref_skew_pct": skew_pct(self.total_ref_stale_drops, self.output_pushed_samples),
             });
             println!("{event}");
         } else {
             print_human(
                 self.human_to_stderr,
                 format!(
-                    "诊断录制完成(reason={}, ok={}, drops={}): {}",
+                    "诊断录制完成(reason={}, ok={}, drops={}, output_underruns={}, output_skew_pct={:.2}): {}",
                     reason.as_str(),
                     ok,
                     self.status.drops(),
+                    self.total_output_underruns,
+                    skew_pct(self.total_output_underruns, self.output_pushed_samples),
                     self.dir.display()
                 ),
             );
@@ -695,6 +773,18 @@ fn csv_escape(value: &str) -> String {
     } else {
         value.to_string()
     }
+}
+
+fn skew_pct(extra_samples: u64, pushed_samples: u64) -> f64 {
+    if pushed_samples == 0 {
+        0.0
+    } else {
+        extra_samples as f64 / pushed_samples as f64 * 100.0
+    }
+}
+
+fn ref_skew_is_correlated(output_skew_pct: f64, ref_skew_pct: f64) -> bool {
+    output_skew_pct > 0.0 && (output_skew_pct - ref_skew_pct).abs() <= output_skew_pct * 0.5
 }
 
 #[cfg(test)]
@@ -821,10 +911,10 @@ mod tests {
             mic_input_drops: 0,
             ref_input_drops: 0,
             mic_stale_drops: 0,
-            ref_stale_drops: 0,
+            ref_stale_drops: 1,
             ref_underruns: 0,
             output_overruns: 0,
-            output_underruns: 0,
+            output_underruns: 1,
             node_stats: &node_stats,
         };
 
@@ -848,6 +938,11 @@ mod tests {
         let metadata = std::fs::read_to_string(dir.join("metadata.txt"))?;
         assert!(metadata.contains("near_delay_ms=25"));
         assert!(metadata.contains("output_level=75"));
+        let summary = std::fs::read_to_string(dir.join("summary.txt"))?;
+        assert!(summary.contains("output_underruns_total=1"));
+        assert!(summary.contains("ref_stale_drops_total=1"));
+        assert!(summary.contains("out_wav_capture_point=pre_output_ring"));
+        assert!(summary.contains("out_wav_device_underrun_blind_spot=true"));
 
         let _ = std::fs::remove_dir_all(base);
         Ok(())
