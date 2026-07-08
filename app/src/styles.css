@@ -417,6 +417,9 @@ body {
   letter-spacing: 2px;
   text-transform: uppercase;
   margin: 16px 0 6px;
+  /* 数值 line-height 锁死行盒高度(不随字体变):否则中文字形(如「延迟侦测」)
+     的默认 line box 比拉丁文高几像素,多个段头累加 → 切换语言时下方各行整体上下漂移。 */
+  line-height: 1.3;
 }
 .asec::before {
   content: "[ ";
@@ -551,6 +554,7 @@ body {
   overflow: hidden;
   text-overflow: ellipsis;
   text-transform: uppercase; /* 用户反馈:小写提示不符合全大写主题 */
+  line-height: 1.3; /* 定死行盒:probe 提示中英文切换不改行高、不推 SESSION 段 */
 }
 /* 12 点进度:蜂鸣一声亮一个  ⚠ 问题 B7:与按钮/读数左缘对齐待调 */
 .pdots {
@@ -1521,6 +1525,8 @@ button.ecard:disabled {
   font-size: 10px;
   letter-spacing: 3px;
   text-transform: uppercase;
+  /* 同 .asec:定死行盒高度,避免中文标题(如「高级参数」)行盒偏高把整页下推。 */
+  line-height: 1.3;
 }
 .kick .d {
   display: flex;

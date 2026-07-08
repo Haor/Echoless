@@ -60,6 +60,18 @@ UI cleanup.
 - NVAFX runtime download is more robust: a longer timeout for the ~1 GB fetch,
   a byte-count readout when the server doesn't report a total size (so progress
   isn't blank), and stderr context included on timeout.
+- The Advanced page no longer shifts vertically when switching language. The
+  section headers and page kicker had font-derived line heights, so CJK titles
+  rendered a few pixels taller than Latin ones and nudged every row below them;
+  the line boxes are now locked to a script-independent height.
+- Selecting the LocalVQE engine on the Engine page before a model is chosen no
+  longer pops a "config validate failed" error. Switching to an engine that
+  isn't ready yet now just moves the selection (and stops a running engine)
+  instead of trying to validate and start an incomplete configuration.
+- After a successful NVAFX download-and-install, the ~1 GB download cache under
+  the system temp directory is cleared automatically once the runtime and model
+  are extracted and the doctor check passes. The cache is kept on failure so a
+  retry doesn't re-download.
 
 ## [1.0.0] — 2026-07-06
 

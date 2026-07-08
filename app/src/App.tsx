@@ -595,6 +595,13 @@ function useEngineConfig({
       paramsByKind.current[k] ??
       defaultParams(processors.find((p) => p.kind === k));
     updateEngine({ kind: k, params: np });
+    // 目标引擎未就绪(如首次选 LocalVQE 但还没选模型)→ 只切换选择,不去 validate/启动
+    // 一份缺 model 的配置(否则 config validate 会以退出码 1 抛「配置校验失败」弹窗)。
+    // 当前在运行则停掉旧引擎并置 OFF —— 待用户在引擎页配好目标引擎再开机。
+    if (!engineReady(k)) {
+      if (powerOnRef.current) stop();
+      return;
+    }
     applyChangeRef.current({ kind: k, params: np });
   }
 

@@ -392,7 +392,23 @@ fn cmd_nvafx_download_install(a: NvafxDownloadInstallArgs) -> Result<()> {
         print_nvafx_doctor_report(&report);
     }
     if !report.ok() {
+        // doctor 未过:保留下载缓存,便于用户排查后重装而无需重下 ~1 GB。
         bail!("runtime 已下载并解压,但 doctor 仍未通过");
+    }
+    // 安装成功且 doctor 通过 —— common runtime + model 已完全解压导入 runtime_dir,
+    // TMP 里的下载缓存(~1 GB)不再需要,自动清掉。清理失败不影响安装结果,仅记日志。
+    match remove_dir_all(&download_dir) {
+        Ok(()) => install_log(
+            a.json,
+            format!("已清理下载缓存: {}", download_dir.display()),
+        ),
+        Err(err) => install_log(
+            a.json,
+            format!(
+                "清理下载缓存失败(可忽略,可手动删除): {}: {err:#}",
+                download_dir.display()
+            ),
+        ),
     }
     Ok(())
 }
