@@ -43,8 +43,8 @@ const D: Record<string, { en: string; zh: string }> = {
   reduceNoise: { en: "Reduce background noise", zh: "抑制背景噪声" },
   aec3Only: { en: "AEC3 only", zh: "仅 AEC3" },
   lvqeNsHint: {
-    en: "on = denoise + echo removal · off = echo removal only",
-    zh: "开 = 降噪 + 回声消除 · 关 = 仅回声消除",
+    en: "on = v1.3 · off = v1.4 pure aec",
+    zh: "开 = v1.3 · 关 = v1.4 纯回声消除",
   },
 
   signal: { en: "Signal", zh: "Signal" },
