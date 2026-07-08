@@ -43,8 +43,8 @@ const D: Record<string, { en: string; zh: string }> = {
   reduceNoise: { en: "Reduce background noise", zh: "抑制背景噪声" },
   aec3Only: { en: "AEC3 only", zh: "仅 AEC3" },
   lvqeNsHint: {
-    en: "on = v1.3 · off = v1.4 pure aec",
-    zh: "开 = v1.3 · 关 = v1.4 纯回声消除",
+    en: "on = denoise + echo removal · off = echo removal only",
+    zh: "开 = 降噪 + 回声消除 · 关 = 仅回声消除",
   },
 
   signal: { en: "Signal", zh: "Signal" },
@@ -230,8 +230,8 @@ const D: Record<string, { en: string; zh: string }> = {
   nearDelay: { en: "Near Delay", zh: "近端延迟" },
   probeRun: { en: "RUN PROBE", zh: "运行侦测" },
   probeRunHint: {
-    en: "Plays test beeps to measure echo delay and auto-fill the delay params (Windows → initial, macOS → near). Engine pauses and restores.",
-    zh: "播放测试蜂鸣测回声延迟,自动填延迟参数(Windows→初始延迟,macOS→近端延迟)。引擎会暂停并在完成后恢复。",
+    en: "Plays test beeps to measure the echo delay and auto-fill the delay params. The engine pauses during the test and restores after (~15s).",
+    zh: "外放测试蜂鸣测量回声延迟并自动填入延迟参数。测试期间引擎暂停,结束后恢复(约 15 秒)。",
   },
   probing: { en: "PROBING…", zh: "侦测中…" },
   probeQuiet: {

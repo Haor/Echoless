@@ -65,68 +65,67 @@ const PROBE_INIT_DELAY_MS = 8;
 // 参数说明(悬浮 label 时提示)。缺省键无提示。
 const DESC: Record<string, { en: string; zh: string }> = {
   sample_rate: {
-    en: "Pipeline sample rate (must divide by 100). Restarts runtime.",
-    zh: "管线采样率(须能被 100 整除)。改动会重启运行时。",
+    en: "Audio processing sample rate. 48000 = full band, 16000 = narrowband/lighter. Restarts the engine.",
+    zh: "音频处理采样率。48000 全带宽,16000 窄带更省资源。改动会重启引擎。",
   },
-  frame_ms: { en: "Realtime frame size. Restarts runtime.", zh: "实时帧长。改动会重启运行时。" },
+  frame_ms: {
+    en: "Audio block size per processing step; sets the processing latency. Restarts the engine.",
+    zh: "单次处理的音频块时长,决定处理延迟。改动会重启引擎。",
+  },
   reference_channels: {
-    en: "Far-end reference channel mode (mono is the stable baseline).",
-    zh: "远端参考声道模式(mono 为稳定基线)。",
+    en: "Whether the system-audio reference enters the AEC as mono or stereo. Mono is the stable baseline.",
+    zh: "系统声音(参考)送入 AEC 时按 mono 还是 stereo。Mono 为稳定基线。",
   },
   ns_level: {
-    en: "Only effective when NS is on; NS is off by default.",
-    zh: "仅在降噪开启时有效;降噪默认关闭。",
+    en: "Noise-suppression strength. Higher suppresses more background noise.",
+    zh: "降噪强度。越高压掉的背景噪声越多。",
   },
   agc: {
-    en: "Off by default; avoids volume pumping (loud/quiet swings).",
-    zh: "默认关闭,避免音量泵动(忽大忽小)。",
+    en: "Automatic Gain Control — auto-levels mic volume. Off by default (it can cause volume pumping).",
+    zh: "自动增益控制(AGC):自动调平麦克风音量。默认关(会致音量泵动)。",
   },
   near_delay_ms: {
-    en: "Near/mic alignment delay for late-arriving references (negative delay); value ≈ negative search depth. Auto-filled on macOS, usually unset on Windows. Applies live.",
-    zh: "近端对齐延迟:延迟近端以对齐「参考晚到」的回声,数值≈负方向搜索深度。macOS 按需自动填,Windows 一般无需。运行中生效。",
+    en: "Delays the mic to align echoes that arrive before the reference; the value is the negative-direction search depth. macOS default 25ms (probe may override), Windows default 0. Applies live.",
+    zh: "延后麦克风,对齐「比系统声音先到」的回声;数值即负方向搜索深度。macOS 默认 25ms(侦测可覆盖),Windows 默认 0。运行中生效。",
   },
   initial_delay_ms: {
-    en: "AEC3 cold-start alignment hint, used once (runtime then self-estimates). Probe auto-fills: measured echo on Windows, 8ms margin on macOS.",
-    zh: "AEC3 冷启动对齐起点,只用一次(之后引擎自估)。侦测自动填:Windows 写实测回声延迟,macOS 写 8ms 余量。",
+    en: "Initial echo-delay value for AEC cold-start alignment; the engine self-estimates after. The probe fills the measured value.",
+    zh: "AEC 启动时的回声延迟初值,仅用于冷启动对齐,之后引擎自估。侦测会填入实测值。",
   },
   tail_ms: {
-    en: "Echo tail length. Auto ≈ AEC3 default (~52ms).",
-    zh: "回声拖尾长度。自动时走 AEC3 默认(约 52ms)。",
+    en: "Echo length the canceller models (tail). Default ~52ms.",
+    zh: "AEC 建模的回声长度(拖尾)。默认约 52ms。",
   },
   delay_num_filters: {
-    en: "Delay search window size. Auto ≈ 5 (~608ms).",
-    zh: "延迟搜索窗大小。自动约为 5(约 608ms)。",
+    en: "Delay-estimation search range (parallel matched filters). Default 5 ≈ 608ms.",
+    zh: "延迟估计的搜索范围(并行滤波器数)。默认 5 ≈ 608ms。",
   },
   linear_stable_echo_path: {
-    en: "Assume a more linear/stable echo path (pure loopback). Off by default.",
-    zh: "假设 echo path 更线性稳定(偏纯 loopback)。默认关闭。",
+    en: "Assume a linear, stable echo path (closer to pure loopback). Off by default.",
+    zh: "假设回声路径线性稳定(偏纯回环)。默认关。",
   },
-  model: { en: "GGUF model path (required).", zh: "GGUF 模型路径(必填)。" },
-  library: { en: "LocalVQE dynamic library path (auto if empty).", zh: "LocalVQE 动态库路径(留空自动)。" },
+  model: { en: "Path to the LocalVQE model file (.gguf). Required.", zh: "LocalVQE 模型文件(.gguf)路径。必填。" },
+  library: { en: "LocalVQE runtime library path. Auto-detected if empty.", zh: "LocalVQE 运行库路径。留空自动。" },
   threads: {
-    en: "CPU threads (auto if empty). 2-4 is plenty for realtime.",
-    zh: "CPU 线程数(留空自动)。实时推理 2-4 已足够。",
+    en: "CPU threads for model inference. Auto if empty.",
+    zh: "模型推理的 CPU 线程数。留空自动。",
   },
   noise_gate: {
-    en: "LocalVQE noise gate: mutes output below the threshold. Off by default.",
-    zh: "LocalVQE 噪声门:低于阈值时静音输出。默认关闭。",
+    en: "Mutes output below the threshold. Off by default.",
+    zh: "输出低于阈值时静音。默认关。",
   },
   noise_gate_threshold_dbfs: {
-    en: "Gate threshold (dBFS). Default -45; raise toward -35 to cut more room noise.",
-    zh: "噪声门阈值(dBFS)。默认 -45;想压掉更多环境声可向 -35 提高。",
+    en: "Noise-gate threshold (dBFS). Default -45; higher is more aggressive.",
+    zh: "噪声门阈值(dBFS)。默认 -45,越高越激进。",
   },
   intensity_ratio: {
-    en: "RTX AEC strength (0-1). Default 1.0; lower it if voice sounds over-suppressed.",
-    zh: "RTX AEC 强度(0-1)。默认 1.0;人声被压过头时调低。",
+    en: "RTX echo-removal strength (0–1). Default 1.0; lower is gentler.",
+    zh: "RTX 回声消除强度(0–1)。默认 1.0,越低越保守。",
   },
-  runtime_dir: { en: "NVIDIA AFX runtime dir (auto if empty).", zh: "NVIDIA AFX runtime 目录(留空自动)。" },
-  model_path: { en: "RTX AEC model path (auto if empty).", zh: "RTX AEC 模型路径(留空自动)。" },
   on_runtime_error: {
-    en: "On backend runtime error: silence (safe, no echo leak) or bypass (keeps mic alive but echo passes).",
-    zh: "运行时出错时:silence 安全不漏回声;bypass 保住麦克风但回声直通。",
+    en: "Fallback when the RTX backend errors: silence (no echo leak) or bypass (mic stays live, echo passes).",
+    zh: "RTX 后端出错时:silence 静音不漏回声,bypass 直通保麦克风但漏回声。",
   },
-  use_default_gpu: { en: "Use the default GPU.", zh: "使用默认 GPU。" },
-  disable_cuda_graph: { en: "Disable CUDA graph.", zh: "关闭 CUDA graph。" },
 };
 
 function backendLabel(kind: string, proc?: Processor): string {
