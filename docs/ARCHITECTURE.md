@@ -75,6 +75,28 @@ automatically).
 engine (15 ms crossfade) but capture/output keep running and the engine keeps
 its adaptation state, so switching back on is instant and glitch-free.
 
+**Clock-drift rate matching (`output_rate_match`, default on).** The pipeline
+runs on the capture (mic) clock, the output device drains on its own clock, and
+the far ring is filled on the render/loopback clock. These clocks are
+independent and drift even at an identical nominal rate (all 48 kHz, no format
+resampling) — virtual audio devices drift most. Uncompensated, the drift slowly
+empties the output ring (underruns → zero-fill clicks) or overflows it. The
+pre-T3 path dropped stale reference frames (`skip_stale`) and zero-filled
+underruns; both are audible and knock the far/near frames out of alignment,
+degrading AEC.
+
+Instead of dropping, the engine resamples to absorb the drift. On the fast path
+where the device rate equals the pipeline rate (otherwise a fixed-ratio
+resampler already runs), a PI controller (`RateController`) reads the output
+ring's water level, compares it to a 2-frame setpoint, and emits a ratio `trim`
+clamped to ±3% (with anti-windup); the resampler then runs at
+`base_ratio · (1 + trim)` to steer occupancy back to the setpoint. The far path
+uses the analogous resampler in place of `skip_stale`. The key detail is a
+**half-frame soft deadband**: while the water-level error stays within ±½ frame
+the effective error is zero and `trim` decays to 0, so a device that only
+jitters stays bit-exact and is never resampled — only sustained drift past
+½ frame pulls the ratio. The ±3% clamp keeps the pitch shift inaudible.
+
 ## AEC3 (`aec3/`)
 
 A Rust port of WebRTC's AEC3 (lineage: WebRTC C++ →
