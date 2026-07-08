@@ -105,6 +105,11 @@ pub struct RuntimeOptions {
     pub stats_interval_ms: Option<u64>,
     /// true = stdout 只输出 JSONL status;人类提示改走 stderr。
     pub status_json: bool,
+    /// true = 有界诊断(CLI `--diagnostic-seconds`)录满即自动停机退出。
+    /// 仅 CLI 一次性诊断场景置真;GUI 交互式 start/stop_diagnostics 不置(录完 run 要续跑)。
+    /// probe-delay 依赖这个自退:否则 run 录完仍常驻,靠外部 SIGINT/kill 停(Windows 无 kill、
+    /// dev sidecar 进程组信号不可靠),会把 probe 拖到超时、前端一直 PROBING。
+    pub exit_when_diagnostic_done: bool,
 }
 
 #[derive(Clone)]
@@ -143,6 +148,7 @@ struct ProcessRuntime {
     diagnostics_status: Option<DiagnosticsStatusHandle>,
     diagnostic: Option<DiagnosticRecorder>,
     control: Option<Receiver<RuntimeControlEvent>>,
+    exit_when_diagnostic_done: bool,
 }
 
 #[derive(Debug)]
@@ -487,6 +493,7 @@ pub fn run_with_options(cfg: &PipelineConfig, options: RuntimeOptions) -> Result
         diagnostics_status,
         diagnostic,
         control,
+        exit_when_diagnostic_done: options.exit_when_diagnostic_done,
     };
     let proc = thread::spawn(move || {
         process_loop(
@@ -585,6 +592,10 @@ fn process_loop<M, R, O>(
     });
     let mut diagnostic = runtime.diagnostic;
     let mut control = runtime.control;
+    // 有界诊断自退(CLI --diagnostic-seconds):录制线程录满 max_frames 后会把
+    // is_recording() 翻 false;主循环据此优雅停机,不再靠外部信号杀 run。
+    let exit_when_diagnostic_done = runtime.exit_when_diagnostic_done;
+    let mut diagnostic_was_recording = false;
 
     while running.load(Ordering::SeqCst) {
         handle_runtime_controls(
@@ -703,6 +714,20 @@ fn process_loop<M, R, O>(
                 Err(err) => {
                     eprintln!("诊断录制失败,已停用: {err:#}");
                     diagnostic = None;
+                }
+            }
+            // 有界诊断自退:录制线程录满 max_frames 后翻 is_recording()=false。
+            // 观察「曾在录 → 现已停」的沿变即优雅停机(仅 CLI --diagnostic-seconds
+            // 一次性场景;GUI 交互式录制不置该标志,录完 run 续跑)。
+            if exit_when_diagnostic_done {
+                let recording_now = diagnostic
+                    .as_ref()
+                    .is_some_and(DiagnosticRecorder::is_recording);
+                if recording_now {
+                    diagnostic_was_recording = true;
+                } else if diagnostic_was_recording {
+                    print_human(runtime.status_json, "诊断录制完成,run 自动停机。");
+                    running.store(false, Ordering::SeqCst);
                 }
             }
         }

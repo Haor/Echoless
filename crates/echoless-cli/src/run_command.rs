@@ -140,6 +140,9 @@ fn runtime_options_from_args(a: &RunArgs) -> Result<realtime::RuntimeOptions> {
             .stats_interval_ms
             .or_else(|| (a.verbose || a.status_json).then_some(1000)),
         status_json: a.status_json,
+        // 有界诊断(--diagnostic-seconds)录满即自退:一次性诊断跑完就停,
+        // 不再常驻等外部信号(probe-delay 依赖此;GUI 交互式录制不走 CLI 该参数)。
+        exit_when_diagnostic_done: a.diagnostic_seconds.is_some(),
     })
 }
 
