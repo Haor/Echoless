@@ -927,11 +927,16 @@ mod tests {
 
     #[test]
     fn probe_recommendation_preserves_default_bias() {
-        let default_bias_ms = default_near_delay_ms();
-
+        // 大负 lag(-18.5 → -(-18.5)+8=26.5,round 到 5 = 25)超过任何平台默认 → 按实测。
         assert_eq!(recommended_near_delay_ms(-18.5, 8.0), 25);
-        assert_eq!(recommended_near_delay_ms(-2.0, 8.0), default_bias_ms);
-        assert_eq!(recommended_near_delay_ms(12.0, 8.0), default_bias_ms);
+        // 小负 lag / 正 lag → 回落平台默认:mac 25(负方向窗)、win/linux 0(不设近端延迟)。
+        if cfg!(target_os = "macos") {
+            assert_eq!(recommended_near_delay_ms(-2.0, 8.0), 25);
+            assert_eq!(recommended_near_delay_ms(12.0, 8.0), 25);
+        } else {
+            assert_eq!(recommended_near_delay_ms(-2.0, 8.0), 10); // max(10, 0)=10
+            assert_eq!(recommended_near_delay_ms(12.0, 8.0), 0); // max(-4, 0)=0
+        }
     }
 
     #[test]

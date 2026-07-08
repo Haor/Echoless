@@ -82,12 +82,12 @@ const DESC: Record<string, { en: string; zh: string }> = {
     zh: "默认关闭,避免音量泵动(忽大忽小)。",
   },
   near_delay_ms: {
-    en: "Top-level near/mic alignment delay. Empty = backend default (macOS 25, others 0). Applies live while running.",
-    zh: "顶层近端对齐延迟。留空走后端默认(macOS 25 / 其它 0)。运行中可实时生效。",
+    en: "Near/mic alignment delay for late-arriving references (negative delay); value ≈ negative search depth. Auto-filled on macOS, usually unset on Windows. Applies live.",
+    zh: "近端对齐延迟:延迟近端以对齐「参考晚到」的回声,数值≈负方向搜索深度。macOS 按需自动填,Windows 一般无需。运行中生效。",
   },
   initial_delay_ms: {
-    en: "Initial stream delay hint; runtime still estimates dynamically. On macOS the probe writes it: 8ms when a near delay is applied, else the measured echo delay.",
-    zh: "初始延迟提示;运行时仍会动态估计。macOS 上侦测会写入:设了近端延迟时写 8ms,否则写实测 echo 延迟。",
+    en: "AEC3 cold-start alignment hint, used once (runtime then self-estimates). Probe auto-fills: measured echo on Windows, 8ms margin on macOS.",
+    zh: "AEC3 冷启动对齐起点,只用一次(之后引擎自估)。侦测自动填:Windows 写实测回声延迟,macOS 写 8ms 余量。",
   },
   tail_ms: {
     en: "Echo tail length. Auto ≈ AEC3 default (~52ms).",
@@ -164,8 +164,10 @@ function probeInitialDelay(
   platform: Platform,
   kind: string,
 ): number | null {
-  if (platform !== "macos" || kind !== "aec3") return null;
-  if (r.recommended_near_delay_ms > 0) return PROBE_INIT_DELAY_MS;
+  if (kind !== "aec3") return null;
+  // mac:近端延迟已做负方向偏置对齐 → init 只需一个小的安全余量。
+  if (platform === "macos") return PROBE_INIT_DELAY_MS;
+  // win/其它:不设近端延迟 → init = 实测回声延迟(冷启动对齐起点),需稳定。
   const stable =
     r.warnings.length === 0 &&
     Math.abs(r.event_lag_stddev_ms) < 5 &&
@@ -261,9 +263,11 @@ function ProbeSection({
       }
       if (!mounted.current) return;
       updateProbeIfMounted({ probe: r });
-      // 自动把实测推荐值填进 near_delay_ms(含 8ms AEC 安全余量,后端已算好)。
-      onPipeline({ near_delay_ms: r.recommended_near_delay_ms });
-      // mac + AEC3 → 顺带写 AEC3 initial_delay_ms(负 lag 写 8ms 安全值,正常正 lag 写实测延迟)。
+      // mac:近端延迟做负方向偏置(后端已含安全余量);win/其它:正 lag 无需近端延迟,不动。
+      if (platform === "macos") {
+        onPipeline({ near_delay_ms: r.recommended_near_delay_ms });
+      }
+      // AEC3 初始延迟:mac 写 8ms 余量(near_delay 已对齐),win/其它写实测回声延迟(冷启动起点)。
       const init = probeInitialDelay(r, platform, kind);
       if (init != null) onParam("initial_delay_ms", init);
     } catch (e) {
@@ -321,15 +325,17 @@ function ProbeSection({
         </div>
         <div className="apright">
           <div className="prow">
-            <button
-              type="button"
-              className="dopen pbtn"
-              disabled={probing}
-              onClick={runProbe}
-            >
-              {probing ? t("probing") : t("probeRun")}{" "}
-              <span className="mk">{probing ? "•••" : "↻"}</span>
-            </button>
+            <Hint text={t("probeRunHint")}>
+              <button
+                type="button"
+                className="dopen pbtn"
+                disabled={probing}
+                onClick={runProbe}
+              >
+                {probing ? t("probing") : t("probeRun")}{" "}
+                <span className="mk">{probing ? "•••" : "↻"}</span>
+              </button>
+            </Hint>
             <span className="pnote">
               {phase === "pausing"
                 ? t("probePausing")
@@ -374,7 +380,8 @@ function ProbeSection({
                 </span>
               </span>
               <span className="pline sub">
-                {probe.recommended_near_delay_ms > 0 ? (
+                {/* 显示随平台分流,与填充逻辑一致:mac 填近端延迟,win/其它只填初始延迟。 */}
+                {platform === "macos" ? (
                   <span className="ok">
                     {t("probeRec")} {probe.recommended_near_delay_ms}ms · {t("probeFilled")}
                     {initWritten != null && ` · ${t("probeInit")} ${initWritten}ms`}

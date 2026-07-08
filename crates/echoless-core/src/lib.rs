@@ -36,9 +36,11 @@ fn default_reference_channels() -> ReferenceChannels {
 }
 pub fn default_near_delay_ms() -> u32 {
     if cfg!(target_os = "macos") {
+        // macOS Process Tap 的参考常晚到(负 lag);近端延迟做常开负方向搜索偏置。
         25
     } else {
-        20
+        // Windows/Linux 参考先到(正 lag),AEC3 自搜即可;近端延迟默认不设。
+        0
     }
 }
 fn default_mic() -> String {

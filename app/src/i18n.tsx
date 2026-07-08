@@ -229,6 +229,10 @@ const D: Record<string, { en: string; zh: string }> = {
   secProbe: { en: "Delay Probe", zh: "延迟侦测" },
   nearDelay: { en: "Near Delay", zh: "近端延迟" },
   probeRun: { en: "RUN PROBE", zh: "运行侦测" },
+  probeRunHint: {
+    en: "Plays test beeps to measure echo delay and auto-fill the delay params (Windows → initial, macOS → near). Engine pauses and restores.",
+    zh: "播放测试蜂鸣测回声延迟,自动填延迟参数(Windows→初始延迟,macOS→近端延迟)。引擎会暂停并在完成后恢复。",
+  },
   probing: { en: "PROBING…", zh: "侦测中…" },
   probeQuiet: {
     en: "keep quiet · plays a beep train (~15s)",
