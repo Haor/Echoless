@@ -47,6 +47,8 @@ async function pickZip(set: (v: string) => void) {
 interface Props {
   doctor: NvafxDoctor | null;
   busy: boolean;
+  pct?: number | null;
+  stage?: "runtime" | "model" | null;
   dev: boolean;
   devState: RtxState;
   onDevState: (s: RtxState) => void;
@@ -59,6 +61,8 @@ interface Props {
 export function RtxSetupPage({
   doctor,
   busy,
+  pct,
+  stage,
   dev,
   devState,
   onDevState,
@@ -258,7 +262,11 @@ export function RtxSetupPage({
             </div>
             <div className="wzgo">
               {busy ? (
-                <span className="wzbusy">{t("wzDownloading")}</span>
+                <span className="wzbusy">
+                  {stage != null
+                    ? `${t("wzDl")} · ${stage === "model" ? t("wzModel") : t("wzCommon")}${pct != null ? ` ${pct}%` : ""}`
+                    : t("wzDownloading")}
+                </span>
               ) : (
                 <button
                   type="button"

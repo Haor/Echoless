@@ -4,7 +4,10 @@ use std::fs::{create_dir_all, remove_dir_all, rename, File};
 use std::io::{copy, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::thread;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, ensure, Context, Result};
 use clap::{Args, Subcommand};
@@ -653,6 +656,24 @@ fn download_file(url: &str, dest: &Path, label: &str, log_to_stderr: bool) -> Re
     ));
     let _ = std::fs::remove_file(&tmp);
     install_log(log_to_stderr, format!("下载 {label}: {url}"));
+    // json 模式下旁路一个 poller 线程,轮询 .part 字节数 / Content-Length,把进度
+    // 以 JSONL 打到 stderr(app 侧解析后转成 nvafx-progress 事件)。下载本身仍由
+    // 下面的 powershell/curl 完成,poller 只观测,失败也不影响下载。
+    let progress_stop = Arc::new(AtomicBool::new(false));
+    let progress = log_to_stderr.then(|| {
+        spawn_download_progress_poller(
+            url.to_string(),
+            tmp.clone(),
+            label.to_string(),
+            progress_stop.clone(),
+        )
+    });
+    // drop 时(含下面 ? 提前返回)自动停 poller 并 join,替代手写 finish 调用。
+    let _stopper = ProgressStopper {
+        stop: progress_stop,
+        handle: progress,
+    };
+
     match download_with_powershell(url, &tmp) {
         Ok(()) => {
             let _ = std::fs::remove_file(dest);
@@ -674,6 +695,68 @@ fn download_file(url: &str, dest: &Path, label: &str, log_to_stderr: bool) -> Re
             })
         }
     }
+}
+
+/// drop 时停止下载进度 poller 并 join 其线程(含 ? 提前返回时也会触发)。
+struct ProgressStopper {
+    stop: Arc<AtomicBool>,
+    handle: Option<thread::JoinHandle<()>>,
+}
+
+impl Drop for ProgressStopper {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
+}
+
+/// 下载进度 poller:HEAD 拿 Content-Length 作分母,轮询 .part 已下字节数,
+/// 把 `nvafx_download_progress` JSONL 打到 stderr。total 拿不到时 pct 发 null。
+fn spawn_download_progress_poller(
+    url: String,
+    tmp: PathBuf,
+    label: String,
+    stop: Arc<AtomicBool>,
+) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        let total = http_content_length(&url).unwrap_or(0);
+        loop {
+            let received = std::fs::metadata(&tmp).map(|m| m.len()).unwrap_or(0);
+            let pct = (received.min(total) * 100)
+                .checked_div(total)
+                .map(|p| (p as u32).min(99));
+            let line = json!({
+                "event": "nvafx_download_progress",
+                "label": label,
+                "received": received,
+                "total": total,
+                "pct": pct,
+            });
+            eprintln!("{line}");
+            if stop.load(Ordering::Relaxed) {
+                break;
+            }
+            thread::sleep(Duration::from_millis(400));
+        }
+    })
+}
+
+/// HEAD 请求取 Content-Length(跟随重定向,取最后一跳的值)。非 Windows 或
+/// 无 curl.exe 时返回 None,进度退化为无百分比。
+fn http_content_length(url: &str) -> Option<u64> {
+    let out = Command::new("curl.exe").args(["-sIL", url]).output().ok()?;
+    let headers = String::from_utf8_lossy(&out.stdout);
+    headers
+        .lines()
+        .filter_map(|line| {
+            line.to_ascii_lowercase()
+                .strip_prefix("content-length:")
+                .map(|v| v.trim().to_string())
+        })
+        .next_back()
+        .and_then(|v| v.parse::<u64>().ok())
 }
 
 fn download_with_powershell(url: &str, dest: &Path) -> Result<()> {

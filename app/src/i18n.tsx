@@ -150,6 +150,7 @@ const D: Record<string, { en: string; zh: string }> = {
   },
   wzDownloadInstall: { en: "download & install", zh: "下载并安装" },
   wzDownloading: { en: "downloading… ~1 GB, may take a while", zh: "下载中… 约 1 GB,可能需要一会" },
+  wzDl: { en: "downloading", zh: "下载中" },
   wzUseEngine: { en: "use this engine", zh: "使用该引擎" },
   wzNoGpuArch: { en: "fix GPU / driver detection first", zh: "请先修复 GPU / 驱动检测" },
 

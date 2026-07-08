@@ -22,6 +22,7 @@ import {
   nvafxDownloadInstall,
   nvafxInstall,
   onDevicesChanged,
+  onNvafxProgress,
   onRunEvent,
   onRunExit,
   onRunLog,
@@ -266,6 +267,8 @@ type AppState = {
   doctor: DoctorAudio | null;
   nvafx: NvafxDoctor | null;
   nvafxBusy: boolean;
+  nvafxPct: number | null;
+  nvafxStage: "runtime" | "model" | null;
   dev: boolean;
   devRtxState: RtxState;
   devMicState: MicState;
@@ -323,6 +326,8 @@ const INITIAL_APP_STATE: AppState = {
   doctor: null,
   nvafx: null,
   nvafxBusy: false,
+  nvafxPct: null,
+  nvafxStage: null,
   dev: false,
   devRtxState: "runtime_not_installed",
   devMicState: "missing",
@@ -1237,6 +1242,8 @@ function AppShell() {
     doctor,
     nvafx,
     nvafxBusy,
+    nvafxPct,
+    nvafxStage,
     dev,
     devRtxState,
     devMicState,
@@ -1425,6 +1432,21 @@ function AppShell() {
     };
   }, [noteError, refreshDevices]);
 
+  // NVAFX 下载进度:CLI download-install 在 stderr 打的 JSONL,后端转成事件。
+  // label 是「common runtime」/「model」两段,归一成 stage 让 UI 分别标注。
+  useEffect(() => {
+    let alive = true;
+    const un = onNvafxProgress((p) => {
+      if (!alive) return;
+      const stage = /model/i.test(p.label) ? "model" : "runtime";
+      updateApp({ nvafxPct: p.pct, nvafxStage: stage });
+    });
+    return () => {
+      alive = false;
+      un.then((f) => f());
+    };
+  }, [updateApp]);
+
   // Esc 始终有意义:在次级页按 Esc 返回 Overview。
   useEffect(() => {
     if (view === "overview") return;
@@ -1541,18 +1563,33 @@ function AppShell() {
   // 从公共 GitHub release 下载并安装(按 GPU 架构自动选模型)。dev 下模拟。
   function downloadInstallNvafx() {
     if (dev) {
-      updateApp({ nvafxBusy: true });
-      window.setTimeout(() => {
-        updateApp({ devRtxState: "ready", nvafxBusy: false });
-      }, 1200);
+      // 模拟真实下载:common runtime 0→99,再 model 0→99,然后完成。真实后端就是
+      // 两个 asset 顺序下载、各自 0→99,所以这里也走两段(各带 stage 标签),对齐 UI。
+      const stages = ["runtime", "model"] as const;
+      updateApp({ nvafxBusy: true, nvafxPct: 0, nvafxStage: stages[0], err: null });
+      let phase = 0;
+      let pct = 0;
+      const timer = window.setInterval(() => {
+        pct += 6;
+        if (pct >= 100) {
+          phase += 1;
+          if (phase >= stages.length) {
+            window.clearInterval(timer);
+            updateApp({ devRtxState: "ready", nvafxBusy: false, nvafxPct: null, nvafxStage: null });
+            return;
+          }
+          pct = 0; // 下一个 asset 从头开始
+        }
+        updateApp({ nvafxPct: Math.min(pct, 99), nvafxStage: stages[phase] });
+      }, 150);
       return;
     }
     const runtimeDir = (paramsRef.current.runtime_dir as string) || undefined;
-    updateApp({ nvafxBusy: true, err: null });
+    updateApp({ nvafxBusy: true, nvafxPct: null, nvafxStage: null, err: null });
     nvafxDownloadInstall({ runtimeDir })
       .then((nvafx) => updateApp({ nvafx }))
       .catch((e) => noteError(String(e)))
-      .finally(() => updateApp({ nvafxBusy: false }));
+      .finally(() => updateApp({ nvafxBusy: false, nvafxPct: null, nvafxStage: null }));
   }
 
   const platformView: Platform = dev && devPlatform ? devPlatform : platform;
@@ -1989,6 +2026,8 @@ function AppShell() {
           <RtxSetupPage
             doctor={nvafxView}
             busy={nvafxBusy}
+            pct={nvafxPct}
+            stage={nvafxStage}
             dev={dev}
             devState={devRtxState}
             onDevState={chooseDevRtxState}
