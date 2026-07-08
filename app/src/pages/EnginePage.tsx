@@ -131,6 +131,10 @@ interface Props {
   onSetup: () => void;
 }
 
+// 本机系统信息整段会话不变:模块级缓存,避免每次进 Engine 页 NvafxCard 重挂载都
+// 异步重取致「空 → 延迟 pop」的闪现。首取后缓存,重进用缓存同步初始化 state。
+let macSysInfoCache: MacSystemInfo | null = null;
+
 function NvafxCard({
   kind,
   params,
@@ -162,23 +166,29 @@ function NvafxCard({
   const nv = doctor?.report;
 
   // 不可用态(仅 macOS)拉本机系统信息填充右栏。dev 模拟给一份样例。
-  const [sysInfo, setSysInfo] = useState<MacSystemInfo | null>(null);
+  const [sysInfo, setSysInfo] = useState<MacSystemInfo | null>(macSysInfoCache);
   useEffect(() => {
     if (nvSupported || platform !== "macos") return;
+    if (sysInfo) return; // 缓存命中,已同步渲染,无需再取
     if (dev) {
-      setSysInfo({
+      const info: MacSystemInfo = {
         model: "MacBook Pro",
         os_version: "26.5.1",
         chip: "Apple M4",
         memory_gb: 24,
         cores: 10,
-      });
+      };
+      macSysInfoCache = info;
+      setSysInfo(info);
       return;
     }
     macSystemInfo()
-      .then(setSysInfo)
+      .then((info) => {
+        macSysInfoCache = info;
+        setSysInfo(info);
+      })
       .catch(() => {});
-  }, [nvSupported, platform, dev]);
+  }, [nvSupported, platform, dev, sysInfo]);
 
   async function pickRuntime() {
     try {
