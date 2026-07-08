@@ -279,15 +279,11 @@ fn run_native_delay_probe(
         .arg("--stats-interval-ms")
         .arg("1000")
         .stdout(Stdio::piped())
-        // 关键:不要 inherit stderr。probe(proc A)的 stderr 是 GUI sidecar 正在读的管道;
-        // run(proc B)若继承它,就多持有一个写端 → 即便 run 残留,sidecar 的 stderr reader
-        // 也永远等不到 EOF,run_probe_streaming 卡死、前端一直 PROBING(Windows 上尤甚:
-        // stop_probe_child 的 `kill` 命令不存在,杀不掉 run)。丢到 null:run 的 stderr 噪声
-        // probe 不需要,且彻底切断这条卡死链路。
-        .stderr(Stdio::null())
-        // run 现在录满 --diagnostic-seconds 会自动停机(realtime.rs 有界诊断自退);
-        // 给它一个常开 piped stdin 只作停机契约的次要保险(stdin EOF 也触发优雅停机),
-        // 不再依赖外部 SIGINT/kill —— dev sidecar 进程组信号、Windows 无 kill 都不可靠。
+        .stderr(Stdio::inherit())
+        // control reader 无条件启动(审计 B-01):stdin EOF = 优雅停机。probe spawn 的 run
+        // 子进程若继承已关闭的 stdin,会一起来就读到 EOF 自杀退出(exit 0),导致 probe 报
+        // 「run 过早退出」。给它一个常开 piped stdin(父持有、不写不关),让 run 正常跑满
+        // diagnostic 录制时长;结束时 stop_probe_child 用 SIGINT 停它。
         .stdin(Stdio::piped());
     #[cfg(unix)]
     {
@@ -339,10 +335,9 @@ fn run_native_delay_probe(
     }
     play_probe_beep(a, beep_path)?;
 
-    // run 现在录满 --diagnostic-seconds 会自动停机退出(realtime.rs 有界诊断自退),
-    // 下面 finish loop 的 child.try_wait() 会干净收到它退出 —— 这是主路径。
-    // 关 stdin 只作次要保险(stdin EOF 也触发优雅停机):万一自退逻辑被改动/回归,
-    // 仍不至于让 run 常驻。不再依赖 stop_probe_child 的 SIGINT/kill(Windows 无 kill)。
+    // beep 播完 = run 已录够诊断。关闭 stdin 触发 run 优雅停机(flush diagnostic、输出
+    // 「诊断录制完成」后退出),不再靠 finish loop 空等 deadline + SIGINT —— dev sidecar 下
+    // 进程组 SIGINT 停不干净,run 会常驻 R 态、把 probe 拖到逼近 45s 超时(前端一直 PROBING)。
     drop(run_stdin.take());
 
     let finish_deadline = Instant::now() + Duration::from_secs(u64::from(diagnostic_seconds) + 2);

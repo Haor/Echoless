@@ -206,13 +206,17 @@ function ProbeSection({
   const timer = useRef<number | null>(null);
   const mounted = useRef(true);
 
-  useEffect(
-    () => () => {
+  useEffect(() => {
+    // setup 必须把 mounted 设回 true:StrictMode(dev)会 mount→cleanup→再 mount,
+    // 首次 cleanup 已把 mounted 翻 false;若 setup 不重置,mounted 永久 false,
+    // 之后 runProbe 里所有 updateProbeIfMounted 全 no-op —— 进度灯不亮、结果不填、
+    // PROBING 永不清除(表现为「有声音但前端卡死」)。
+    mounted.current = true;
+    return () => {
       mounted.current = false;
       if (timer.current != null) window.clearInterval(timer.current);
-    },
-    [],
-  );
+    };
+  }, []);
   const updateProbeIfMounted = (patch: ProbePatch) => {
     if (mounted.current) updateProbe(patch);
   };
