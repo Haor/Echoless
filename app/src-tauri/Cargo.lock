@@ -789,7 +789,7 @@ dependencies = [
 
 [[package]]
 name = "echoless-paths"
-version = "1.0.0"
+version = "1.1.0"
 
 [[package]]
 name = "embed-resource"
