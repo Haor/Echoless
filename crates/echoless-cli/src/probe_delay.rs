@@ -279,7 +279,12 @@ fn run_native_delay_probe(
         .arg("--stats-interval-ms")
         .arg("1000")
         .stdout(Stdio::piped())
-        .stderr(Stdio::inherit());
+        .stderr(Stdio::inherit())
+        // control reader 无条件启动(审计 B-01):stdin EOF = 优雅停机。probe spawn 的 run
+        // 子进程若继承已关闭的 stdin,会一起来就读到 EOF 自杀退出(exit 0),导致 probe 报
+        // 「run 过早退出」。给它一个常开 piped stdin(父持有、不写不关),让 run 正常跑满
+        // diagnostic 录制时长;结束时 stop_probe_child 用 SIGINT 停它。
+        .stdin(Stdio::piped());
     #[cfg(unix)]
     {
         command.process_group(0);
