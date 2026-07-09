@@ -99,6 +99,11 @@ const CLOCK_SKEW_WINDOW_SECS: u64 = 5;
 const CLOCK_SKEW_ENTER_RATIO: f64 = 0.02;
 const CLOCK_SKEW_EXIT_RATIO: f64 = 0.01;
 const CLOCK_SKEW_REF_TOLERANCE_RATIO: f64 = 0.5;
+// 窗口级 EMA:新满窗占 50%。配合 ENTER_WINDOWS 滤掉单窗瞬时尖峰
+// (切窗/调度抖动把一次 underrun 突发挤进一个窗口,raw 比率可冲到 8%+)。
+const CLOCK_SKEW_EMA_ALPHA: f64 = 0.5;
+// 连续满窗超阈值(且参考侧佐证)才进入告警:单窗尖峰不告警。
+const CLOCK_SKEW_ENTER_WINDOWS: u32 = 2;
 
 struct WaveBuckets {
     peaks: Vec<f32>,
@@ -180,6 +185,15 @@ struct ClockSkewDetector {
     window_ref_stale_drops: u64,
     snapshot: ClockSkewSnapshot,
     warning: bool,
+    // 平滑 + 消抖(2026-07-09,黑屏 RCA 遗留项):raw 单窗比率对调度抖动极敏感
+    // (mac cmd+tab 切窗瞬间可从 0% 冲到 8%+ 再回落),导致 warning/resolved
+    // 高频翻转刷事件、面板读数乱跳。两道闸:
+    //   1. EMA 平滑比率(snapshot 对外报的也是平滑值,面板不再跳变);
+    //   2. 连续 CLOCK_SKEW_ENTER_WINDOWS 个满窗超阈值才进入告警。
+    // 解除侧保持单窗即出(EXIT 阈值本身已是滞回下沿,快恢复体验更好)。
+    ema_output_ratio: Option<f64>,
+    ema_ref_ratio: Option<f64>,
+    enter_streak: u32,
 }
 
 impl ClockSkewDetector {
@@ -191,6 +205,9 @@ impl ClockSkewDetector {
             window_ref_stale_drops: 0,
             snapshot: ClockSkewSnapshot::default(),
             warning: false,
+            ema_output_ratio: None,
+            ema_ref_ratio: None,
+            enter_streak: 0,
         }
     }
 
@@ -205,21 +222,39 @@ impl ClockSkewDetector {
             .window_output_underruns
             .saturating_add(output_underruns);
         self.window_ref_stale_drops = self.window_ref_stale_drops.saturating_add(ref_stale_drops);
-        self.snapshot = ClockSkewSnapshot::from_counts(
-            self.window_pushed_samples,
-            self.window_output_underruns,
-            self.window_ref_stale_drops,
-        );
 
         if self.min_window_samples == 0 || self.window_pushed_samples < self.min_window_samples {
+            // 满窗前 snapshot 用 raw 累计值(EMA 尚无本窗贡献);对外读数在
+            // 首个满窗后即切换为平滑值。
+            self.snapshot = ClockSkewSnapshot::from_ratios(
+                ratio(self.window_output_underruns, self.window_pushed_samples),
+                ratio(self.window_ref_stale_drops, self.window_pushed_samples),
+            );
             return None;
         }
 
-        let output_ratio = ratio(self.window_output_underruns, self.window_pushed_samples);
-        let event = if !self.warning
-            && output_ratio > CLOCK_SKEW_ENTER_RATIO
-            && self.snapshot.ref_correlated
-        {
+        let raw_output = ratio(self.window_output_underruns, self.window_pushed_samples);
+        let raw_ref = ratio(self.window_ref_stale_drops, self.window_pushed_samples);
+        // 窗口级 EMA:首窗直取,此后按 α 混入 —— 对外读数(snapshot)与解除判定
+        // 走平滑值,面板不跳、告警态不抖;进入判定走 raw(见下),否则尖峰的
+        // EMA 余温会让 streak 在错配已消失的窗口里继续累积、造成误告警。
+        let ema = |prev: Option<f64>, raw: f64| match prev {
+            Some(p) => p + CLOCK_SKEW_EMA_ALPHA * (raw - p),
+            None => raw,
+        };
+        let output_ratio = ema(self.ema_output_ratio, raw_output);
+        let ref_ratio = ema(self.ema_ref_ratio, raw_ref);
+        self.ema_output_ratio = Some(output_ratio);
+        self.ema_ref_ratio = Some(ref_ratio);
+        self.snapshot = ClockSkewSnapshot::from_ratios(output_ratio, ref_ratio);
+
+        // 进入侧按 raw 单窗判定:本窗真实超阈值且参考侧佐证,streak 才累积;
+        // 任一平静窗立即断裂 → 孤立尖峰(切窗/调度抖动)永远凑不齐连续窗。
+        let raw_win = ClockSkewSnapshot::from_ratios(raw_output, raw_ref);
+        let over = raw_output > CLOCK_SKEW_ENTER_RATIO && raw_win.ref_correlated;
+        self.enter_streak = if over { self.enter_streak.saturating_add(1) } else { 0 };
+
+        let event = if !self.warning && self.enter_streak >= CLOCK_SKEW_ENTER_WINDOWS {
             self.warning = true;
             Some(ClockSkewEvent {
                 kind: ClockSkewEventKind::Warning,
@@ -245,9 +280,7 @@ impl ClockSkewDetector {
 }
 
 impl ClockSkewSnapshot {
-    fn from_counts(pushed_samples: u64, output_underruns: u64, ref_stale_drops: u64) -> Self {
-        let output_ratio = ratio(output_underruns, pushed_samples);
-        let ref_ratio = ratio(ref_stale_drops, pushed_samples);
+    fn from_ratios(output_ratio: f64, ref_ratio: f64) -> Self {
         let tolerance = output_ratio * CLOCK_SKEW_REF_TOLERANCE_RATIO;
         Self {
             output_skew_pct: output_ratio * 100.0,
@@ -773,6 +806,12 @@ mod tests {
     fn clock_skew_detector_warns_after_correlated_five_second_window() {
         let mut detector = ClockSkewDetector::new(48_000);
 
+        // 第 1 个满窗(5 次 observe):超阈值但 streak=1 < ENTER_WINDOWS,不告警
+        // (单窗尖峰豁免 —— 切窗/调度抖动的瞬时 underrun 突发不算时钟错配)。
+        for _ in 0..5 {
+            assert!(detector.observe(48_000, 10_752, 10_752).is_none());
+        }
+        // 第 2 个连续满窗:streak=2 → 告警。恒定错配下 EMA 收敛于 raw,读数不失真。
         for _ in 0..4 {
             assert!(detector.observe(48_000, 10_752, 10_752).is_none());
         }
@@ -788,19 +827,39 @@ mod tests {
     #[test]
     fn clock_skew_detector_uses_hysteresis_for_resolution() {
         let mut detector = ClockSkewDetector::new(48_000);
-        for _ in 0..5 {
+        for _ in 0..10 {
             let _ = detector.observe(48_000, 10_752, 10_752);
         }
         assert!(detector.warning);
 
-        for _ in 0..4 {
-            assert!(detector.observe(48_000, 240, 240).is_none());
+        // 错配消失(计数归零):EMA 每满窗衰减一半,22.4% → …… → 跌破 EXIT(1%)
+        // 才解除。平滑让恢复比 raw 慢几个窗口 —— 换来的是告警态不抖。
+        let mut resolved = None;
+        for _ in 0..40 {
+            if let Some(event) = detector.observe(48_000, 0, 0) {
+                resolved = Some(event);
+                break;
+            }
         }
-        let event = detector.observe(48_000, 240, 240).unwrap();
-
+        let event = resolved.expect("EMA 衰减后应触发 Resolved");
         assert_eq!(event.kind, ClockSkewEventKind::Resolved);
         assert!(!detector.warning);
-        assert!((event.snapshot.output_skew_pct - 0.5).abs() < 0.001);
+        assert!(event.snapshot.output_skew_pct < 1.0);
+    }
+
+    #[test]
+    fn clock_skew_detector_ignores_transient_single_window_spike(){
+        // 回归(2026-07-09 黑屏 RCA 遗留项):单个满窗的瞬时尖峰(如 cmd+tab 切窗
+        // 挤出的 underrun 突发)不得触发告警 —— 尖峰过后回零,streak 断裂。
+        let mut detector = ClockSkewDetector::new(48_000);
+        for _ in 0..5 {
+            assert!(detector.observe(48_000, 10_752, 10_752).is_none());
+        }
+        // 下一个满窗回零:streak 归零,始终无告警。
+        for _ in 0..5 {
+            assert!(detector.observe(48_000, 0, 0).is_none());
+        }
+        assert!(!detector.warning);
     }
 
     #[test]
@@ -831,7 +890,8 @@ mod tests {
         // (回归护栏:T3 不得让 T1 的时钟错配告警失效)。
         let mut detector = ClockSkewDetector::new(48_000);
         let ref_signal = ref_pace_loss(0, 10_752); // T3: stale=0, input=10_752
-        for _ in 0..4 {
+        // 两个连续满窗(enter_streak 消抖)后告警。
+        for _ in 0..9 {
             assert!(detector.observe(48_000, 10_752, ref_signal).is_none());
         }
         let event = detector.observe(48_000, 10_752, ref_signal).unwrap();
