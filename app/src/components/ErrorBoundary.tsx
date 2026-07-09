@@ -1,4 +1,5 @@
 import { Component, type ErrorInfo, type ReactNode } from "react";
+import { frontendLog } from "../api";
 
 // React 渲染期异常的隔离墙。没有它,任意一处 render 抛错(例如某个遥测数值
 // 为 undefined 时的 `.toFixed()`)都会卸载整棵组件树 —— #root 清空、整窗黑屏、
@@ -33,6 +34,11 @@ export class ErrorBoundary extends Component<Props, State> {
       `[ErrorBoundary${this.props.label ? " " + this.props.label : ""}]`,
       error,
       info.componentStack,
+    );
+    // 落盘取证(logs/echoless-*.log):用户报障发日志文件即可,不再依赖现场 DevTools。
+    frontendLog(
+      "error",
+      `[ErrorBoundary ${this.props.label ?? "?"}] ${error?.stack ?? String(error)}\ncomponent stack:${info.componentStack ?? ""}`,
     );
   }
 

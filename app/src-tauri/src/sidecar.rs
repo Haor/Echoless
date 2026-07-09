@@ -183,9 +183,11 @@ pub(crate) fn start_run(
         Ok(child) => child,
         Err(err) => {
             cleanup_run_config(&path);
+            crate::logging::log("error", "sidecar", &format!("spawn echoless run failed: {err}"));
             return Err(format!("spawn echoless run failed: {err}"));
         }
     };
+    crate::logging::log("info", "sidecar", "echoless run started");
 
     // 本子进程专属的 stopping flag:被主动停/重启时置 true。
     let stopping = Arc::new(AtomicBool::new(false));
@@ -220,11 +222,13 @@ pub(crate) fn start_run(
                         let _ = app_out.emit("echoless://status", v);
                     }
                     JsonlLineEvent::Unparsed(line) => {
+                        crate::logging::log("warn", "sidecar", &format!("unparsed status line: {line}"));
                         let _ =
                             app_out.emit("echoless://log", format!("unparsed status line: {line}"));
                     }
                 },
                 Err(err) => {
+                    crate::logging::log("error", "sidecar", &format!("failed to read echoless stdout: {err}"));
                     let _ = app_out.emit(
                         "echoless://log",
                         format!("failed to read echoless stdout: {err}"),
@@ -235,6 +239,11 @@ pub(crate) fn start_run(
         }
         // 退出归因:intentional=主动停/重启(本 flag 已被置 true);否则=子进程自己退出(崩溃)。
         let intentional = stop_reader.load(Ordering::SeqCst);
+        crate::logging::log(
+            if intentional { "info" } else { "error" },
+            "sidecar",
+            &format!("echoless run exited (intentional={intentional})"),
+        );
         let run_state = app_out.state::<RunState>();
         mark_run_exited(&run_state, &reader_config_path);
         update_tray_tooltip(&app_out, false);
@@ -244,13 +253,14 @@ pub(crate) fn start_run(
         );
     });
 
-    // stderr = 人类日志
+    // stderr = 人类日志(转发事件 + 落盘取证)
     let app_err = app.clone();
     std::thread::spawn(move || {
         for line in BufReader::new(stderr).lines() {
             match line {
                 Ok(line) => {
                     if !line.trim().is_empty() {
+                        crate::logging::log("info", "cli", &line);
                         let _ = app_err.emit("echoless://log", line);
                     }
                 }

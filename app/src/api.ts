@@ -148,6 +148,15 @@ export function openPath(path: string): Promise<void> {
   return invoke<void>("open_path", { path });
 }
 
+// 前端错误落盘(logs/echoless-*.log):ErrorBoundary / window.onerror /
+// unhandledrejection 汇入,用户报障直接发日志文件。fire-and-forget,绝不 throw。
+export function frontendLog(
+  level: "error" | "warn" | "info",
+  message: string,
+): void {
+  invoke<void>("frontend_log", { level, message }).catch(() => {});
+}
+
 export function validateConfig(tomlText: string): Promise<ValidateResult> {
   return invoke<ValidateResult>("validate_config", { tomlText });
 }

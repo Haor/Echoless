@@ -15,6 +15,7 @@ mod commands;
 #[cfg(target_os = "macos")]
 mod device_watch;
 mod localvqe;
+mod logging;
 mod nvafx;
 mod platform;
 mod proc;
@@ -38,6 +39,8 @@ use tray::{register_windows_tray, TrayIconState};
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // 崩溃取证日志(logs/echoless-<stamp>.log,启动清理超龄/超量)。
+    logging::init(env!("CARGO_PKG_VERSION"));
     let builder = tauri::Builder::default()
         .plugin(tauri_plugin_decorum::init())
         .plugin(tauri_plugin_dialog::init())
@@ -66,6 +69,7 @@ pub fn run() {
             open_url,
             default_diag_dir,
             open_path,
+            logging::frontend_log,
             validate_config,
             start_run,
             send_run_control,
