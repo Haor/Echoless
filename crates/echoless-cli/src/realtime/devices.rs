@@ -109,7 +109,7 @@ fn select_default_device(host: &cpal::Host, kind: DeviceKind) -> Result<Selected
         DeviceKind::Input => host.default_input_device(),
         DeviceKind::Output => host.default_output_device(),
     }
-    .with_context(|| format!("无默认 {} 设备", kind.label()))?;
+    .with_context(|| format!("no default {} device", kind.label()))?;
     let devices = devices_for(host, kind).unwrap_or_default();
     let index = find_device_index(&devices, &device);
     Ok(SelectedDevice { index, device })
@@ -126,7 +126,7 @@ pub(super) fn select_device(
             let device = devices
                 .get(index)
                 .cloned()
-                .with_context(|| format!("无 {} 设备索引 {index}", kind.label()))?;
+                .with_context(|| format!("no {} device at index {index}", kind.label()))?;
             return Ok(SelectedDevice {
                 index: Some(index),
                 device,
@@ -141,7 +141,12 @@ pub(super) fn select_device(
                 index: Some(index),
                 device,
             })
-            .with_context(|| format!("无名称含 {selector:?} 的 {} 设备", kind.label()));
+            .with_context(|| {
+                format!(
+                    "no {} device with name containing {selector:?}",
+                    kind.label()
+                )
+            });
     }
     select_default_device(host, kind)
 }
@@ -169,7 +174,7 @@ fn select_system_reference_source(_host: &cpal::Host) -> Result<ReferenceSource>
 fn select_system_reference_source(host: &cpal::Host) -> Result<ReferenceSource> {
     Ok(ReferenceSource::Cpal {
         device: select_default_device(host, DeviceKind::Output)
-            .context("无默认输出设备可作系统 loopback")?,
+            .context("no default output device available for system loopback")?,
         kind: DeviceKind::Output,
     })
 }
@@ -179,7 +184,7 @@ fn select_render_device(host: &cpal::Host, selector: &str) -> Result<(SelectedDe
         let kind = match prefix.to_lowercase().as_str() {
             "input" | "in" => DeviceKind::Input,
             "output" | "out" => DeviceKind::Output,
-            _ => bail!("参考设备前缀须为 input: 或 output:"),
+            _ => bail!("reference device prefix must be input: or output:"),
         };
         return Ok((select_device(host, kind, Some(sel))?, kind));
     }
@@ -244,7 +249,7 @@ pub(super) fn pick_config(
         .map(|(_, config)| StreamConfigChoice::new(config, sample_rate))
         .with_context(|| {
             format!(
-                "{} 没有可用的非 DSD {} 配置",
+                "{} has no available non-DSD {} config",
                 device_label(device),
                 kind.label()
             )
@@ -256,7 +261,13 @@ fn default_config(device: &Device, kind: DeviceKind) -> Result<SupportedStreamCo
         DeviceKind::Input => device.default_input_config(),
         DeviceKind::Output => device.default_output_config(),
     }
-    .with_context(|| format!("{} 没有默认 {} 配置", device_label(device), kind.label()))
+    .with_context(|| {
+        format!(
+            "{} has no default {} config",
+            device_label(device),
+            kind.label()
+        )
+    })
 }
 
 // ── 设备列表 ──────────────────────────────────────────────────────────────────
@@ -264,7 +275,7 @@ fn default_config(device: &Device, kind: DeviceKind) -> Result<SupportedStreamCo
 pub fn print_devices() -> Result<()> {
     let host = cpal::default_host();
     for kind in [DeviceKind::Input, DeviceKind::Output] {
-        println!("{} 设备:", kind.label());
+        println!("{} devices:", kind.label());
         for (i, d) in devices_for(&host, kind)?.iter().enumerate() {
             let cfg = match kind {
                 DeviceKind::Input => d.default_input_config(),
@@ -272,7 +283,7 @@ pub fn print_devices() -> Result<()> {
             };
             let summary = cfg
                 .map(|c| config_summary(&c))
-                .unwrap_or_else(|e| format!("无默认配置: {e}"));
+                .unwrap_or_else(|e| format!("no default config: {e}"));
             println!(
                 "  {} ({summary})",
                 format_indexed_label(Some(i), device_label(d))
@@ -280,10 +291,10 @@ pub fn print_devices() -> Result<()> {
         }
     }
     println!(
-        "\n用法:run --config 配置文件;也可用 --mic / --reference / --output 覆盖配置里的设备选择。"
+        "\nUsage: run --config <config-file>; you can also use --mic / --reference / --output to override the device selection in the config."
     );
     println!(
-        "reference 还支持 'system'(Win=默认输出 loopback,mac=Process Tap)/ 'none' / 'output:<名>' / 'input:<名>'。"
+        "reference also accepts 'system' (Win = default output loopback, mac = Process Tap) / 'none' / 'output:<name>' / 'input:<name>'."
     );
     Ok(())
 }
@@ -739,7 +750,7 @@ fn request_system_audio_permission() -> SystemAudioPermissionProbe {
             },
             Err(err) => {
                 let detail = format!("{err:#}");
-                let state = if detail.contains("未找到 macOS Process Tap helper")
+                let state = if detail.contains("macOS Process Tap helper not found")
                     || detail.contains("Process Tap availability")
                 {
                     "unknown"
@@ -886,7 +897,7 @@ fn device_label(device: &Device) -> String {
     device
         .description()
         .map(|d| format_device_description(&d))
-        .unwrap_or_else(|_| "<未知>".to_owned())
+        .unwrap_or_else(|_| "<unknown>".to_owned())
 }
 
 pub(super) fn format_device_description(desc: &DeviceDescription) -> String {

@@ -360,7 +360,7 @@ fn config_writer_uses_create_new_and_refuses_existing_path() {
     std::fs::write(&path, "old = true").unwrap();
 
     let err = write_toml_create_new(&path, "new = true").unwrap_err();
-    assert!(err.contains("创建配置文件失败"), "{err}");
+    assert!(err.contains("failed to create config file"), "{err}");
     assert_eq!(std::fs::read_to_string(&path).unwrap(), "old = true");
 
     let _ = std::fs::remove_dir_all(dir);
@@ -421,13 +421,13 @@ fn localvqe_model_verification_checks_size_and_sha256() {
     let err = verify_localvqe_model_file(&path, &wrong_hash)
         .unwrap_err()
         .to_string();
-    assert!(err.contains("SHA256 不匹配"), "{err}");
+    assert!(err.contains("SHA256 mismatch"), "{err}");
 
     let wrong_size = LocalVqeModelPin { size: 4, ..good };
     let err = verify_localvqe_model_file(&path, &wrong_size)
         .unwrap_err()
         .to_string();
-    assert!(err.contains("大小不匹配"), "{err}");
+    assert!(err.contains("size mismatch"), "{err}");
 
     let _ = std::fs::remove_dir_all(dir);
 }

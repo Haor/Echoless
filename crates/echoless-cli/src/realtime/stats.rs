@@ -684,7 +684,7 @@ impl RealtimeStats {
 
 fn clock_skew_hint(output_skew_pct: f64) -> String {
     format!(
-        "输出设备时钟比麦克风快 {:.1}%,可能是虚拟音频设备采样率不一致;请将 Voicemeeter 及其虚拟端点、硬件输出统一设为 48000 Hz",
+        "the output device clock is {:.1}% faster than the microphone; a virtual audio device's sample rate is likely mismatched — set all virtual endpoints and hardware outputs to 48000 Hz",
         output_skew_pct
     )
 }
@@ -845,7 +845,7 @@ mod tests {
                 break;
             }
         }
-        let event = resolved.expect("EMA 衰减后应触发 Resolved");
+        let event = resolved.expect("Resolved should fire after EMA decay");
         assert_eq!(event.kind, ClockSkewEventKind::Resolved);
         assert!(!detector.warning);
         assert!(event.snapshot.output_skew_pct < 1.0);

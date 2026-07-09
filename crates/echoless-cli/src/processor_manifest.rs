@@ -14,11 +14,11 @@ pub(crate) fn cmd_processors(args: ProcessorsArgs) -> Result<()> {
         println!("{}", serde_json::to_string_pretty(&processor_manifest())?);
         return Ok(());
     }
-    println!("可用处理器种类:");
+    println!("available processor kinds:");
     for k in registry::kinds() {
         println!("  - {k}");
     }
-    println!("(在 --chain 或 config 的 [[chain]] 里按 kind 引用;默认建议 aec3)");
+    println!("(reference by kind in --chain or the config [[chain]] section; aec3 is the default recommendation)");
     Ok(())
 }
 

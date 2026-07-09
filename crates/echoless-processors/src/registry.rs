@@ -12,7 +12,7 @@ pub fn build(kind: &str) -> anyhow::Result<Box<dyn EchoProcessor>> {
         "localvqe" => Box::new(LocalVqe::new()),
         "nvidia_afx_aec" => Box::new(NvidiaAfxAec::new()),
         other => anyhow::bail!(
-            "未知处理器 kind: {other}(可用: passthrough / aec3 / localvqe / nvidia_afx_aec)"
+            "unknown processor kind: {other} (available: passthrough / aec3 / localvqe / nvidia_afx_aec)"
         ),
     })
 }

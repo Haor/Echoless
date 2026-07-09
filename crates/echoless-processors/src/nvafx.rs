@@ -207,12 +207,12 @@ impl RuntimeErrorMode {
             return Ok(Self::Silence);
         };
         let Some(s) = value.as_str() else {
-            bail!("on_runtime_error 必须是 silence 或 bypass");
+            bail!("on_runtime_error must be silence or bypass");
         };
         match s.to_ascii_lowercase().as_str() {
             "silence" => Ok(Self::Silence),
             "bypass" => Ok(Self::Bypass),
-            other => bail!("on_runtime_error 不支持 {other};可用: silence / bypass"),
+            other => bail!("on_runtime_error does not support {other}; valid: silence / bypass"),
         }
     }
 }
@@ -259,7 +259,7 @@ impl AecConfig {
             cfg.intensity_ratio = v as f32;
         }
         if !cfg.intensity_ratio.is_finite() || cfg.intensity_ratio < 0.0 {
-            bail!("intensity_ratio 必须是非负有限数");
+            bail!("intensity_ratio must be a non-negative finite number");
         }
         if let Some(v) = params.get("use_default_gpu").and_then(toml::Value::as_bool) {
             cfg.use_default_gpu = v;
@@ -357,7 +357,7 @@ impl EchoProcessor for NvidiaAfxAec {
 
         let report = doctor_report(self.cfg.runtime_dir.as_deref())?;
         if !report.ok() {
-            bail!("nvidia_afx_aec 尚未可用;请先运行 `echoless nvafx doctor` 修复依赖");
+            bail!("nvidia_afx_aec is not available yet; run `echoless nvafx doctor` to fix dependencies first");
         }
 
         let selection = resolve_runtime_selection(
@@ -368,7 +368,7 @@ impl EchoProcessor for NvidiaAfxAec {
         #[cfg(not(windows))]
         {
             let _ = selection;
-            bail!("nvidia_afx_aec 目前只支持 Windows x64");
+            bail!("nvidia_afx_aec currently supports Windows x64 only");
         }
 
         #[cfg(windows)]
@@ -384,7 +384,9 @@ impl EchoProcessor for NvidiaAfxAec {
     fn process(&mut self, near: &[f32], far: &[f32], out: &mut [f32], frames: u32) {
         if frames != NVAFX_FRAME_SAMPLES {
             self.handle_runtime_error(
-                format!("RTX AEC v1 只支持 {NVAFX_FRAME_SAMPLES} samples/frame,实际 {frames}"),
+                format!(
+                    "RTX AEC v1 only supports {NVAFX_FRAME_SAMPLES} samples/frame, got {frames}"
+                ),
                 near,
                 out,
             );
@@ -392,19 +394,19 @@ impl EchoProcessor for NvidiaAfxAec {
         }
         let frame = NVAFX_FRAME_SAMPLES as usize;
         if near.len() < frame || far.len() < frame || out.len() < frame {
-            self.handle_runtime_error("RTX AEC 输入/输出缓冲长度不足", near, out);
+            self.handle_runtime_error("RTX AEC input/output buffer too short", near, out);
             return;
         }
 
         #[cfg(not(windows))]
         {
-            self.handle_runtime_error("RTX AEC backend 只支持 Windows", near, out);
+            self.handle_runtime_error("RTX AEC backend only supports Windows", near, out);
         }
 
         #[cfg(windows)]
         {
             let Some(effect) = self.effect.as_mut() else {
-                self.handle_runtime_error("RTX AEC effect 未初始化", near, out);
+                self.handle_runtime_error("RTX AEC effect not initialized", near, out);
                 return;
             };
             let started = Instant::now();
@@ -448,16 +450,16 @@ pub fn doctor_report(runtime_dir_override: Option<&Path>) -> Result<DoctorReport
     } else {
         checks.push(DoctorCheck::unsupported(
             "platform",
-            "NVIDIA AFX AEC runtime 目前只支持 Windows x64",
-            "在 Windows RTX 机器上使用 RTX AEC backend",
+            "The NVIDIA AFX AEC runtime currently supports Windows x64 only",
+            "Use the RTX AEC backend on a Windows RTX machine",
         ));
     }
 
     let gpus = detect_gpus().unwrap_or_else(|err| {
         checks.push(DoctorCheck::missing(
             "nvidia-smi",
-            format!("无法运行 nvidia-smi: {err:#}"),
-            "安装 NVIDIA graphics driver 572.61 或更新版本",
+            format!("could not run nvidia-smi: {err:#}"),
+            "Install NVIDIA graphics driver 572.61 or newer",
         ));
         Vec::new()
     });
@@ -495,12 +497,13 @@ fn resolve_runtime_selection(
     model_path_override: Option<&Path>,
 ) -> Result<RuntimeSelection> {
     let (runtime_dir, _runtime_dir_source) = resolve_runtime_dir(runtime_dir_override);
-    let gpus = detect_gpus().context("检测 NVIDIA GPU 失败")?;
+    let gpus = detect_gpus().context("failed to detect NVIDIA GPU")?;
     let selected_arch = gpus.iter().find_map(|gpu| gpu.arch);
     let model_path = if let Some(path) = model_path_override {
         path.to_path_buf()
     } else {
-        let arch = selected_arch.context("无法根据 GPU compute capability 选择 RTX AEC 模型")?;
+        let arch = selected_arch
+            .context("cannot select an RTX AEC model from the GPU compute capability")?;
         runtime_dir.join(arch.model_payload_path())
     };
     Ok(RuntimeSelection {
@@ -516,13 +519,13 @@ fn check_windows_system_dependencies() -> Vec<DoctorCheck> {
         if let Some(path) = find_windows_system_dll(dll) {
             checks.push(DoctorCheck::ok(
                 format!("vc-runtime:{dll}"),
-                format!("Microsoft VC++ runtime 已存在: {}", path.display()),
+                format!("Microsoft VC++ runtime present: {}", path.display()),
             ));
         } else {
             checks.push(DoctorCheck::missing(
                 format!("vc-runtime:{dll}"),
-                "未找到 Microsoft VC++ runtime DLL",
-                "安装 Microsoft Visual C++ 2015-2022 Redistributable x64",
+                "Microsoft VC++ runtime DLL not found",
+                "Install Microsoft Visual C++ 2015-2022 Redistributable x64",
             ));
         }
     }
@@ -534,8 +537,8 @@ fn check_windows_system_dependencies() -> Vec<DoctorCheck> {
     } else {
         checks.push(DoctorCheck::missing(
             "nvcuda.dll",
-            "未找到 NVIDIA CUDA driver DLL",
-            "安装 NVIDIA graphics driver 572.61 或更新版本",
+            "NVIDIA CUDA driver DLL not found",
+            "Install NVIDIA graphics driver 572.61 or newer",
         ));
     }
     checks
@@ -624,10 +627,10 @@ fn detect_gpus() -> Result<Vec<GpuInfo>> {
             "--format=csv,noheader",
         ])
         .output()
-        .with_context(|| format!("运行 nvidia-smi 失败: {}", nvidia_smi.display()))?;
+        .with_context(|| format!("failed to run nvidia-smi: {}", nvidia_smi.display()))?;
     if !output.status.success() {
         bail!(
-            "nvidia-smi ({}) 退出码 {:?}: {}",
+            "nvidia-smi ({}) exited with code {:?}: {}",
             nvidia_smi.display(),
             output.status.code(),
             String::from_utf8_lossy(&output.stderr).trim()
@@ -657,8 +660,8 @@ fn check_gpus(gpus: &[GpuInfo]) -> Vec<DoctorCheck> {
     if gpus.is_empty() {
         return vec![DoctorCheck::missing(
             "gpu",
-            "未检测到 NVIDIA GPU",
-            "确认机器有 RTX / Tensor Core GPU 并已安装 NVIDIA driver",
+            "No NVIDIA GPU detected",
+            "Make sure the machine has an RTX / Tensor Core GPU and the NVIDIA driver installed",
         )];
     }
 
@@ -670,10 +673,10 @@ fn check_gpus(gpus: &[GpuInfo]) -> Vec<DoctorCheck> {
             checks.push(DoctorCheck::missing(
                 format!("{label}:driver"),
                 format!(
-                    "{} driver={} 低于最低要求 {}",
+                    "{} driver={} is below the minimum {}",
                     gpu.name, gpu.driver_version, MIN_DRIVER_VERSION
                 ),
-                "更新 NVIDIA graphics driver",
+                "Update the NVIDIA graphics driver",
             ));
         } else {
             checks.push(DoctorCheck::ok(
@@ -692,10 +695,10 @@ fn check_gpus(gpus: &[GpuInfo]) -> Vec<DoctorCheck> {
             None => checks.push(DoctorCheck::unsupported(
                 format!("{label}:arch"),
                 format!(
-                    "{} compute_cap={} 不在支持列表",
+                    "{} compute_cap={} is not in the supported list",
                     gpu.name, gpu.compute_capability
                 ),
-                "RTX AEC backend 需要 Turing/Ampere/Ada/Blackwell 架构",
+                "The RTX AEC backend requires a Turing/Ampere/Ada/Blackwell architecture",
             )),
         }
     }
@@ -707,13 +710,16 @@ fn check_runtime_files(runtime_dir: &Path, selected_arch: Option<GpuArch>) -> Ve
     if runtime_dir.is_dir() {
         checks.push(DoctorCheck::ok(
             "runtime-dir",
-            format!("runtime 目录: {}", runtime_dir.display()),
+            format!("runtime directory: {}", runtime_dir.display()),
         ));
     } else {
         checks.push(DoctorCheck::missing(
             "runtime-dir",
-            format!("runtime 目录不存在: {}", runtime_dir.display()),
-            "下载并解压 echoless-rtx-aec-common-runtime-win64-2.1.0.zip",
+            format!(
+                "runtime directory does not exist: {}",
+                runtime_dir.display()
+            ),
+            "Download and extract echoless-rtx-aec-common-runtime-win64-2.1.0.zip",
         ));
     }
 
@@ -728,7 +734,7 @@ fn check_runtime_files(runtime_dir: &Path, selected_arch: Option<GpuArch>) -> Ve
             checks.push(DoctorCheck::missing(
                 format!("runtime:{rel}"),
                 format!("missing {}", path.display()),
-                "下载并解压 common runtime zip",
+                "Download and extract the common runtime zip",
             ));
         }
     }
@@ -746,14 +752,14 @@ fn check_runtime_files(runtime_dir: &Path, selected_arch: Option<GpuArch>) -> Ve
                 checks.push(DoctorCheck::missing(
                     "runtime:model",
                     format!("missing {}", path.display()),
-                    format!("下载并解压 {}", arch.model_asset_name()),
+                    format!("Download and extract {}", arch.model_asset_name()),
                 ));
             }
         }
         None => checks.push(DoctorCheck::warning(
             "runtime:model",
-            "无法判断应使用哪个 AEC 模型",
-            "先修复 GPU/driver 检测",
+            "Cannot determine which AEC model to use",
+            "Fix GPU/driver detection first",
         )),
     }
 
@@ -764,8 +770,8 @@ fn check_afx_smoke(runtime_dir: &Path, selected_arch: Option<GpuArch>) -> Vec<Do
     let Some(arch) = selected_arch else {
         return vec![DoctorCheck::warning(
             "afx-smoke",
-            "跳过 AFX smoke check: 无法选择 GPU 架构",
-            "先修复 GPU/driver 检测",
+            "Skipping AFX smoke check: cannot select a GPU architecture",
+            "Fix GPU/driver detection first",
         )];
     };
     let model_path = runtime_dir.join(arch.model_payload_path());
@@ -775,7 +781,7 @@ fn check_afx_smoke(runtime_dir: &Path, selected_arch: Option<GpuArch>) -> Vec<Do
             Ok(effect) => vec![
                 DoctorCheck::ok(
                     "afx-smoke:load",
-                    format!("已加载 NVAudioEffects.dll 并创建 AEC effect ({arch})"),
+                    format!("Loaded NVAudioEffects.dll and created the AEC effect ({arch})"),
                 ),
                 DoctorCheck::ok(
                     "afx-smoke:devices",
@@ -791,8 +797,8 @@ fn check_afx_smoke(runtime_dir: &Path, selected_arch: Option<GpuArch>) -> Vec<Do
             ],
             Err(err) => vec![DoctorCheck::unsupported(
                 "afx-smoke",
-                format!("AFX AEC smoke check 失败: {err:#}"),
-                "确认 runtime/model 与 GPU 架构匹配,并安装满足要求的 NVIDIA driver",
+                format!("AFX AEC smoke check failed: {err:#}"),
+                "Make sure the runtime/model match the GPU architecture and a supported NVIDIA driver is installed",
             )],
         }
     }
@@ -801,8 +807,8 @@ fn check_afx_smoke(runtime_dir: &Path, selected_arch: Option<GpuArch>) -> Vec<Do
         let _ = (runtime_dir, model_path);
         vec![DoctorCheck::unsupported(
             "afx-smoke",
-            "AFX smoke check 只在 Windows 执行",
-            "在 Windows RTX 机器上运行 doctor",
+            "The AFX smoke check only runs on Windows",
+            "Run doctor on a Windows RTX machine",
         )]
     }
 }
@@ -923,7 +929,7 @@ mod ffi {
                 "NvAFX_CreateEffect(aec)",
             )?;
             if handle.is_null() {
-                bail!("NvAFX_CreateEffect(aec) 返回空 handle");
+                bail!("NvAFX_CreateEffect(aec) returned a null handle");
             }
 
             let mut effect = Self {
@@ -986,7 +992,7 @@ mod ffi {
                 self.get_u32_list(PARAM_SUPPORTED_NUM_SAMPLES_PER_FRAME)?;
             if !self.supported_frame_sizes.contains(&NVAFX_FRAME_SAMPLES) {
                 bail!(
-                    "RTX AEC 模型不支持 {} samples/frame;支持列表 {:?}",
+                    "the RTX AEC model does not support {} samples/frame; supported list {:?}",
                     NVAFX_FRAME_SAMPLES,
                     self.supported_frame_sizes
                 );
@@ -1009,7 +1015,7 @@ mod ffi {
                 || output_frame != NVAFX_FRAME_SAMPLES
             {
                 bail!(
-                    "AFX AEC 属性不匹配: in_rate={input_rate}, out_rate={output_rate}, \
+                    "AFX AEC property mismatch: in_rate={input_rate}, out_rate={output_rate}, \
                      in_ch={input_channels}, out_ch={output_channels}, in_frame={input_frame}, out_frame={output_frame}"
                 );
             }
@@ -1033,8 +1039,8 @@ mod ffi {
         fn set_string(&self, param: &[u8], value: &Path) -> Result<()> {
             let value = value
                 .to_str()
-                .with_context(|| format!("AFX path 不是 UTF-8: {}", value.display()))?;
-            let value = CString::new(value).context("AFX path 含 NUL 字节")?;
+                .with_context(|| format!("AFX path is not UTF-8: {}", value.display()))?;
+            let value = CString::new(value).context("AFX path contains a NUL byte")?;
             self.api.check(
                 unsafe {
                     (self.api.set_string)(self.handle, param.as_ptr().cast(), value.as_ptr())
@@ -1145,7 +1151,7 @@ mod ffi {
             ])?;
             let dll = runtime_dir.join("bin").join("NVAudioEffects.dll");
             let library = unsafe { Library::new(&dll) }
-                .with_context(|| format!("加载 AFX DLL 失败: {}", dll.display()))?;
+                .with_context(|| format!("failed to load AFX DLL: {}", dll.display()))?;
             Ok(Self {
                 create_effect: unsafe { load_symbol(&library, b"NvAFX_CreateEffect\0")? },
                 destroy_effect: unsafe { load_symbol(&library, b"NvAFX_DestroyEffect\0")? },
@@ -1179,9 +1185,12 @@ mod ffi {
     }
 
     unsafe fn load_symbol<T: Copy>(library: &Library, name: &[u8]) -> Result<T> {
-        Ok(*library
-            .get::<T>(name)
-            .with_context(|| format!("加载 AFX symbol 失败: {}", String::from_utf8_lossy(name)))?)
+        Ok(*library.get::<T>(name).with_context(|| {
+            format!(
+                "failed to load AFX symbol: {}",
+                String::from_utf8_lossy(name)
+            )
+        })?)
     }
 
     fn param_label(prefix: &'static str, param: &[u8]) -> String {
@@ -1238,7 +1247,7 @@ mod ffi {
             };
             if ok == 0 {
                 return Err(std::io::Error::last_os_error())
-                    .context("设置 Windows DLL 默认搜索路径失败");
+                    .context("failed to set the Windows DLL default search path");
             }
 
             let mut cookies = Vec::new();
@@ -1251,8 +1260,9 @@ mod ffi {
                     .collect();
                 let cookie = unsafe { AddDllDirectory(wide.as_ptr()) };
                 if cookie.is_null() {
-                    return Err(std::io::Error::last_os_error())
-                        .with_context(|| format!("加入 DLL 搜索路径失败: {}", path.display()));
+                    return Err(std::io::Error::last_os_error()).with_context(|| {
+                        format!("failed to add DLL search path: {}", path.display())
+                    });
                 }
                 cookies.push(cookie);
                 wide_paths.push(wide);

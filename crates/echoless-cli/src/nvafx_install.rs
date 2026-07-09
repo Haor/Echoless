@@ -64,44 +64,44 @@ pub(crate) struct NvafxArgs {
 
 #[derive(Subcommand)]
 enum NvafxCmd {
-    /// 检查 RTX AEC runtime、GPU、driver、VC++ runtime 是否可用
+    /// Check RTX AEC runtime, GPU, driver, and VC++ runtime availability
     Doctor(NvafxDoctorArgs),
-    /// 离线运行 RTX AEC:mic.wav + ref.wav → out.wav
+    /// Run RTX AEC offline: mic.wav + ref.wav -> out.wav
     Offline(NvafxOfflineArgs),
-    /// 从本地 zip 安装 Echoless RTX AEC runtime 与模型
+    /// Install Echoless RTX AEC runtime and model from a local zip
     Install(NvafxInstallArgs),
-    /// 从 Echoless GitHub public release 下载并安装 RTX AEC runtime 与当前 GPU 模型
+    /// Download and install RTX AEC runtime and current GPU model from the Echoless GitHub public release
     DownloadInstall(NvafxDownloadInstallArgs),
 }
 
 #[derive(Args)]
 struct NvafxDoctorArgs {
-    /// 覆盖 runtime 根目录;Windows 默认读 ECHOLESS_NVAFX_RUNTIME_DIR,再退到 %LOCALAPPDATA%\Echoless\nvafx\2.1.0
+    /// Override runtime root directory; Windows defaults to ECHOLESS_NVAFX_RUNTIME_DIR, then falls back to %LOCALAPPDATA%\Echoless\nvafx\2.1.0
     #[arg(long)]
     runtime_dir: Option<PathBuf>,
-    /// 输出 JSON,供 GUI/installer 消费
+    /// Emit JSON for GUI/installer consumers
     #[arg(long)]
     json: bool,
 }
 
 #[derive(Args)]
 struct NvafxOfflineArgs {
-    /// 近端麦克风 WAV
+    /// Near-end microphone WAV
     #[arg(long)]
     mic: String,
-    /// far-end 参考 WAV
+    /// Far-end reference WAV
     #[arg(long)]
     reference: String,
-    /// 输出 WAV
+    /// Output WAV
     #[arg(long)]
     out: String,
-    /// 覆盖 runtime 根目录
+    /// Override runtime root directory
     #[arg(long)]
     runtime_dir: Option<PathBuf>,
-    /// 覆盖模型路径;默认按 GPU 架构自动选择
+    /// Override model path; defaults are chosen automatically by GPU architecture
     #[arg(long)]
     model_path: Option<PathBuf>,
-    /// AFX AEC 强度
+    /// AFX AEC intensity
     #[arg(long, default_value_t = 1.0)]
     intensity_ratio: f32,
 }
@@ -111,29 +111,29 @@ struct NvafxInstallArgs {
     /// common runtime zip
     #[arg(long)]
     common_zip: PathBuf,
-    /// 当前 GPU 架构对应的 model zip
+    /// Model zip for the current GPU architecture
     #[arg(long)]
     model_zip: PathBuf,
-    /// 覆盖安装根目录;Windows 默认 %LOCALAPPDATA%\Echoless\nvafx\2.1.0
+    /// Override install root directory; Windows defaults to %LOCALAPPDATA%\Echoless\nvafx\2.1.0
     #[arg(long)]
     runtime_dir: Option<PathBuf>,
-    /// 覆盖 common zip 期望 SHA256;不填则按官方 asset 名称自动匹配
+    /// Override expected SHA256 for common zip; falls back to matching the official asset name when unset
     #[arg(long)]
     common_sha256: Option<String>,
-    /// 覆盖 model zip 期望 SHA256;不填则按官方 asset 名称自动匹配
+    /// Override expected SHA256 for model zip; falls back to matching the official asset name when unset
     #[arg(long)]
     model_sha256: Option<String>,
 }
 
 #[derive(Args)]
 struct NvafxDownloadInstallArgs {
-    /// 覆盖安装根目录;Windows 默认 %LOCALAPPDATA%\Echoless\nvafx\2.1.0
+    /// Override install root directory; Windows defaults to %LOCALAPPDATA%\Echoless\nvafx\2.1.0
     #[arg(long)]
     runtime_dir: Option<PathBuf>,
-    /// GitHub release tag;默认使用 Echoless RTX AEC public preview release
+    /// GitHub release tag; defaults to the Echoless RTX AEC public preview release
     #[arg(long, default_value = DEFAULT_NVAFX_RELEASE_TAG)]
     tag: String,
-    /// 输出 { ok, report } JSON,供 GUI installer 消费
+    /// Emit { ok, report } JSON for GUI installer consumers
     #[arg(long)]
     json: bool,
 }
@@ -162,7 +162,7 @@ fn cmd_nvafx_doctor(args: NvafxDoctorArgs) -> Result<()> {
 
     println!("NVIDIA AFX / RTX AEC doctor");
     println!(
-        "SDK {} · runtime file {} · 最低 driver {}",
+        "SDK {} · runtime file {} · minimum driver {}",
         echoless_processors::nvafx::SDK_VERSION,
         echoless_processors::nvafx::RUNTIME_FILE_VERSION,
         echoless_processors::nvafx::MIN_DRIVER_VERSION,
@@ -173,7 +173,7 @@ fn cmd_nvafx_doctor(args: NvafxDoctorArgs) -> Result<()> {
         report.runtime_dir_source
     );
     if report.gpus.is_empty() {
-        println!("GPU:     未检测到 NVIDIA GPU");
+        println!("GPU:     no NVIDIA GPU detected");
     } else {
         println!("GPU:");
         for (index, gpu) in report.gpus.iter().enumerate() {
@@ -204,14 +204,14 @@ fn cmd_nvafx_doctor(args: NvafxDoctorArgs) -> Result<()> {
             check.detail
         );
         if let Some(action) = &check.action {
-            println!("      处理: {action}");
+            println!("      action: {action}");
         }
     }
 
     if problems == 0 {
-        println!("\nRTX AEC runtime 预检通过。");
+        println!("\nRTX AEC runtime preflight passed.");
     } else {
-        println!("\nRTX AEC runtime 预检未通过: {problems} 个问题需要处理。");
+        println!("\nRTX AEC runtime preflight failed: {problems} issues to resolve.");
     }
     Ok(())
 }
@@ -219,7 +219,7 @@ fn cmd_nvafx_doctor(args: NvafxDoctorArgs) -> Result<()> {
 fn cmd_nvafx_offline(a: NvafxOfflineArgs) -> Result<()> {
     ensure_nvafx_windows_command("nvafx offline")?;
     if !a.intensity_ratio.is_finite() || a.intensity_ratio < 0.0 {
-        bail!("--intensity-ratio 必须是非负有限数");
+        bail!("--intensity-ratio must be a non-negative finite number");
     }
     let mut params = toml::Table::new();
     if let Some(runtime_dir) = &a.runtime_dir {
@@ -262,10 +262,13 @@ fn cmd_nvafx_offline(a: NvafxOfflineArgs) -> Result<()> {
     let mic = WavFileSource::new(&a.mic, frame)?;
     let reference = WavFileSource::new(&a.reference, frame)?;
     let sink = WavFileSink::new(&a.out);
-    println!("RTX AEC 离线运行: {} + {} → {}", a.mic, a.reference, a.out);
+    println!(
+        "RTX AEC offline run: {} + {} -> {}",
+        a.mic, a.reference, a.out
+    );
     let rep = run_offline(&cfg, mic, reference, sink)?;
     println!(
-        "完成: {} 帧 (~{:.2}s) · process 链 [{}]",
+        "done: {} frames (~{:.2}s) · process chain [{}]",
         rep.frames,
         rep.seconds,
         rep.chain.join(", ")
@@ -301,7 +304,7 @@ fn cmd_nvafx_install(a: NvafxInstallArgs) -> Result<()> {
     })?;
     print_nvafx_doctor_report(&report);
     if !report.ok() {
-        bail!("runtime 已解压,但 doctor 仍未通过");
+        bail!("runtime extracted, but doctor still did not pass");
     }
     Ok(())
 }
@@ -310,22 +313,26 @@ fn cmd_nvafx_download_install(a: NvafxDownloadInstallArgs) -> Result<()> {
     ensure_nvafx_windows_command("nvafx download-install")?;
     let tag = a.tag.trim();
     if tag.is_empty() {
-        bail!("--tag 不能为空");
+        bail!("--tag must not be empty");
     }
 
     let preflight = echoless_processors::nvafx::doctor_report(a.runtime_dir.as_deref())?;
     let arch = preflight.selected_arch.with_context(|| {
-        "无法从 nvafx doctor 判断 GPU 架构;请先确认 nvidia-smi、driver 和 RTX GPU 可用"
+        "unable to determine GPU architecture from nvafx doctor; verify nvidia-smi, driver, and RTX GPU availability first"
     })?;
     let model_asset = arch.model_asset_name();
     let download_dir = nvafx_download_cache_dir(tag);
-    create_dir_all(&download_dir)
-        .with_context(|| format!("创建下载缓存目录失败: {}", download_dir.display()))?;
+    create_dir_all(&download_dir).with_context(|| {
+        format!(
+            "failed to create download cache directory: {}",
+            download_dir.display()
+        )
+    })?;
 
     install_log(
         a.json,
         format!(
-            "RTX AEC 下载源: GitHub release {tag} · arch={}",
+            "RTX AEC download source: GitHub release {tag} · arch={}",
             arch.as_str()
         ),
     );
@@ -335,7 +342,7 @@ fn cmd_nvafx_download_install(a: NvafxDownloadInstallArgs) -> Result<()> {
         Err(err) => {
             install_log(
                 a.json,
-                format!("读取 SHA256SUMS.txt 失败: {err:#}; 将使用内置哈希或仅记录实际哈希"),
+                format!("failed to read SHA256SUMS.txt: {err:#}; will fall back to built-in hashes or only record actual hashes"),
             );
             HashMap::new()
         }
@@ -393,19 +400,19 @@ fn cmd_nvafx_download_install(a: NvafxDownloadInstallArgs) -> Result<()> {
     }
     if !report.ok() {
         // doctor 未过:保留下载缓存,便于用户排查后重装而无需重下 ~1 GB。
-        bail!("runtime 已下载并解压,但 doctor 仍未通过");
+        bail!("runtime downloaded and extracted, but doctor still did not pass");
     }
     // 安装成功且 doctor 通过 —— common runtime + model 已完全解压导入 runtime_dir,
     // TMP 里的下载缓存(~1 GB)不再需要,自动清掉。清理失败不影响安装结果,仅记日志。
     match remove_dir_all(&download_dir) {
         Ok(()) => install_log(
             a.json,
-            format!("已清理下载缓存: {}", download_dir.display()),
+            format!("cleaned up download cache: {}", download_dir.display()),
         ),
         Err(err) => install_log(
             a.json,
             format!(
-                "清理下载缓存失败(可忽略,可手动删除): {}: {err:#}",
+                "failed to clean up download cache (ignorable, remove manually): {}: {err:#}",
                 download_dir.display()
             ),
         ),
@@ -429,8 +436,12 @@ fn install_nvafx_runtime(
     let (runtime_dir, runtime_dir_source) =
         echoless_processors::nvafx::resolve_runtime_dir(request.runtime_dir);
     if let Some(parent) = runtime_dir.parent() {
-        create_dir_all(parent)
-            .with_context(|| format!("创建 runtime 父目录失败: {}", parent.display()))?;
+        create_dir_all(parent).with_context(|| {
+            format!(
+                "failed to create runtime parent directory: {}",
+                parent.display()
+            )
+        })?;
     }
 
     let common_expected = request
@@ -455,7 +466,7 @@ fn install_nvafx_runtime(
     install_log(
         request.log_to_stderr,
         format!(
-            "解压 common runtime 到 staging 后切换 {}",
+            "extracting common runtime to staging, then switching to {}",
             runtime_dir.display()
         ),
     );
@@ -463,13 +474,13 @@ fn install_nvafx_runtime(
     extract_zip(request.common_zip, &staging_dir)?;
     install_log(
         request.log_to_stderr,
-        format!("解压 model 到 staging: {}", staging_dir.display()),
+        format!("extracting model to staging: {}", staging_dir.display()),
     );
     extract_zip(request.model_zip, &staging_dir)?;
 
     let installed_at = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .context("系统时间早于 UNIX_EPOCH")?
+        .context("system time is before UNIX_EPOCH")?
         .as_secs();
     let manifest = json!({
         "sdk_version": echoless_processors::nvafx::SDK_VERSION,
@@ -483,8 +494,12 @@ fn install_nvafx_runtime(
         "install_source": request.install_source,
     });
     let manifest_path = staging_dir.join("echoless-runtime-install-manifest.json");
-    let mut file = File::create(&manifest_path)
-        .with_context(|| format!("写入安装 manifest 失败: {}", manifest_path.display()))?;
+    let mut file = File::create(&manifest_path).with_context(|| {
+        format!(
+            "failed to write install manifest: {}",
+            manifest_path.display()
+        )
+    })?;
     file.write_all(serde_json::to_string_pretty(&manifest)?.as_bytes())?;
     file.write_all(b"\n")?;
     drop(file);
@@ -494,7 +509,7 @@ fn install_nvafx_runtime(
     install_log(
         request.log_to_stderr,
         format!(
-            "安装 manifest: {}",
+            "install manifest: {}",
             runtime_dir
                 .join("echoless-runtime-install-manifest.json")
                 .display()
@@ -505,7 +520,7 @@ fn install_nvafx_runtime(
 
 fn ensure_nvafx_windows_command(command: &str) -> Result<()> {
     if !cfg!(windows) {
-        bail!("{command} 目前只支持 Windows x64; macOS artifact 只能用于 AEC3/LocalVQE 路径");
+        bail!("{command} currently supports Windows x64 only; macOS artifacts can only use the AEC3/LocalVQE path");
     }
     Ok(())
 }
@@ -572,7 +587,7 @@ fn fetch_release_sha256sums(
     let url = nvafx_release_asset_url(tag, "SHA256SUMS.txt");
     download_file(&url, &path, "SHA256SUMS.txt", log_to_stderr)?;
     let contents = std::fs::read_to_string(&path)
-        .with_context(|| format!("读取 SHA256SUMS.txt 失败: {}", path.display()))?;
+        .with_context(|| format!("failed to read SHA256SUMS.txt: {}", path.display()))?;
     Ok(parse_sha256sums(&contents))
 }
 
@@ -610,7 +625,7 @@ fn expected_sha256_for_release_asset(
             if let Some(release) = release_sha256sums.get(asset) {
                 ensure!(
                     release.eq_ignore_ascii_case(embedded),
-                    "GitHub release SHA256SUMS.txt 与内置 pin 不一致: asset={asset}, release={release}, embedded={embedded}"
+                    "SHA256SUMS.txt does not match the built-in pin: asset={asset}, release={release}, embedded={embedded}"
                 );
             }
             return Ok(Some(embedded.to_string()));
@@ -630,25 +645,29 @@ fn download_release_asset(
     if dest.exists() {
         match expected_sha256 {
             Some(expected) => {
-                let actual = sha256_file(dest)
-                    .with_context(|| format!("校验已有下载失败: {}", dest.display()))?;
+                let actual = sha256_file(dest).with_context(|| {
+                    format!("failed to verify existing download: {}", dest.display())
+                })?;
                 if actual.eq_ignore_ascii_case(expected) {
                     install_log(
                         log_to_stderr,
-                        format!("{label} 已在缓存中且 SHA256 ok: {}", dest.display()),
+                        format!("{label} already cached and SHA256 ok: {}", dest.display()),
                     );
                     return Ok(());
                 }
                 install_log(
                     log_to_stderr,
-                    format!("{label} 缓存 SHA256 不匹配,重新下载: {}", dest.display()),
+                    format!(
+                        "{label} cached SHA256 mismatch; re-downloading: {}",
+                        dest.display()
+                    ),
                 );
             }
             None => {
                 install_log(
                     log_to_stderr,
                     format!(
-                        "{label} 已在缓存中,未提供期望 SHA256,将重新下载: {}",
+                        "{label} already cached, no expected SHA256 provided; re-downloading: {}",
                         dest.display()
                     ),
                 );
@@ -660,8 +679,9 @@ fn download_release_asset(
 
 fn download_file(url: &str, dest: &Path, label: &str, log_to_stderr: bool) -> Result<()> {
     if let Some(parent) = dest.parent() {
-        create_dir_all(parent)
-            .with_context(|| format!("创建下载目录失败: {}", parent.display()))?;
+        create_dir_all(parent).with_context(|| {
+            format!("failed to create download directory: {}", parent.display())
+        })?;
     }
     let tmp = dest.with_extension(format!(
         "{}part",
@@ -671,7 +691,7 @@ fn download_file(url: &str, dest: &Path, label: &str, log_to_stderr: bool) -> Re
             .unwrap_or_default()
     ));
     let _ = std::fs::remove_file(&tmp);
-    install_log(log_to_stderr, format!("下载 {label}: {url}"));
+    install_log(log_to_stderr, format!("downloading {label}: {url}"));
     // json 模式下旁路一个 poller 线程,轮询 .part 字节数 / Content-Length,把进度
     // 以 JSONL 打到 stderr(app 侧解析后转成 nvafx-progress 事件)。下载本身仍由
     // 下面的 powershell/curl 完成,poller 只观测,失败也不影响下载。
@@ -694,20 +714,28 @@ fn download_file(url: &str, dest: &Path, label: &str, log_to_stderr: bool) -> Re
         Ok(()) => {
             let _ = std::fs::remove_file(dest);
             rename(&tmp, dest).with_context(|| {
-                format!("提交下载文件失败: {} -> {}", tmp.display(), dest.display())
+                format!(
+                    "failed to commit downloaded file: {} -> {}",
+                    tmp.display(),
+                    dest.display()
+                )
             })
         }
         Err(power_shell_err) => {
             let _ = std::fs::remove_file(&tmp);
             install_log(
                 log_to_stderr,
-                format!("PowerShell 下载失败,尝试 curl.exe: {power_shell_err:#}"),
+                format!("PowerShell download failed, trying curl.exe: {power_shell_err:#}"),
             );
             download_with_curl(url, &tmp)
-                .with_context(|| format!("PowerShell 下载也失败: {power_shell_err:#}"))?;
+                .with_context(|| format!("PowerShell download also failed: {power_shell_err:#}"))?;
             let _ = std::fs::remove_file(dest);
             rename(&tmp, dest).with_context(|| {
-                format!("提交下载文件失败: {} -> {}", tmp.display(), dest.display())
+                format!(
+                    "failed to commit downloaded file: {} -> {}",
+                    tmp.display(),
+                    dest.display()
+                )
             })
         }
     }
@@ -786,7 +814,7 @@ fn download_with_powershell(url: &str, dest: &Path) -> Result<()> {
         .arg(url)
         .arg(dest)
         .output()
-        .context("启动 powershell.exe 失败")?;
+        .context("failed to launch powershell.exe")?;
     if output.status.success() {
         return Ok(());
     }
@@ -808,7 +836,7 @@ fn download_with_curl(url: &str, dest: &Path) -> Result<()> {
         .arg(dest)
         .arg(url)
         .output()
-        .context("启动 curl.exe 失败")?;
+        .context("failed to launch curl.exe")?;
     if output.status.success() {
         return Ok(());
     }
@@ -823,7 +851,7 @@ fn download_with_curl(url: &str, dest: &Path) -> Result<()> {
 fn print_nvafx_doctor_report(report: &echoless_processors::nvafx::DoctorReport) {
     println!("NVIDIA AFX / RTX AEC doctor");
     println!(
-        "SDK {} · runtime file {} · 最低 driver {}",
+        "SDK {} · runtime file {} · minimum driver {}",
         echoless_processors::nvafx::SDK_VERSION,
         echoless_processors::nvafx::RUNTIME_FILE_VERSION,
         echoless_processors::nvafx::MIN_DRIVER_VERSION,
@@ -834,7 +862,7 @@ fn print_nvafx_doctor_report(report: &echoless_processors::nvafx::DoctorReport) 
         report.runtime_dir_source
     );
     if report.gpus.is_empty() {
-        println!("GPU:     未检测到 NVIDIA GPU");
+        println!("GPU:     no NVIDIA GPU detected");
     } else {
         println!("GPU:");
         for (index, gpu) in report.gpus.iter().enumerate() {
@@ -865,14 +893,14 @@ fn print_nvafx_doctor_report(report: &echoless_processors::nvafx::DoctorReport) 
             check.detail
         );
         if let Some(action) = &check.action {
-            println!("      处理: {action}");
+            println!("      action: {action}");
         }
     }
 
     if problems == 0 {
-        println!("\nRTX AEC runtime 预检通过。");
+        println!("\nRTX AEC runtime preflight passed.");
     } else {
-        println!("\nRTX AEC runtime 预检未通过: {problems} 个问题需要处理。");
+        println!("\nRTX AEC runtime preflight failed: {problems} issues to resolve.");
     }
 }
 
@@ -896,14 +924,14 @@ fn verify_zip_sha256(
             install_log(log_to_stderr, format!("{label} SHA256 ok: {actual}"));
         }
         Some(expected) => bail!(
-            "{label} SHA256 不匹配: actual={actual}, expected={expected}, file={}",
+            "{label} SHA256 mismatch: actual={actual}, expected={expected}, file={}",
             path.display()
         ),
         None => {
             install_log(
                 log_to_stderr,
                 format!(
-                    "{label} SHA256: {actual} (未找到官方期望值,仅记录;建议传 --{}-sha256)",
+                    "{label} SHA256: {actual} (no official expected value found, recording only; consider passing --{}-sha256)",
                     if label.starts_with("common") {
                         "common"
                     } else {
@@ -917,13 +945,14 @@ fn verify_zip_sha256(
 }
 
 fn sha256_file(path: &Path) -> Result<String> {
-    let mut file = File::open(path).with_context(|| format!("打开文件失败: {}", path.display()))?;
+    let mut file =
+        File::open(path).with_context(|| format!("failed to open file: {}", path.display()))?;
     let mut hasher = Sha256::new();
     let mut buf = vec![0u8; 64 * 1024];
     loop {
         let n = file
             .read(&mut buf)
-            .with_context(|| format!("读取文件失败: {}", path.display()))?;
+            .with_context(|| format!("failed to read file: {}", path.display()))?;
         if n == 0 {
             break;
         }
@@ -933,31 +962,31 @@ fn sha256_file(path: &Path) -> Result<String> {
 }
 
 fn extract_zip(zip_path: &Path, dest: &Path) -> Result<()> {
-    let file =
-        File::open(zip_path).with_context(|| format!("打开 zip 失败: {}", zip_path.display()))?;
-    let mut archive =
-        ZipArchive::new(file).with_context(|| format!("读取 zip 失败: {}", zip_path.display()))?;
+    let file = File::open(zip_path)
+        .with_context(|| format!("failed to open zip: {}", zip_path.display()))?;
+    let mut archive = ZipArchive::new(file)
+        .with_context(|| format!("failed to read zip: {}", zip_path.display()))?;
     for index in 0..archive.len() {
-        let mut entry = archive
-            .by_index(index)
-            .with_context(|| format!("读取 zip entry #{index} 失败: {}", zip_path.display()))?;
+        let mut entry = archive.by_index(index).with_context(|| {
+            format!("failed to read zip entry #{index}: {}", zip_path.display())
+        })?;
         let enclosed = entry
             .enclosed_name()
-            .with_context(|| format!("zip entry 路径不安全: {}", entry.name()))?;
+            .with_context(|| format!("unsafe zip entry path: {}", entry.name()))?;
         let out_path = dest.join(enclosed);
         if entry.is_dir() {
             create_dir_all(&out_path)
-                .with_context(|| format!("创建目录失败: {}", out_path.display()))?;
+                .with_context(|| format!("failed to create directory: {}", out_path.display()))?;
             continue;
         }
         if let Some(parent) = out_path.parent() {
             create_dir_all(parent)
-                .with_context(|| format!("创建目录失败: {}", parent.display()))?;
+                .with_context(|| format!("failed to create directory: {}", parent.display()))?;
         }
         let mut out = File::create(&out_path)
-            .with_context(|| format!("创建文件失败: {}", out_path.display()))?;
+            .with_context(|| format!("failed to create file: {}", out_path.display()))?;
         copy(&mut entry, &mut out)
-            .with_context(|| format!("解压文件失败: {}", out_path.display()))?;
+            .with_context(|| format!("failed to extract file: {}", out_path.display()))?;
     }
     Ok(())
 }
@@ -965,22 +994,26 @@ fn extract_zip(zip_path: &Path, dest: &Path) -> Result<()> {
 fn unique_install_staging_dir(runtime_dir: &Path) -> Result<PathBuf> {
     let parent = runtime_dir
         .parent()
-        .with_context(|| format!("runtime 目录缺少父目录: {}", runtime_dir.display()))?;
+        .with_context(|| format!("runtime directory has no parent: {}", runtime_dir.display()))?;
     let name = runtime_dir
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("nvafx-runtime");
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .context("系统时间早于 UNIX_EPOCH")?
+        .context("system time is before UNIX_EPOCH")?
         .as_nanos();
     let staging = parent.join(format!("{name}.installing-{}-{nanos}", std::process::id()));
     if staging.exists() {
-        remove_dir_all(&staging)
-            .with_context(|| format!("清理旧 staging 目录失败: {}", staging.display()))?;
+        remove_dir_all(&staging).with_context(|| {
+            format!(
+                "failed to clean up old staging directory: {}",
+                staging.display()
+            )
+        })?;
     }
     create_dir_all(&staging)
-        .with_context(|| format!("创建 staging 目录失败: {}", staging.display()))?;
+        .with_context(|| format!("failed to create staging directory: {}", staging.display()))?;
     Ok(staging)
 }
 
@@ -989,14 +1022,14 @@ fn replace_dir_with_staging(runtime_dir: &Path, staging_dir: &Path) -> Result<()
         "previous-{}",
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .context("系统时间早于 UNIX_EPOCH")?
+            .context("system time is before UNIX_EPOCH")?
             .as_nanos()
     ));
     let had_previous = runtime_dir.exists();
     if had_previous {
         rename(runtime_dir, &backup_dir).with_context(|| {
             format!(
-                "移动旧 runtime 目录失败: {} -> {}",
+                "failed to move old runtime directory: {} -> {}",
                 runtime_dir.display(),
                 backup_dir.display()
             )
@@ -1007,7 +1040,7 @@ fn replace_dir_with_staging(runtime_dir: &Path, staging_dir: &Path) -> Result<()
             let _ = rename(&backup_dir, runtime_dir);
         }
         bail!(
-            "提交 runtime staging 目录失败: {} -> {}: {err}",
+            "failed to commit runtime staging directory: {} -> {}: {err}",
             staging_dir.display(),
             runtime_dir.display()
         );
@@ -1024,19 +1057,19 @@ pub(crate) fn validate_nvafx_constraints(cfg: &PipelineConfig) -> Result<()> {
     }
     if cfg.sample_rate != echoless_processors::nvafx::NVAFX_SAMPLE_RATE {
         bail!(
-            "nvidia_afx_aec v1 只支持 {} Hz,当前 sample_rate={}",
+            "nvidia_afx_aec v1 only supports {} Hz; current sample_rate={}",
             echoless_processors::nvafx::NVAFX_SAMPLE_RATE,
             cfg.sample_rate
         );
     }
     if cfg.frame_ms != 10 {
         bail!(
-            "nvidia_afx_aec v1 只支持 10ms frame,当前 frame_ms={}",
+            "nvidia_afx_aec v1 only supports 10ms frames; current frame_ms={}",
             cfg.frame_ms
         );
     }
     if cfg.reference_channels != ReferenceChannels::Mono {
-        bail!("nvidia_afx_aec v1 只支持 mono reference;请设置 reference_channels = \"mono\"");
+        bail!("nvidia_afx_aec v1 only supports mono reference; set reference_channels = \"mono\"");
     }
     Ok(())
 }
@@ -1127,7 +1160,10 @@ mod tests {
         )
         .unwrap_err()
         .to_string();
-        assert!(err.contains("SHA256SUMS.txt 与内置 pin 不一致"), "{err}");
+        assert!(
+            err.contains("SHA256SUMS.txt does not match the built-in pin"),
+            "{err}"
+        );
 
         sums.insert(
             NVAFX_COMMON_RUNTIME_ASSET.to_string(),

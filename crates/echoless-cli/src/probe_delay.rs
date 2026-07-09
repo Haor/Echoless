@@ -23,63 +23,63 @@ use crate::dsp::rms_dbfs;
 
 #[derive(Args)]
 pub(crate) struct ProbeDelayArgs {
-    /// 近端麦克风设备 selector
+    /// Near-end microphone device selector
     #[arg(long, default_value = "MacBook Pro麦克风")]
     mic: String,
-    /// reference selector;macOS 默认 system(Process Tap),Windows 默认 system(WASAPI loopback)
+    /// Reference selector; macOS defaults to system (Process Tap), Windows defaults to system (WASAPI loopback)
     #[arg(long, default_value = "system")]
     reference: String,
-    /// Echoless 输出设备;建议虚拟音频设备,避免把处理后人声送回外放
+    /// Echoless output device; a virtual audio device is recommended to avoid routing processed voice back to speakers
     #[arg(long, default_value = "BlackHole 2ch")]
     output: String,
-    /// 保留 diagnostics session 的输出目录;不传则使用临时目录并在分析后清理
+    /// Directory to keep the diagnostics session in; when unset, a temporary directory is used and cleaned up after analysis
     #[arg(long)]
     out_dir: Option<PathBuf>,
-    /// 即使未指定 --out-dir,也保留本次 diagnostics session
+    /// Keep this diagnostics session even when --out-dir is not specified
     #[arg(long)]
     keep_session: bool,
-    /// 开始播放蜂鸣前等待实时管线稳定的秒数
+    /// Seconds to wait for the realtime pipeline to stabilize before starting the beep train
     #[arg(long, default_value_t = 4.0)]
     startup_delay: f64,
-    /// 蜂鸣个数
+    /// Number of beeps
     #[arg(long, default_value_t = 12)]
     beeps: u32,
-    /// 蜂鸣音量(0.0-1.0)
+    /// Beep volume (0.0-1.0)
     #[arg(long, default_value_t = 0.35)]
     volume: f32,
-    /// 仅分析已有 diagnostics session
+    /// Only analyze an existing diagnostics session
     #[arg(long)]
     analyze_only: Option<PathBuf>,
-    /// 保留生成的蜂鸣 WAV
+    /// Keep the generated beep WAV
     #[arg(long)]
     keep_beep: Option<PathBuf>,
-    /// 输出机器可读 JSON
+    /// Emit machine-readable JSON
     #[arg(long)]
     json: bool,
 }
 
 pub(crate) fn cmd_probe_delay(a: ProbeDelayArgs) -> Result<()> {
     if !cfg!(feature = "realtime") {
-        bail!("probe-delay 需 realtime 特性(cpal)");
+        bail!("probe-delay requires the realtime feature (cpal)");
     }
     if !(cfg!(target_os = "macos") || cfg!(windows) || cfg!(target_os = "linux")) {
-        bail!("probe-delay 当前只支持 macOS / Windows / Linux");
+        bail!("probe-delay currently supports macOS / Windows / Linux only");
     }
     if !a.startup_delay.is_finite() || a.startup_delay < 0.0 {
-        bail!("--startup-delay 必须是非负有限数");
+        bail!("--startup-delay must be a non-negative finite number");
     }
     if !a.volume.is_finite() || !(0.0..=1.0).contains(&a.volume) {
-        bail!("--volume 必须在 0.0..=1.0");
+        bail!("--volume must be within 0.0..=1.0");
     }
     if a.beeps == 0 {
-        bail!("--beeps 必须大于 0");
+        bail!("--beeps must be greater than 0");
     }
     let cancel = Arc::new(AtomicBool::new(false));
     ctrlc::set_handler({
         let cancel = Arc::clone(&cancel);
         move || cancel.store(true, Ordering::SeqCst)
     })
-    .context("安装 probe-delay 取消处理器失败")?;
+    .context("failed to install probe-delay cancel handler")?;
 
     let (result, cleanup_dirs, session_retained) = if let Some(session_dir) = &a.analyze_only {
         (analyze_probe_session(&a, session_dir)?, Vec::new(), true)
@@ -156,10 +156,11 @@ fn probe_beep_path(a: &ProbeDelayArgs) -> Result<(PathBuf, Option<PathBuf>)> {
         std::process::id(),
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .context("系统时间早于 UNIX_EPOCH")?
+            .context("system time is before UNIX_EPOCH")?
             .as_nanos()
     ));
-    create_dir_all(&dir).with_context(|| format!("创建 probe 临时目录失败: {}", dir.display()))?;
+    create_dir_all(&dir)
+        .with_context(|| format!("failed to create probe temp directory: {}", dir.display()))?;
     Ok((dir.join("near-delay-beeps.wav"), Some(dir)))
 }
 
@@ -172,7 +173,7 @@ fn probe_output_dir(a: &ProbeDelayArgs) -> Result<(PathBuf, Option<PathBuf>, boo
         std::process::id(),
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .context("系统时间早于 UNIX_EPOCH")?
+            .context("system time is before UNIX_EPOCH")?
             .as_nanos()
     ));
     Ok((dir.clone(), Some(dir), a.keep_session))
@@ -187,8 +188,9 @@ fn write_probe_beep_train(a: &ProbeDelayArgs, path: &Path) -> Result<f64> {
     let freqs = [880.0, 1320.0, 1760.0, 1100.0];
 
     if let Some(parent) = path.parent() {
-        create_dir_all(parent)
-            .with_context(|| format!("创建蜂鸣 WAV 目录失败: {}", parent.display()))?;
+        create_dir_all(parent).with_context(|| {
+            format!("failed to create beep WAV directory: {}", parent.display())
+        })?;
     }
     let spec = hound::WavSpec {
         channels: 1,
@@ -197,7 +199,7 @@ fn write_probe_beep_train(a: &ProbeDelayArgs, path: &Path) -> Result<f64> {
         sample_format: hound::SampleFormat::Int,
     };
     let mut writer = hound::WavWriter::create(path, spec)
-        .with_context(|| format!("创建 {} 失败", path.display()))?;
+        .with_context(|| format!("failed to create {}", path.display()))?;
 
     let mut total_frames = 0usize;
     for _ in 0..pre_frames {
@@ -248,10 +250,14 @@ fn run_native_delay_probe(
     beep_duration_s: f64,
     cancel: &AtomicBool,
 ) -> Result<PathBuf> {
-    create_dir_all(out_dir)
-        .with_context(|| format!("创建 diagnostics 输出目录失败: {}", out_dir.display()))?;
+    create_dir_all(out_dir).with_context(|| {
+        format!(
+            "failed to create diagnostics output directory: {}",
+            out_dir.display()
+        )
+    })?;
     let diagnostic_seconds = (a.startup_delay + beep_duration_s + 1.0).ceil().max(1.0) as u32;
-    let current_exe = env::current_exe().context("定位当前 echoless 可执行文件失败")?;
+    let current_exe = env::current_exe().context("failed to locate current echoless executable")?;
     let mut command = Command::new(current_exe);
     command
         .arg("run")
@@ -291,9 +297,12 @@ fn run_native_delay_probe(
     }
     let mut child = command
         .spawn()
-        .context("启动 echoless run probe 子进程失败")?;
+        .context("failed to spawn echoless run probe child process")?;
 
-    let stdout = child.stdout.take().context("probe 子进程 stdout 未捕获")?;
+    let stdout = child
+        .stdout
+        .take()
+        .context("probe child stdout not captured")?;
     // 持有 run 的 stdin write end:run 期间保持打开(control reader 阻塞等待、不 EOF,run 正常录);
     // beep 播完后关闭它 → run 收 stdin EOF 优雅停机(比进程组 SIGINT 可靠,dev/打包都稳)。
     let mut run_stdin = child.stdin.take();
@@ -309,7 +318,7 @@ fn run_native_delay_probe(
         }
         drain_probe_output(&rx, a.json, &mut session_dir, &mut saw_done);
         if let Some(status) = child.try_wait()? {
-            bail!("echoless run probe 过早退出: {status}");
+            bail!("echoless run probe exited prematurely: {status}");
         }
         thread::sleep(Duration::from_millis(50));
     }
@@ -352,7 +361,7 @@ fn run_native_delay_probe(
         }
         if let Some(status) = child.try_wait()? {
             if !status.success() {
-                bail!("echoless run probe 失败: {status}");
+                bail!("echoless run probe failed: {status}");
             }
             break;
         }
@@ -365,7 +374,7 @@ fn run_native_delay_probe(
     session_dir
         .filter(|path| path.is_dir())
         .or_else(|| newest_probe_session(out_dir).ok())
-        .with_context(|| format!("未找到 diagnostics session: {}", out_dir.display()))
+        .with_context(|| format!("diagnostics session not found: {}", out_dir.display()))
 }
 
 #[cfg(all(feature = "realtime", target_os = "macos"))]
@@ -373,9 +382,9 @@ fn play_probe_beep(_a: &ProbeDelayArgs, beep_path: &Path) -> Result<()> {
     let status = Command::new("afplay")
         .arg(beep_path)
         .status()
-        .context("播放蜂鸣 WAV 失败(需要 macOS afplay)")?;
+        .context("failed to play beep WAV (requires macOS afplay)")?;
     if !status.success() {
-        bail!("播放蜂鸣 WAV 失败: {status}");
+        bail!("failed to play beep WAV: {status}");
     }
     Ok(())
 }
@@ -404,7 +413,7 @@ fn play_probe_beep(a: &ProbeDelayArgs, beep_path: &Path) -> Result<()> {
         ) {
             Ok(()) => return Ok(()),
             Err(err) => {
-                eprintln!("probe-delay: monitor→sink 映射播放失败({stem}): {err};回退默认输出")
+                eprintln!("probe-delay: monitor->sink mapping playback failed ({stem}): {err}; falling back to default output")
             }
         }
     }
@@ -418,7 +427,7 @@ fn monitor_reference_output_stem(reference: &str) -> Result<Option<String>> {
     let reference = reference.trim();
     match reference {
         "" | "default" | "system" => Ok(None),
-        "none" => bail!("probe-delay 需要可播放的 reference;当前 reference=none"),
+        "none" => bail!("probe-delay requires a playable reference; current reference=none"),
         value => {
             let name = value.strip_prefix("input:").unwrap_or(value).trim();
             let stem = name
@@ -436,12 +445,12 @@ fn monitor_reference_output_stem(reference: &str) -> Result<Option<String>> {
     not(any(target_os = "macos", windows, target_os = "linux"))
 ))]
 fn play_probe_beep(_a: &ProbeDelayArgs, _beep_path: &Path) -> Result<()> {
-    bail!("当前平台没有 probe-delay 蜂鸣播放实现");
+    bail!("no probe-delay beep playback implementation for the current platform");
 }
 
 #[cfg(not(feature = "realtime"))]
 fn play_probe_beep(_a: &ProbeDelayArgs, _beep_path: &Path) -> Result<()> {
-    bail!("probe-delay 蜂鸣播放需 realtime 特性(cpal)");
+    bail!("probe-delay beep playback requires the realtime feature (cpal)");
 }
 
 #[cfg(any(windows, test))]
@@ -449,9 +458,9 @@ fn reference_playback_output_selector(reference: &str) -> Result<Option<&str>> {
     let reference = reference.trim();
     match reference {
         "" | "system" | "default" => Ok(None),
-        "none" => bail!("probe-delay 需要可播放的 reference;当前 reference=none"),
+        "none" => bail!("probe-delay requires a playable reference; current reference=none"),
         value if value.starts_with("input:") => {
-            bail!("probe-delay 无法向 input reference 播放蜂鸣: {value}")
+            bail!("probe-delay cannot play beeps into an input reference: {value}")
         }
         value => {
             if let Some(output) = value.strip_prefix("output:") {
@@ -465,7 +474,7 @@ fn reference_playback_output_selector(reference: &str) -> Result<Option<&str>> {
 #[cfg(any(windows, target_os = "linux"))]
 fn read_probe_beep_samples(beep_path: &Path) -> Result<Vec<f32>> {
     let mut reader = hound::WavReader::open(beep_path)
-        .with_context(|| format!("读取蜂鸣 WAV 失败: {}", beep_path.display()))?;
+        .with_context(|| format!("failed to read beep WAV: {}", beep_path.display()))?;
     let spec = reader.spec();
     if spec.channels != 1
         || spec.sample_rate != PROBE_SAMPLE_RATE
@@ -473,7 +482,7 @@ fn read_probe_beep_samples(beep_path: &Path) -> Result<Vec<f32>> {
         || spec.sample_format != hound::SampleFormat::Int
     {
         bail!(
-            "蜂鸣 WAV 格式不支持: channels={}, rate={}, bits={}, format={:?}",
+            "unsupported beep WAV format: channels={}, rate={}, bits={}, format={:?}",
             spec.channels,
             spec.sample_rate,
             spec.bits_per_sample,
@@ -484,7 +493,7 @@ fn read_probe_beep_samples(beep_path: &Path) -> Result<Vec<f32>> {
         .samples::<i16>()
         .map(|s| {
             s.map(|v| f32::from(v) / f32::from(i16::MAX))
-                .context("读取蜂鸣 WAV sample 失败")
+                .context("failed to read beep WAV sample")
         })
         .collect()
 }
@@ -506,7 +515,7 @@ where
                     }
                 }
                 Err(err) => {
-                    eprintln!("probe-delay: 读取子进程输出失败,停止读取: {err}");
+                    eprintln!("probe-delay: failed to read child output, stopping: {err}");
                     break;
                 }
             }
@@ -525,10 +534,10 @@ fn drain_probe_output(
         if !json_mode {
             println!("{line}");
         }
-        if let Some((_, dir)) = line.split_once("诊断录制目录:") {
+        if let Some((_, dir)) = line.split_once("diagnostics recording directory:") {
             *session_dir = Some(PathBuf::from(dir.trim()));
         }
-        if let Some((_, dir)) = line.split_once("诊断录制完成") {
+        if let Some((_, dir)) = line.split_once("diagnostics recording complete") {
             if let Some((_, path)) = dir.rsplit_once(": ") {
                 *session_dir = Some(PathBuf::from(path.trim()));
             }
@@ -561,7 +570,7 @@ fn stop_probe_child(child: &mut std::process::Child) -> Result<()> {
             .status();
     }
     #[cfg(not(unix))]
-    child.kill().context("停止 probe 子进程失败")?;
+    child.kill().context("failed to stop probe child process")?;
     let _ = child.wait();
     Ok(())
 }
@@ -600,7 +609,7 @@ fn newest_probe_session(out_dir: &Path) -> Result<PathBuf> {
     sessions
         .pop()
         .map(|(_, path)| path)
-        .with_context(|| format!("{} 下没有 session-*", out_dir.display()))
+        .with_context(|| format!("no session-* found under {}", out_dir.display()))
 }
 
 fn analyze_probe_session(a: &ProbeDelayArgs, session_dir: &Path) -> Result<ProbeResult> {
@@ -610,7 +619,7 @@ fn analyze_probe_session(a: &ProbeDelayArgs, session_dir: &Path) -> Result<Probe
     let (mic_rate, mic) = read_wav_mono(&mic_path)?;
     if ref_rate != PROBE_SAMPLE_RATE || mic_rate != PROBE_SAMPLE_RATE {
         bail!(
-            "probe 只支持 48k diagnostics,实际 ref={} mic={}",
+            "probe only supports 48k diagnostics; got ref={} mic={}",
             ref_rate,
             mic_rate
         );
@@ -678,7 +687,7 @@ fn analyze_probe_session(a: &ProbeDelayArgs, session_dir: &Path) -> Result<Probe
 
 fn read_wav_mono(path: &Path) -> Result<(u32, Vec<f32>)> {
     let mut reader = hound::WavReader::open(path)
-        .with_context(|| format!("读取 WAV 失败: {}", path.display()))?;
+        .with_context(|| format!("failed to read WAV: {}", path.display()))?;
     let spec = reader.spec();
     let channels = usize::from(spec.channels.max(1));
     let values = match spec.sample_format {
@@ -697,7 +706,7 @@ fn read_wav_mono(path: &Path) -> Result<(u32, Vec<f32>)> {
                 .collect::<std::result::Result<Vec<_>, _>>()?
         }
         _ => bail!(
-            "{} 不支持的 WAV 格式: {:?} {}bit",
+            "{}: unsupported WAV format: {:?} {}bit",
             path.display(),
             spec.sample_format,
             spec.bits_per_sample

@@ -210,30 +210,30 @@ pub fn run_with_options(cfg: &PipelineConfig, options: RuntimeOptions) -> Result
     let host = cpal::default_host();
 
     let mic_device = select_device(&host, DeviceKind::Input, mic_selector(&cfg.mic))
-        .context("选择麦克风设备失败")?;
+        .context("failed to select microphone device")?;
     let output_device = select_device(&host, DeviceKind::Output, output_selector(&cfg.output))
-        .context("选择输出设备失败")?;
+        .context("failed to select output device")?;
     // reference:"none" = 无参考(纯 NS);"system" = 平台原生系统音频参考。
-    let reference_source =
-        select_reference_source(&host, cfg.reference.as_str()).context("选择参考源失败")?;
+    let reference_source = select_reference_source(&host, cfg.reference.as_str())
+        .context("failed to select reference source")?;
 
     let sample_rate = cfg.sample_rate;
     if cfg.frame_ms == 0 {
-        bail!("帧长必须大于 0ms");
+        bail!("frame length must be greater than 0ms");
     }
     let frame_samples = sample_rate as u64 * cfg.frame_ms as u64;
     if !frame_samples.is_multiple_of(1000) {
         bail!(
-            "采样率与帧长必须产生整数样本: sample_rate={sample_rate}, frame_ms={}",
+            "sample rate and frame length must yield an integer sample count: sample_rate={sample_rate}, frame_ms={}",
             cfg.frame_ms
         );
     }
     let frame_size = (frame_samples / 1000) as usize;
     if cfg.near_delay_ms > MAX_NEAR_DELAY_MS {
-        bail!("near_delay_ms 必须 <= {MAX_NEAR_DELAY_MS}");
+        bail!("near_delay_ms must be <= {MAX_NEAR_DELAY_MS}");
     }
     if cfg.output_level > MAX_OUTPUT_LEVEL {
-        bail!("output_level 必须 <= {MAX_OUTPUT_LEVEL}");
+        bail!("output_level must be <= {MAX_OUTPUT_LEVEL}");
     }
     let near_delay_samples = delay_ms_to_samples(cfg.near_delay_ms, sample_rate);
     let ring_size = frame_size * 12 + near_delay_samples; // ~120ms plus explicit near delay
@@ -247,12 +247,13 @@ pub fn run_with_options(cfg: &PipelineConfig, options: RuntimeOptions) -> Result
     };
 
     let mic_config = pick_config(&mic_device.device, DeviceKind::Input, sample_rate)
-        .context("麦克风不支持该采样率")?;
+        .context("microphone does not support this sample rate")?;
     let output_config = pick_config(&output_device.device, DeviceKind::Output, sample_rate)
-        .context("输出设备不支持该采样率")?;
+        .context("output device does not support this sample rate")?;
     let render_config = match &reference_source {
         ReferenceSource::Cpal { device, kind } => Some(
-            pick_config(&device.device, *kind, sample_rate).context("参考设备不支持该采样率")?,
+            pick_config(&device.device, *kind, sample_rate)
+                .context("reference device does not support this sample rate")?,
         ),
         ReferenceSource::None => None,
         #[cfg(target_os = "macos")]
@@ -261,7 +262,7 @@ pub fn run_with_options(cfg: &PipelineConfig, options: RuntimeOptions) -> Result
     if cfg.reference_channels == ReferenceChannels::Stereo
         && render_config.as_ref().is_some_and(|c| c.channels() < 2)
     {
-        bail!("reference_channels=stereo 需要参考设备至少 2ch");
+        bail!("reference_channels=stereo requires a reference device with at least 2ch");
     }
 
     print_human(
@@ -292,7 +293,7 @@ pub fn run_with_options(cfg: &PipelineConfig, options: RuntimeOptions) -> Result
         ),
         (ReferenceSource::None, _) => print_human(
             options.status_json,
-            "Ref:    无 —— AEC 缺少参考,仅 NS 等单端处理有效",
+            "Ref:    none — AEC has no reference; only single-ended processing (e.g. NS) is effective",
         ),
         _ => {}
     }
@@ -317,7 +318,7 @@ pub fn run_with_options(cfg: &PipelineConfig, options: RuntimeOptions) -> Result
             .join("+")
     };
     let chain_desc = if chain_cfg.is_empty() {
-        "直通".to_string()
+        "passthrough".to_string()
     } else {
         chain_cfg
             .iter()
@@ -328,7 +329,7 @@ pub fn run_with_options(cfg: &PipelineConfig, options: RuntimeOptions) -> Result
     print_human(
         options.status_json,
         format!(
-            "采样率 {sample_rate} Hz · 帧 {} ms / {frame_size} 样本 · near_delay={} ms · output_level={} · reference={} · 链: {chain_desc}",
+            "sample rate {sample_rate} Hz · frame {} ms / {frame_size} samples · near_delay={} ms · output_level={} · reference={} · chain: {chain_desc}",
             cfg.frame_ms,
             cfg.near_delay_ms,
             cfg.output_level,
@@ -381,7 +382,9 @@ pub fn run_with_options(cfg: &PipelineConfig, options: RuntimeOptions) -> Result
     let mut render_prod = render_prod;
     let render_stream = match (&reference_source, render_config.as_ref()) {
         (ReferenceSource::Cpal { device, .. }, Some(c)) => {
-            let p = render_prod.take().context("参考 ring producer 未初始化")?;
+            let p = render_prod
+                .take()
+                .context("reference ring producer not initialized")?;
             Some(build_input_stream(
                 &device.device,
                 c,
@@ -399,7 +402,7 @@ pub fn run_with_options(cfg: &PipelineConfig, options: RuntimeOptions) -> Result
         ReferenceSource::ProcessTap => {
             let p = render_prod
                 .take()
-                .context("Process Tap ring producer 未初始化")?;
+                .context("Process Tap ring producer not initialized")?;
             Some(macos_process_tap::start(
                 cfg.reference_channels,
                 sample_rate,
@@ -510,7 +513,7 @@ pub fn run_with_options(cfg: &PipelineConfig, options: RuntimeOptions) -> Result
 
     print_human(
         options.status_json,
-        "运行中。macOS 首次需授予麦克风/系统音频录制权限。Ctrl+C 停止。",
+        "Running. On macOS the first run requires granting microphone/system-audio recording permission. Press Ctrl+C to stop.",
     );
     while running.load(Ordering::SeqCst) {
         thread::sleep(Duration::from_millis(100));
@@ -522,7 +525,7 @@ pub fn run_with_options(cfg: &PipelineConfig, options: RuntimeOptions) -> Result
     drop(process_tap_stream);
     drop(output_stream);
     proc.join().ok();
-    print_human(options.status_json, "已停止。");
+    print_human(options.status_json, "Stopped.");
     Ok(())
 }
 
@@ -701,7 +704,7 @@ fn process_loop<M, R, O>(
                 Ok(true) => {}
                 Ok(false) => {}
                 Err(err) => {
-                    eprintln!("诊断录制失败,已停用: {err:#}");
+                    eprintln!("diagnostics recording failed, disabled: {err:#}");
                     diagnostic = None;
                 }
             }
@@ -841,7 +844,7 @@ macro_rules! dispatch_format {
             SampleFormat::I32 => $build::<i32, _, _>($($arg),+),
             SampleFormat::F32 => $build::<f32, _, _>($($arg),+),
             SampleFormat::U16 => $build::<u16, _, _>($($arg),+),
-            other => bail!("不支持的采样格式 {other}"),
+            other => bail!("unsupported sample format {other}"),
         }
     };
 }
@@ -856,7 +859,7 @@ fn stream_error_handler(
 ) -> impl FnMut(cpal::StreamError) {
     move |err| {
         let fatal = matches!(err, cpal::StreamError::DeviceNotAvailable);
-        eprintln!("{label} 流错误: {err}");
+        eprintln!("{label} stream error: {err}");
         if status_json {
             emit::emit_stdout_line(
                 json!({
@@ -948,7 +951,7 @@ where
             on_error,
             None,
         )
-        .with_context(|| format!("构建 {label} 输入流失败"))
+        .with_context(|| format!("failed to build {label} input stream"))
 }
 
 fn push_input_frame<T, P>(
@@ -1104,7 +1107,7 @@ where
             on_error,
             None,
         )
-        .context("构建输出流失败")
+        .context("failed to build output stream")
 }
 
 #[cfg(any(windows, target_os = "linux"))]
@@ -1152,16 +1155,18 @@ pub(crate) fn play_mono_samples_to_output(
             Arc::clone(&samples),
             Arc::clone(&done),
         ),
-        other => bail!("不支持的采样格式 {other}"),
+        other => bail!("unsupported sample format {other}"),
     }?;
-    stream.play().context("启动蜂鸣输出流失败")?;
+    stream
+        .play()
+        .context("failed to start beep output stream")?;
 
     let deadline = Instant::now() + duration + Duration::from_secs(2);
     while !done.load(Ordering::Relaxed) && Instant::now() < deadline {
         thread::sleep(Duration::from_millis(10));
     }
     if !done.load(Ordering::Relaxed) {
-        bail!("蜂鸣播放超时:输出设备没有及时消耗测试音");
+        bail!("beep playback timed out: the output device did not consume the test tone in time");
     }
     Ok(())
 }
@@ -1209,10 +1214,10 @@ where
                     }
                 }
             },
-            |err| eprintln!("蜂鸣输出流错误: {err}"),
+            |err| eprintln!("beep output stream error: {err}"),
             None,
         )
-        .context("构建蜂鸣输出流失败")
+        .context("failed to build beep output stream")
 }
 
 #[cfg(any(test, windows, target_os = "linux"))]

@@ -18,16 +18,16 @@ pub(crate) struct ConfigArgs {
 
 #[derive(Subcommand)]
 enum ConfigCmd {
-    /// 校验管线 TOML 配置
+    /// Validate the pipeline TOML config
     Validate(ConfigValidateArgs),
 }
 
 #[derive(Args)]
 struct ConfigValidateArgs {
-    /// 管线 TOML 配置
+    /// Pipeline TOML config
     #[arg(long)]
     config: String,
-    /// 输出结构化 JSON 结果
+    /// Emit a structured JSON result
     #[arg(long)]
     json: bool,
 }
@@ -43,7 +43,7 @@ fn cmd_config_validate(args: ConfigValidateArgs) -> Result<()> {
     if args.json {
         println!("{}", serde_json::to_string_pretty(&report.to_json())?);
     } else if report.ok {
-        println!("配置校验通过: {}", args.config);
+        println!("config validation passed: {}", args.config);
     } else {
         for error in &report.errors {
             eprintln!("{}: {}", error.path, error.message);
@@ -53,7 +53,7 @@ fn cmd_config_validate(args: ConfigValidateArgs) -> Result<()> {
     if report.ok {
         Ok(())
     } else {
-        bail!("配置校验失败: {} 个问题", report.errors.len())
+        bail!("config validation failed: {} issues", report.errors.len())
     }
 }
 
@@ -107,7 +107,7 @@ fn validate_config_file(path: &str) -> ConfigValidationReport {
         Err(err) => {
             return ConfigValidationReport::new(vec![ConfigValidationError::new(
                 "config",
-                format!("读取配置失败: {err}"),
+                format!("failed to read config: {err}"),
             )])
         }
     };
@@ -116,7 +116,7 @@ fn validate_config_file(path: &str) -> ConfigValidationReport {
         Err(err) => {
             return ConfigValidationReport::new(vec![ConfigValidationError::new(
                 "config",
-                format!("解析 TOML 失败: {err}"),
+                format!("failed to parse TOML: {err}"),
             )])
         }
     };
@@ -129,7 +129,7 @@ fn validate_config_file(path: &str) -> ConfigValidationReport {
         Err(err) => {
             return ConfigValidationReport::new(vec![ConfigValidationError::new(
                 "config",
-                format!("解析配置失败: {err}"),
+                format!("failed to deserialize config: {err}"),
             )])
         }
     };

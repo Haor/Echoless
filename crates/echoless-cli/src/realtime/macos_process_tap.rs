@@ -55,7 +55,7 @@ impl Drop for MacProcessTapStream {
                 let _ = reader.join();
             }
         } else {
-            eprintln!("macOS Process Tap helper 未及时退出,跳过 reader 回收(自愈兜底接管)");
+            eprintln!("macOS Process Tap helper did not exit in time; skipping reader join (parent-death self-heal takes over)");
         }
     }
 }
@@ -71,7 +71,7 @@ pub fn helper_path() -> Result<PathBuf> {
             return Ok(path);
         }
         bail!(
-            "{HELPER_ENV} 指向的 Process Tap helper 不存在: {}",
+            "Process Tap helper referenced by {HELPER_ENV} does not exist: {}",
             path.display()
         );
     }
@@ -91,7 +91,7 @@ pub fn helper_path() -> Result<PathBuf> {
     }
 
     bail!(
-        "未找到 macOS Process Tap helper;先运行 tools/macos-process-tap-poc/build.sh,或设置 {HELPER_ENV}"
+        "macOS Process Tap helper not found; run tools/macos-process-tap-poc/build.sh first, or set {HELPER_ENV}"
     )
 }
 
@@ -124,7 +124,12 @@ pub fn probe_permission() -> Result<String> {
         .arg("--probe-permission")
         .arg("--mono")
         .output()
-        .with_context(|| format!("启动 macOS Process Tap 权限探测失败: {}", helper.display()))?;
+        .with_context(|| {
+            format!(
+                "failed to launch macOS Process Tap permission probe: {}",
+                helper.display()
+            )
+        })?;
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
     if output.status.success() {
         return Ok(if stderr.is_empty() {
@@ -165,13 +170,16 @@ where
     }
     command.stdout(Stdio::piped()).stderr(Stdio::inherit());
 
-    let mut child = command
-        .spawn()
-        .with_context(|| format!("启动 macOS Process Tap helper 失败: {}", helper.display()))?;
+    let mut child = command.spawn().with_context(|| {
+        format!(
+            "failed to launch macOS Process Tap helper: {}",
+            helper.display()
+        )
+    })?;
     let stdout = child
         .stdout
         .take()
-        .context("macOS Process Tap helper stdout 未打开")?;
+        .context("macOS Process Tap helper stdout was not opened")?;
     let reader_running = running.clone();
     let channels = usize::from(mode.channel_count());
     let reader = thread::spawn(move || {
@@ -229,13 +237,13 @@ fn read_pcm_stream<P>(
                         // 解读交织流,整条参考会声道错位,AEC 静默失效。
                         if hdr_channels != 0 && hdr_channels as usize != channels {
                             eprintln!(
-                                "macOS Process Tap: tap 实际 {hdr_channels} 声道 ≠ 请求 {channels} 声道,按实际解读并适配"
+                                "macOS Process Tap: tap actually reports {hdr_channels} channels != requested {channels}; interpreting as reported and adapting"
                             );
                             source_channels = hdr_channels as usize;
                         }
                         if rate != 0 && rate != target_rate {
                             eprintln!(
-                                "macOS Process Tap: 系统输出 {rate} Hz ≠ 管线 {target_rate} Hz,启用 rubato 重采样"
+                                "macOS Process Tap: system output {rate} Hz != pipeline {target_rate} Hz; enabling rubato resampling"
                             );
                             resampler =
                                 Some(InterleavedInputResampler::new(rate, target_rate, channels));
@@ -243,7 +251,7 @@ fn read_pcm_stream<P>(
                         pending.drain(..STREAM_HEADER_LEN);
                     } else {
                         // 旧版 helper 没有流头:按默认 48k 处理,这批字节就是 PCM。
-                        eprintln!("macOS Process Tap: helper 未上报流头,按 {SAMPLE_RATE} Hz 处理");
+                        eprintln!("macOS Process Tap: helper did not report a stream header; assuming {SAMPLE_RATE} Hz");
                         if SAMPLE_RATE != target_rate {
                             resampler = Some(InterleavedInputResampler::new(
                                 SAMPLE_RATE,
@@ -288,7 +296,7 @@ fn read_pcm_stream<P>(
                 }
             }
             Err(err) => {
-                eprintln!("macOS Process Tap helper 读取失败: {err}");
+                eprintln!("macOS Process Tap helper read failed: {err}");
                 break;
             }
         }

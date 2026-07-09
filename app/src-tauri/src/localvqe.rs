@@ -55,14 +55,14 @@ pub(crate) fn localvqe_model_pin(filename: &str) -> Option<&'static LocalVqeMode
 }
 
 fn sha256_file(path: &Path) -> Result<String, String> {
-    let mut file =
-        std::fs::File::open(path).map_err(|e| format!("打开文件失败: {}: {e}", path.display()))?;
+    let mut file = std::fs::File::open(path)
+        .map_err(|e| format!("failed to open file {}: {e}", path.display()))?;
     let mut hasher = Sha256::new();
     let mut buf = vec![0u8; 64 * 1024];
     loop {
         let n = file
             .read(&mut buf)
-            .map_err(|e| format!("读取文件失败: {}: {e}", path.display()))?;
+            .map_err(|e| format!("failed to read file {}: {e}", path.display()))?;
         if n == 0 {
             break;
         }
@@ -78,11 +78,11 @@ fn verify_pinned_file(
     label: &str,
 ) -> Result<(), String> {
     let size = std::fs::metadata(path)
-        .map_err(|e| format!("读取文件信息失败: {}: {e}", path.display()))?
+        .map_err(|e| format!("failed to read file metadata {}: {e}", path.display()))?
         .len();
     if size != expected_size {
         return Err(format!(
-            "{label}大小不匹配: file={}, actual={}, expected={}",
+            "{label} size mismatch: file={}, actual={}, expected={}",
             path.display(),
             size,
             expected_size
@@ -91,7 +91,7 @@ fn verify_pinned_file(
     let actual = sha256_file(path)?;
     if !actual.eq_ignore_ascii_case(expected_sha256) {
         return Err(format!(
-            "{label} SHA256 不匹配: file={}, actual={}, expected={}",
+            "{label} SHA256 mismatch: file={}, actual={}, expected={}",
             path.display(),
             actual,
             expected_sha256
@@ -104,7 +104,7 @@ pub(crate) fn verify_localvqe_model_file(
     path: &Path,
     pin: &LocalVqeModelPin,
 ) -> Result<(), String> {
-    verify_pinned_file(path, pin.sha256, pin.size, "LocalVQE 模型")
+    verify_pinned_file(path, pin.sha256, pin.size, "LocalVQE model")
 }
 
 fn localvqe_data_dir_path() -> PathBuf {
@@ -321,7 +321,10 @@ fn download_localvqe_model_blocking(
             .lock()
             .map_err(|_| "download lock poisoned".to_string())?;
         if !inflight.insert(pin.filename.to_string()) {
-            return Err(format!("模型 {} 正在下载中,请稍候", pin.filename));
+            return Err(format!(
+                "model {} is already downloading; please wait",
+                pin.filename
+            ));
         }
     }
     let _inflight = InFlightGuard(pin.filename.to_string());
@@ -396,7 +399,7 @@ fn download_localvqe_model_blocking(
     if !out.status.success() {
         let _ = std::fs::remove_file(&tmp);
         return Err(format!(
-            "下载失败({url}): {}",
+            "download failed ({url}): {}",
             command_status_error("curl", &out)
         ));
     }

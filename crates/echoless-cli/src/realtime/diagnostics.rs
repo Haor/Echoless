@@ -237,8 +237,12 @@ impl DiagnosticRecorder {
             return Ok(None);
         };
         let base = Path::new(record_dir);
-        create_dir_all(base)
-            .with_context(|| format!("创建诊断录制目录失败: {}", base.display()))?;
+        create_dir_all(base).with_context(|| {
+            format!(
+                "failed to create diagnostics recording directory: {}",
+                base.display()
+            )
+        })?;
         let dir = make_session_dir(base)?;
         let spec = WavSpec {
             channels: 1,
@@ -266,10 +270,9 @@ impl DiagnosticRecorder {
             node_stats: config.node_stats,
         })?;
         let stats_part_path = dir.join("stats.csv.part");
-        let mut stats = BufWriter::new(
-            File::create(&stats_part_path)
-                .with_context(|| format!("创建诊断 stats.csv 失败: {}", dir.display()))?,
-        );
+        let mut stats = BufWriter::new(File::create(&stats_part_path).with_context(|| {
+            format!("failed to create diagnostics stats.csv: {}", dir.display())
+        })?);
         writeln!(
             stats,
             "frame_index,frames,near_delay_ms,near_delay_buffered_samples,mic_dbfs,ref_dbfs,out_dbfs,mic_q,ref_q,out_q,input_queue_latency_ms,output_queue_latency_ms,estimated_user_latency_ms,aec_estimated_delay_ms,aec3_delay_blocks,mic_input_drops,ref_input_drops,input_drops,mic_stale_drops,ref_stale_drops,stale_drops,ref_underruns,output_overruns,output_underruns,node_process_time_ms,node_runtime_errors,node_diverged,node_last_error"
@@ -314,7 +317,7 @@ impl DiagnosticRecorder {
 
         print_human(
             config.status_json,
-            format!("诊断录制目录: {}", dir.display()),
+            format!("diagnostics recording directory: {}", dir.display()),
         );
         Ok(Some(Self {
             dir,
@@ -358,7 +361,7 @@ impl DiagnosticRecorder {
             }
             Err(TrySendError::Disconnected(_)) => {
                 self.status.set_recording(false);
-                bail!("诊断 writer 线程已退出")
+                bail!("diagnostics writer thread has exited")
             }
         }
     }
@@ -390,7 +393,7 @@ impl DiagnosticRecorder {
         }
         if let Some(writer) = self.writer.take() {
             if let Err(err) = writer.join() {
-                eprintln!("诊断 writer 线程退出异常: {err:?}");
+                eprintln!("diagnostics writer thread exited abnormally: {err:?}");
             }
         }
     }
@@ -448,7 +451,7 @@ impl DiagnosticWriter {
                             break;
                         }
                         Err(err) => {
-                            eprintln!("诊断写入失败: {err:#}");
+                            eprintln!("diagnostics write failed: {err:#}");
                             reason = DiagnosticDoneReason::Error;
                             ok = false;
                             break;
@@ -508,7 +511,7 @@ impl DiagnosticWriter {
             .saturating_add(frame.ref_stale_drops);
 
         let Some(stats) = self.stats.as_mut() else {
-            bail!("诊断 stats writer 已关闭");
+            bail!("diagnostics stats writer is closed");
         };
         writeln!(
             stats,
@@ -584,11 +587,11 @@ impl DiagnosticWriter {
             return true;
         };
         if let Err(err) = writer.finalize() {
-            eprintln!("写入 {label} 尾部失败: {err}");
+            eprintln!("failed to write {label} tail: {err}");
             return false;
         }
         if let Err(err) = rename(part_path, final_path) {
-            eprintln!("提交 {label} 失败: {err}");
+            eprintln!("failed to finalize {label}: {err}");
             return false;
         }
         true
@@ -600,12 +603,12 @@ impl DiagnosticWriter {
         };
         let mut ok = true;
         if let Err(err) = stats.flush() {
-            eprintln!("刷新诊断 stats.csv 失败: {err}");
+            eprintln!("failed to flush diagnostics stats.csv: {err}");
             ok = false;
         }
         drop(stats);
         if let Err(err) = rename(&self.stats_part_path, &self.stats_path) {
-            eprintln!("提交诊断 stats.csv 失败: {err}");
+            eprintln!("failed to finalize diagnostics stats.csv: {err}");
             ok = false;
         }
         ok
@@ -619,7 +622,7 @@ impl DiagnosticWriter {
         let mut file = match File::create(&self.summary_path) {
             Ok(file) => BufWriter::new(file),
             Err(err) => {
-                eprintln!("创建诊断 summary.txt 失败: {err}");
+                eprintln!("failed to create diagnostics summary.txt: {err}");
                 return false;
             }
         };
@@ -648,7 +651,7 @@ impl DiagnosticWriter {
             Ok(())
         })();
         if let Err(err) = result {
-            eprintln!("写入诊断 summary.txt 失败: {err:#}");
+            eprintln!("failed to write diagnostics summary.txt: {err:#}");
             false
         } else {
             true
@@ -677,7 +680,7 @@ impl DiagnosticWriter {
             print_human(
                 self.human_to_stderr,
                 format!(
-                    "诊断录制完成(reason={}, ok={}, drops={}, output_underruns={}, output_skew_pct={:.2}): {}",
+                    "diagnostics recording complete (reason={}, ok={}, drops={}, output_underruns={}, output_skew_pct={:.2}): {}",
                     reason.as_str(),
                     ok,
                     self.status.drops(),
@@ -699,7 +702,7 @@ enum DiagnosticWavKind {
 fn make_session_dir(base: &Path) -> Result<PathBuf> {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .context("系统时间早于 UNIX_EPOCH")?
+        .context("system time is before UNIX_EPOCH")?
         .as_secs();
     for attempt in 0..1000 {
         let name = if attempt == 0 {
@@ -712,12 +715,19 @@ fn make_session_dir(base: &Path) -> Result<PathBuf> {
             Ok(()) => return Ok(dir),
             Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(err) => {
-                return Err(err)
-                    .with_context(|| format!("创建诊断 session 目录失败: {}", dir.display()));
+                return Err(err).with_context(|| {
+                    format!(
+                        "failed to create diagnostics session directory: {}",
+                        dir.display()
+                    )
+                });
             }
         }
     }
-    bail!("创建诊断 session 目录失败: {} 下重名过多", base.display())
+    bail!(
+        "failed to create diagnostics session directory: too many name collisions under {}",
+        base.display()
+    )
 }
 
 struct DiagnosticMetadata<'a> {
@@ -733,8 +743,12 @@ struct DiagnosticMetadata<'a> {
 
 fn write_diagnostic_metadata(metadata: DiagnosticMetadata<'_>) -> Result<()> {
     let mut file = BufWriter::new(
-        File::create(metadata.dir.join("metadata.txt"))
-            .with_context(|| format!("创建诊断 metadata.txt 失败: {}", metadata.dir.display()))?,
+        File::create(metadata.dir.join("metadata.txt")).with_context(|| {
+            format!(
+                "failed to create diagnostics metadata.txt: {}",
+                metadata.dir.display()
+            )
+        })?,
     );
     writeln!(file, "version={}", env!("CARGO_PKG_VERSION"))?;
     writeln!(file, "sample_rate={}", metadata.sample_rate)?;

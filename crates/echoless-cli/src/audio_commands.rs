@@ -29,7 +29,7 @@ pub(crate) fn cmd_devices(args: DevicesArgs) -> Result<()> {
             "{}",
             serde_json::to_string_pretty(&json!({
                 "ok": false,
-                "error": "设备枚举需 realtime 特性(cpal);当前构建未启用。",
+                "error": "device enumeration requires the realtime feature (cpal); current build has it disabled.",
                 "inputs": [],
                 "outputs": [],
                 "reference_sources": [
@@ -40,7 +40,9 @@ pub(crate) fn cmd_devices(args: DevicesArgs) -> Result<()> {
         );
         return Ok(());
     }
-    println!("设备枚举需 realtime 特性(cpal);当前构建未启用。");
+    println!(
+        "device enumeration requires the realtime feature (cpal); current build has it disabled."
+    );
     Ok(())
 }
 
@@ -85,7 +87,7 @@ pub(crate) fn cmd_doctor_audio(args: DoctorAudioArgs) -> Result<()> {
     let report = json!({
         "ok": false,
         "platform": std::env::consts::OS,
-        "error": "audio doctor 需 realtime 特性(cpal);当前构建未启用。",
+        "error": "audio doctor requires the realtime feature (cpal); current build has it disabled.",
         "virtual_output_detected": false,
         "candidate_outputs": [],
         "candidate_inputs": [],
@@ -99,7 +101,7 @@ pub(crate) fn cmd_doctor_audio(args: DoctorAudioArgs) -> Result<()> {
                 "requested": true,
                 "ok": false,
                 "state": "unknown",
-                "detail": "audio doctor 需 realtime 特性(cpal);当前构建未启用。"
+                "detail": "audio doctor requires the realtime feature (cpal); current build has it disabled."
             })
         } else {
             json!(null)
@@ -108,7 +110,9 @@ pub(crate) fn cmd_doctor_audio(args: DoctorAudioArgs) -> Result<()> {
     if args.json {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
-        println!("audio doctor 需 realtime 特性(cpal);当前构建未启用。");
+        println!(
+            "audio doctor requires the realtime feature (cpal); current build has it disabled."
+        );
     }
     Ok(())
 }

@@ -20,7 +20,8 @@ pub struct WavFileSource {
 
 impl WavFileSource {
     pub fn new(path: &str, frames_per_read: u32) -> anyhow::Result<Self> {
-        let reader = WavReader::open(path).with_context(|| format!("打开 WAV 失败: {path}"))?;
+        let reader =
+            WavReader::open(path).with_context(|| format!("failed to open WAV: {path}"))?;
         let spec = reader.spec();
         let samples: Vec<f32> = match spec.sample_format {
             SampleFormat::Float => reader
@@ -103,13 +104,13 @@ impl AudioSink for WavFileSink {
             sample_format: SampleFormat::Float,
         };
         let w = WavWriter::create(&self.path, spec)
-            .with_context(|| format!("创建 WAV 失败: {}", self.path))?;
+            .with_context(|| format!("failed to create WAV: {}", self.path))?;
         self.writer = Some(w);
         Ok(())
     }
 
     fn write(&mut self, interleaved: &[f32], frames: u32) -> anyhow::Result<()> {
-        let w = self.writer.as_mut().context("WavFileSink 未 start")?;
+        let w = self.writer.as_mut().context("WavFileSink not started")?;
         let _ = frames;
         for &s in interleaved {
             w.write_sample(s)?;

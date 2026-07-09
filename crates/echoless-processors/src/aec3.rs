@@ -245,16 +245,16 @@ fn parse_reference_channels(v: &toml::Value) -> anyhow::Result<u16> {
         return match n {
             1 => Ok(1),
             2 => Ok(2),
-            _ => anyhow::bail!("reference_channels 只能是 1/2 或 mono/stereo"),
+            _ => anyhow::bail!("reference_channels must be 1/2 or mono/stereo"),
         };
     }
     let Some(s) = v.as_str() else {
-        anyhow::bail!("reference_channels 只能是 1/2 或 mono/stereo");
+        anyhow::bail!("reference_channels must be 1/2 or mono/stereo");
     };
     match s.to_ascii_lowercase().as_str() {
         "mono" | "1" | "1ch" => Ok(1),
         "stereo" | "2" | "2ch" => Ok(2),
-        _ => anyhow::bail!("reference_channels 只能是 1/2 或 mono/stereo"),
+        _ => anyhow::bail!("reference_channels must be 1/2 or mono/stereo"),
     }
 }
 

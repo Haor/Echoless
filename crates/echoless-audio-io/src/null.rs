@@ -16,7 +16,10 @@ impl NullSource {
 }
 impl AudioSource for NullSource {
     fn start(&mut self) -> anyhow::Result<AudioFormat> {
-        anyhow::bail!("NullSource ({}):该平台/路径无实现", self.label)
+        anyhow::bail!(
+            "NullSource ({}): no implementation on this platform/path",
+            self.label
+        )
     }
     fn read(&mut self, _timeout: Duration) -> anyhow::Result<Option<OwnedPacket>> {
         Ok(None)
@@ -36,7 +39,10 @@ impl NullSink {
 }
 impl AudioSink for NullSink {
     fn start(&mut self, _format: AudioFormat) -> anyhow::Result<()> {
-        anyhow::bail!("NullSink ({}):该平台/路径无实现", self.label)
+        anyhow::bail!(
+            "NullSink ({}): no implementation on this platform/path",
+            self.label
+        )
     }
     fn write(&mut self, _interleaved: &[f32], _frames: u32) -> anyhow::Result<()> {
         Ok(())
