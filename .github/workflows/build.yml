@@ -11,6 +11,12 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  # Cancel stale runs only within the same validation context. A PR validates
+  # its merge result, so a head-only push must never cancel that PR run.
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
 env:
   # 35b116d:v1.4-AEC 支持(旧 runtime 载 v1.4 返回 null);ggml 静态链入,dylib 自包含
   LOCALVQE_REF: 35b116d5eb059d552fa46fac3ce2963ed13ce153
