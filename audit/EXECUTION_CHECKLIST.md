@@ -61,12 +61,12 @@
 
 ### 3. B-27【P1】LocalVQE 错误态无界缓冲与旧音频回放
 
-- [ ] 在 `crates/echoless-processors/src/localvqe.rs` 明确 native error 策略：失败 hop 必须被消费，或清空 near/far/out 并 reset 流状态。
-- [ ] 保证错误期间继续 near passthrough，但内部队列长度始终有界。
-- [ ] 保证恢复后从当前时间点重新起流，不输出错误发生前积压的样本。
-- [ ] 增加连续 error、瞬态恢复、重复恢复测试，并断言 queue 上限与样本时间顺序。
-- [ ] 验证：`cargo test -p echoless-processors --locked`、`cargo clippy -p echoless-processors --all-targets --locked -- -D warnings`。
-- [ ] 独立 commit：`B-27`。
+- [x] 在 `crates/echoless-processors/src/localvqe.rs` 明确 native error 策略：失败 hop 必须被消费，或清空 near/far/out 并 reset 流状态。
+- [x] 保证错误期间继续 near passthrough，但内部队列长度始终有界。
+- [x] 保证恢复后从当前时间点重新起流，不输出错误发生前积压的样本。
+- [x] 增加连续 error、瞬态恢复、重复恢复测试，并断言 queue 上限与样本时间顺序。
+- [x] 验证：`cargo test -p echoless-processors --locked`、`cargo clippy -p echoless-processors --all-targets --locked -- -D warnings`。
+- [x] 独立 commit：`B-27`。
 
 ### 4. B-25【P1】stereo reference 半帧提交与奇偶破坏
 

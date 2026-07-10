@@ -20,8 +20,8 @@
 | 顺序 | 条目 | 梯队 | 状态 | Commit | 专项验证 | 备注 |
 |---:|---|---|---|---|---|---|
 | 1 | B-26 | 第一 | done | `c61195e` | focused 10 passed；CLI 81 passed；clippy clean | ELTP v1 ready + EOF/read-error single fatal report；真实系统音频权限/硬件未自动触发 |
-| 2 | B-28 | 第一 | done-pending-commit | this commit | Tauri 23 passed；frontend 28 passed + tsc；clippy clean | active generation 将 RunState/tray/status/exit 副作用收口在同一锁内；stderr log 事件仍无 run_id，不影响运行状态所有权 |
-| 3 | B-27 | 第一 | pending | — | — | LocalVQE error recovery |
+| 2 | B-28 | 第一 | done | `5dab0f1` | Tauri 23 passed；frontend 28 passed + tsc；clippy clean | active generation 将 RunState/tray/status/exit 副作用收口在同一锁内；stderr log 事件仍无 run_id，不影响运行状态所有权 |
+| 3 | B-27 | 第一 | done-pending-commit | this commit | processors 44 passed / 3 ignored；clippy clean | native error 立即 reset 并清空 near/far/out；recovery warm-up 期 near passthrough；故障注入覆盖连续/瞬态/重复恢复 |
 | 4 | B-25 | 第一 | pending | — | — | stereo frame atomicity |
 | 5 | B-29 | 第一 | pending | — | — | clock-skew frame units/directions |
 | 6 | T-11 | 第一 | pending | — | — | supported-platform Tauri tests in CI |

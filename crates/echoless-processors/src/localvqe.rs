@@ -48,12 +48,13 @@ pub struct LocalVqe {
     threads: Option<i32>,
     noise_gate: bool,
     noise_gate_threshold_dbfs: f32,
-    runtime: Option<LocalVqeRuntime>,
+    runtime: Option<Box<dyn LocalVqeBackend>>,
     near_buffer: VecDeque<f32>,
     far_buffer: VecDeque<f32>,
     frame_out: Vec<f32>,
     out_queue: VecDeque<f32>,
     started: bool,
+    recovering: bool,
     last_error: Option<String>,
     runtime_errors: u64,
 }
@@ -74,12 +75,13 @@ impl LocalVqe {
             frame_out: Vec::new(),
             out_queue: VecDeque::new(),
             started: false,
+            recovering: false,
             last_error: None,
             runtime_errors: 0,
         }
     }
 
-    fn load_runtime(&self) -> Result<LocalVqeRuntime> {
+    fn load_runtime(&self) -> Result<Box<dyn LocalVqeBackend>> {
         let model_path = self
             .model_path
             .as_ref()
@@ -101,7 +103,8 @@ impl LocalVqe {
                         noise_gate: self.noise_gate,
                         noise_gate_threshold_dbfs: self.noise_gate_threshold_dbfs,
                     };
-                    return LocalVqeRuntime::new(api, candidate.clone(), config);
+                    return LocalVqeRuntime::new(api, candidate.clone(), config)
+                        .map(|runtime| Box::new(runtime) as Box<dyn LocalVqeBackend>);
                 }
                 Err(err) => errors.push(format!("{}: {err}", candidate.display())),
             }
@@ -124,7 +127,21 @@ impl LocalVqe {
         self.far_buffer.clear();
         self.out_queue.clear();
         self.started = false;
+        self.recovering = false;
         self.last_error = None;
+    }
+
+    fn recover_from_runtime_error(&mut self, error: String) {
+        if let Some(runtime) = self.runtime.as_mut() {
+            runtime.reset();
+        }
+        self.near_buffer.clear();
+        self.far_buffer.clear();
+        self.out_queue.clear();
+        self.started = false;
+        self.recovering = true;
+        self.last_error = Some(error);
+        self.runtime_errors = self.runtime_errors.saturating_add(1);
     }
 
     fn process_loaded(
@@ -150,7 +167,7 @@ impl LocalVqe {
             .runtime
             .as_mut()
             .context("localvqe runtime is not configured")?;
-        let hop = runtime.hop;
+        let hop = runtime.hop();
         if self.frame_out.len() != hop {
             self.frame_out.resize(hop, 0.0);
         }
@@ -174,12 +191,15 @@ impl LocalVqe {
         let start_threshold = samples.saturating_add(hop);
         if !self.started && self.out_queue.len() >= start_threshold {
             self.started = true;
+            self.recovering = false;
         }
 
         if self.started {
             for sample in out.iter_mut().take(samples) {
                 *sample = self.out_queue.pop_front().unwrap_or(0.0);
             }
+        } else if self.recovering {
+            copy_or_zero(&near[..near.len().min(samples)], &mut out[..samples]);
         } else {
             out[..samples].fill(0.0);
         }
@@ -220,7 +240,7 @@ impl EchoProcessor for LocalVqe {
             .unwrap_or(DEFAULT_NOISE_GATE_THRESHOLD_DBFS);
 
         let runtime = self.load_runtime()?;
-        self.frame_out.resize(runtime.hop, 0.0);
+        self.frame_out.resize(runtime.hop(), 0.0);
         self.runtime = Some(runtime);
         self.reset_stream_state();
         Ok(())
@@ -233,8 +253,7 @@ impl EchoProcessor for LocalVqe {
         }
 
         if let Err(err) = self.process_loaded(near, far, out, frames as usize) {
-            self.last_error = Some(err.to_string());
-            self.runtime_errors = self.runtime_errors.saturating_add(1);
+            self.recover_from_runtime_error(err.to_string());
             copy_or_zero(near, out);
         }
     }
@@ -296,6 +315,13 @@ struct LocalVqeRuntime {
     _library_path: PathBuf,
     hop: usize,
     _fft_size: usize,
+}
+
+trait LocalVqeBackend: Send {
+    fn hop(&self) -> usize;
+    fn process_frame(&mut self, near: &[f32], far: &[f32], out: &mut [f32]) -> Result<()>;
+    fn reset(&mut self);
+    fn set_noise_gate(&mut self, enabled: bool, threshold_dbfs: f32) -> Result<()>;
 }
 
 struct LocalVqeRuntimeConfig<'a> {
@@ -387,6 +413,12 @@ impl LocalVqeRuntime {
             hop: hop as usize,
             _fft_size: fft_size as usize,
         })
+    }
+}
+
+impl LocalVqeBackend for LocalVqeRuntime {
+    fn hop(&self) -> usize {
+        self.hop
     }
 
     fn process_frame(&mut self, near: &[f32], far: &[f32], out: &mut [f32]) -> Result<()> {
@@ -712,7 +744,60 @@ fn check_runtime(api: &LocalVqeApi, ctx: LocalVqeCtx, ret: c_int, call: &str) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    struct ScriptedBackend {
+        hop: usize,
+        fail_calls: VecDeque<bool>,
+        resets: Arc<AtomicUsize>,
+    }
+
+    impl LocalVqeBackend for ScriptedBackend {
+        fn hop(&self) -> usize {
+            self.hop
+        }
+
+        fn process_frame(&mut self, near: &[f32], _far: &[f32], out: &mut [f32]) -> Result<()> {
+            if self.fail_calls.pop_front().unwrap_or(false) {
+                bail!("scripted localvqe native failure");
+            }
+            out.copy_from_slice(near);
+            Ok(())
+        }
+
+        fn reset(&mut self) {
+            self.resets.fetch_add(1, Ordering::SeqCst);
+        }
+
+        fn set_noise_gate(&mut self, _enabled: bool, _threshold_dbfs: f32) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    fn scripted_processor(
+        hop: usize,
+        fail_calls: impl IntoIterator<Item = bool>,
+    ) -> (LocalVqe, Arc<AtomicUsize>) {
+        let resets = Arc::new(AtomicUsize::new(0));
+        let mut processor = LocalVqe::new();
+        processor.frame_out.resize(hop, 0.0);
+        processor.runtime = Some(Box::new(ScriptedBackend {
+            hop,
+            fail_calls: fail_calls.into_iter().collect(),
+            resets: resets.clone(),
+        }));
+        (processor, resets)
+    }
+
+    fn process_block(processor: &mut LocalVqe, value: f32, hop: usize) -> Vec<f32> {
+        let near = vec![value; hop];
+        let far = vec![0.0; hop];
+        let mut out = vec![0.0; hop];
+        processor.process(&near, &far, &mut out, hop as u32);
+        out
+    }
 
     #[test]
     fn configure_requires_model_path() {
@@ -757,6 +842,69 @@ mod tests {
         assert!(processor.far_buffer.is_empty());
         assert!(processor.out_queue.is_empty());
         assert_eq!(processor.frame_out.len(), 160);
+    }
+
+    #[test]
+    fn continuous_native_errors_passthrough_and_keep_queues_bounded() {
+        let hop = 4;
+        let (mut processor, resets) = scripted_processor(hop, [true; 16]);
+
+        for block in 0..16 {
+            let value = block as f32 + 1.0;
+            assert_eq!(process_block(&mut processor, value, hop), vec![value; hop]);
+            assert!(processor.near_buffer.len() < hop);
+            assert!(processor.far_buffer.len() < hop);
+            assert!(processor.out_queue.len() <= hop * 2);
+            assert!(!processor.started);
+            assert!(processor.recovering);
+        }
+
+        let stats = processor.stats();
+        assert_eq!(stats.runtime_error_count, 16);
+        assert!(stats
+            .last_backend_error
+            .as_deref()
+            .is_some_and(|error| error.contains("scripted localvqe native failure")));
+        assert_eq!(resets.load(Ordering::SeqCst), 16);
+    }
+
+    #[test]
+    fn transient_error_recovers_without_pre_error_audio() {
+        let hop = 4;
+        let (mut processor, resets) = scripted_processor(hop, [true, false, false]);
+
+        assert_eq!(process_block(&mut processor, 1.0, hop), vec![1.0; hop]);
+        assert_eq!(process_block(&mut processor, 2.0, hop), vec![2.0; hop]);
+        let recovered = process_block(&mut processor, 3.0, hop);
+
+        assert_eq!(recovered, vec![2.0; hop]);
+        assert!(!recovered.contains(&1.0));
+        assert!(processor.started);
+        assert!(!processor.recovering);
+        assert_eq!(processor.stats().runtime_error_count, 1);
+        assert_eq!(resets.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn repeated_recovery_discards_each_failed_generation() {
+        let hop = 4;
+        let (mut processor, resets) =
+            scripted_processor(hop, [true, false, false, true, false, false]);
+
+        assert_eq!(process_block(&mut processor, 1.0, hop), vec![1.0; hop]);
+        assert_eq!(process_block(&mut processor, 2.0, hop), vec![2.0; hop]);
+        assert_eq!(process_block(&mut processor, 3.0, hop), vec![2.0; hop]);
+        assert_eq!(process_block(&mut processor, 4.0, hop), vec![4.0; hop]);
+        assert_eq!(process_block(&mut processor, 5.0, hop), vec![5.0; hop]);
+        let recovered = process_block(&mut processor, 6.0, hop);
+
+        assert_eq!(recovered, vec![5.0; hop]);
+        assert!(!recovered.contains(&3.0));
+        assert_eq!(processor.stats().runtime_error_count, 2);
+        assert_eq!(resets.load(Ordering::SeqCst), 2);
+        assert!(processor.near_buffer.len() < hop);
+        assert!(processor.far_buffer.len() < hop);
+        assert!(processor.out_queue.len() <= hop * 2);
     }
 
     #[test]
