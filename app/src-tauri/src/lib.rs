@@ -22,6 +22,8 @@ mod platform;
 mod proc;
 mod sidecar;
 #[cfg(test)]
+mod single_instance_contract;
+#[cfg(test)]
 mod tests;
 mod tray;
 
@@ -40,9 +42,14 @@ use tray::{register_windows_tray, TrayIconState};
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    // 崩溃取证日志(logs/echoless-<stamp>.log,启动清理超龄/超量)。
-    logging::init(env!("CARGO_PKG_VERSION"));
-    let builder = tauri::Builder::default()
+    let builder = tauri::Builder::default();
+    // Must be the first plugin: later instances notify this process and exit
+    // before any other plugin can initialize competing application state.
+    #[cfg(desktop)]
+    let builder = builder.plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+        tray::show_main_window(app)
+    }));
+    let builder = builder
         .plugin(tauri_plugin_decorum::init())
         .plugin(tauri_plugin_dialog::init())
         .manage(RunState::default())
@@ -79,6 +86,10 @@ pub fn run() {
             set_tray_prefs
         ])
         .setup(|app| {
+            // 在 single-instance setup 成功后才打开/清理共享日志目录。第二实例会在
+            // single-instance plugin 中退出，不再与主实例竞争日志文件。
+            logging::init(env!("CARGO_PKG_VERSION"));
+
             // 默认打开基线 1040×640(v17 设计稿画布,布局按此定稿);
             // B1:min 锁到默认尺寸 —— plate 分格在更小窗口必然破版。
             // B3:builder 背景色 = 新色板 --bg #1d1d1b,resize 瞬间不露白边。
