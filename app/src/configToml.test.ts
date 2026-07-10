@@ -50,4 +50,38 @@ describe("TOML basic string encoding", () => {
     );
     expect(config.split("\n", 2)[0]).toContain("\\ncr\\r");
   });
+
+  it("preserves a Windows WASAPI endpoint selector with braces", () => {
+    const selector =
+      "{0.0.1.00000000}.{8f6f0d71-4c2b-4a57-bfd3-5f47cdbb6f50}";
+
+    const config = buildConfigToml({
+      mic: selector,
+      reference: "none",
+      output: "default",
+      kind: "passthrough",
+      pipeline: {
+        sample_rate: 48_000,
+        frame_ms: 10,
+        reference_channels: "mono",
+      },
+      params: {},
+    });
+
+    expect(config).toBe(
+      [
+        `mic = "${selector}"`,
+        'reference = "none"',
+        'output = "default"',
+        "sample_rate = 48000",
+        "frame_ms = 10",
+        'reference_channels = "mono"',
+        "output_level = 50",
+        "",
+        "[[chain]]",
+        'kind = "passthrough"',
+        "",
+      ].join("\n"),
+    );
+  });
 });
