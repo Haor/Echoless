@@ -30,8 +30,8 @@
 | 9 | B-30 | 第二 | done | `8c4faac` | Tauri 26 passed；clippy clean | remove success 才释放 context；失败保留 state/OSStatus 并阻止重复注册；poisoned-state fallback 保持 context 存活 |
 | 10 | B-31 | 第二 | done | `30859df` | frontend 48 passed + tsc；CLI config validation ok | TOML basic string 对 C0/DEL 使用标准短转义或 Unicode 转义；quote/backslash/Unicode round-trip 覆盖 |
 | 11 | B-32 | 第二 | done | `f6d9aac` | Tauri 28 passed；clippy clean | 纳秒 stamp + PID + attempt + create_new；8-worker 同 stamp 冲突与独立 cap 覆盖；8 MiB/7 天/20 文件策略不变 |
-| 12 | S-14 | 第二 | done-pending-commit | this commit | Tauri 28 passed；clippy clean | tauri::Url 规范化 scheme/host/port；拒 credentials/non-443；覆盖 backslash/userinfo/encoded delimiter/case/trailing dot |
-| 13 | T-12 | 第二 | pending | — | — | pull request CI trigger |
+| 12 | S-14 | 第二 | done | `de2d1a4` | Tauri 28 passed；clippy clean | tauri::Url 规范化 scheme/host/port；拒 credentials/non-443；覆盖 backslash/userinfo/encoded delimiter/case/trailing dot |
+| 13 | T-12 | 第二 | implemented-pending-remote-ci | this commit | workflow YAML parsed | pull_request 仅覆盖 main/dev；现有 jobs 与 Linux 发布行为不变；测试 PR 待最终推送阶段验收 |
 | 14 | D-12 | 第二 | pending-existing-diff | — | — | preserve baseline diff; commit separately |
 | 15 | D-13 | 第二 | pending | — | — | docs-only Linux path casing |
 | 16 | D-14 | 第二 | pending | — | — | sidecar resolution docs |

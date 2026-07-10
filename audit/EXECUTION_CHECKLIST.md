@@ -163,10 +163,10 @@
 
 ### 13. T-12【P2】增加 PR 自动质量门
 
-- [ ] 为 `.github/workflows/build.yml` 增加 `pull_request` 触发，覆盖目标为 `main`/`dev`。
-- [ ] 不新增 Linux 专项保证；保持现有 job 结构，不在本条重构昂贵打包步骤。
-- [ ] 本地检查 workflow YAML；推送测试 PR 后确认基础 quality jobs 自动出现。
-- [ ] 独立 commit：`T-12`。
+- [x] 为 `.github/workflows/build.yml` 增加 `pull_request` 触发，覆盖目标为 `main`/`dev`。
+- [x] 不新增 Linux 专项保证；保持现有 job 结构，不在本条重构昂贵打包步骤。
+- [ ] 本地检查 workflow YAML；推送测试 PR 后确认基础 quality jobs 自动出现。（本地 YAML 已通过；远端 PR 待最终推送阶段验收。）
+- [x] 独立 commit：`T-12`。
 
 ### 14. D-12【P2】收口已经存在的 example.toml/SRC 注释修复
 
