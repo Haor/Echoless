@@ -4,6 +4,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use ringbuf::traits::Consumer;
 use rubato::{FftFixedIn, FftFixedOut, Resampler};
 
+use super::frame_ring::try_pop_frame;
+
 pub(super) struct InterleavedInputResampler {
     in_rate: u32,
     out_rate: u32,
@@ -544,6 +546,7 @@ pub(super) struct AdaptiveReferenceResampler {
     controller: RateController,
     pos: f64,
     buffers: Vec<VecDeque<f32>>,
+    input_frame: Vec<f32>,
 }
 
 impl AdaptiveReferenceResampler {
@@ -556,6 +559,7 @@ impl AdaptiveReferenceResampler {
             controller: RateController::new(setpoint_frames as f64, deadband_frames as f64),
             pos: 0.0,
             buffers: (0..channels).map(|_| VecDeque::new()).collect(),
+            input_frame: vec![0.0; channels],
         }
     }
 
@@ -605,21 +609,14 @@ impl AdaptiveReferenceResampler {
         let needed = (self.pos.floor() as usize).saturating_add(2);
         // 交织拉取:一次补齐所有声道到 needed 深度。任一声道拉不到即判欠载填零。
         while self.buffers[0].len() < needed {
-            let mut got_full_frame = true;
-            for ch in 0..self.channels {
-                match consumer.try_pop() {
-                    Some(v) => self.buffers[ch].push_back(v.clamp(-1.0, 1.0)),
-                    None => {
-                        got_full_frame = false;
-                        break;
-                    }
-                }
-            }
-            if !got_full_frame {
+            if !try_pop_frame(consumer, &mut self.input_frame) {
                 for sample in out.iter_mut().skip(out_base).take(self.channels) {
                     *sample = 0.0;
                 }
                 return false;
+            }
+            for ch in 0..self.channels {
+                self.buffers[ch].push_back(self.input_frame[ch].clamp(-1.0, 1.0));
             }
         }
 

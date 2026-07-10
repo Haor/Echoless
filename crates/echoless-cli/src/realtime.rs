@@ -16,6 +16,7 @@ mod control;
 mod devices;
 mod diagnostics;
 mod emit;
+mod frame_ring;
 #[cfg(target_os = "macos")]
 mod macos_process_tap;
 mod resample;
@@ -55,6 +56,9 @@ use self::devices::{
     format_device_description, is_virtual_audio_name, system_audio_permission_state,
 };
 use self::diagnostics::{DiagnosticRecorder, DiagnosticRecorderConfig, DiagnosticsStatusHandle};
+use self::frame_ring::{
+    push_interleaved_frames, skip_stale_aligned, try_pop_frame, try_push_frame, try_push_frame_with,
+};
 use self::resample::{
     AdaptiveOutputResampler, AdaptiveReferenceResampler, InterleavedInputResampler,
     OutputDeviceResampler,
@@ -625,7 +629,7 @@ fn process_loop<M, R, O>(
             continue;
         }
         // 控制积压(简单 drift/堆积处理):超 4 帧丢旧的。
-        let mic_stale_drops = skip_stale(&mut mic_cons, frame_size);
+        let mic_stale_drops = skip_stale_aligned(&mut mic_cons, frame_size, 1);
         mic_cons.pop_slice(&mut mic_frame);
         let near_delay_buffered_samples = apply_near_delay(
             &mut near_delay,
@@ -649,10 +653,9 @@ fn process_loop<M, R, O>(
                 }
                 // 关闭 output_rate_match:回退旧 skip_stale 硬丢帧路径(pre-T3 行为)。
                 None => {
-                    ref_stale_drops = skip_stale(rc, far_samples_per_frame);
-                    if rc.occupied_len() >= far_samples_per_frame {
-                        rc.pop_slice(&mut far);
-                    } else {
+                    ref_stale_drops =
+                        skip_stale_aligned(rc, far_samples_per_frame, runtime.reference_channels);
+                    if !try_pop_frame(rc, &mut far) {
                         far.fill(0.0); // 参考欠载 → 填静音
                         ref_underrun = 1;
                     }
@@ -785,18 +788,6 @@ fn bypass_source_sample(
         bypass_near.get(index).copied().unwrap_or(0.0)
     } else {
         processed.get(index).copied().unwrap_or(0.0)
-    }
-}
-
-fn skip_stale<C: Consumer<Item = f32>>(consumer: &mut C, frame_size: usize) -> usize {
-    let max_queued = frame_size * 4;
-    let queued = consumer.occupied_len();
-    if queued > max_queued {
-        let dropped = queued - max_queued;
-        consumer.skip(dropped);
-        dropped
-    } else {
-        0
     }
 }
 
@@ -941,11 +932,12 @@ where
                     for frame in data.chunks(channels) {
                         map_input_frame(frame, channel_mode, &mut mapped);
                     }
-                    for &sample in resampler.process(&mapped) {
-                        if producer.try_push(sample).is_err() {
-                            drops.fetch_add(1, Ordering::Relaxed);
-                        }
-                    }
+                    push_interleaved_frames(
+                        &mut producer,
+                        resampler.process(&mapped),
+                        pipeline_channels,
+                        &drops,
+                    );
                 } else {
                     for frame in data.chunks(channels) {
                         push_input_frame(frame, channel_mode, &mut producer, &drops);
@@ -971,16 +963,20 @@ fn push_input_frame<T, P>(
     match channel_mode {
         InputChannelMode::MonoDownmix => {
             let sample = downmix_frame(frame);
-            if producer.try_push(sample).is_err() {
+            if !try_push_frame(producer, &[sample]) {
                 drops.fetch_add(1, Ordering::Relaxed);
             }
         }
         InputChannelMode::PreserveFirst(channels) => {
-            for ch in 0..channels {
-                let sample = frame.get(ch).copied().map(f32::from_sample).unwrap_or(0.0);
-                if producer.try_push(sample).is_err() {
-                    drops.fetch_add(1, Ordering::Relaxed);
-                }
+            let channels = channels.max(1);
+            if !try_push_frame_with(producer, channels, |channel| {
+                frame
+                    .get(channel)
+                    .copied()
+                    .map(f32::from_sample)
+                    .unwrap_or(0.0)
+            }) {
+                drops.fetch_add(channels as u64, Ordering::Relaxed);
             }
         }
     }
@@ -1717,6 +1713,27 @@ mod tests {
         let mut stereo = [0.0f32; 2];
         stereo_cons.pop_slice(&mut stereo);
         assert_eq!(stereo, [0.25, -0.75]);
+    }
+
+    #[test]
+    fn cpal_reference_overflow_drops_a_whole_stereo_frame() {
+        let drops = AtomicU64::new(0);
+        let (mut producer, mut consumer) = HeapRb::<f32>::new(3).split();
+        assert!(producer.try_push(10.0).is_ok());
+        assert!(producer.try_push(11.0).is_ok());
+
+        push_input_frame(
+            &[0.25f32, -0.75],
+            InputChannelMode::PreserveFirst(2),
+            &mut producer,
+            &drops,
+        );
+
+        assert_eq!(drops.load(Ordering::Relaxed), 2);
+        let mut existing = [0.0; 2];
+        assert!(try_pop_frame(&mut consumer, &mut existing));
+        assert_eq!(existing, [10.0, 11.0]);
+        assert_eq!(consumer.occupied_len(), 0);
     }
 
     #[test]

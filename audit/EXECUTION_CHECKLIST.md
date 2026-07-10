@@ -70,12 +70,12 @@
 
 ### 4. B-25【P1】stereo reference 半帧提交与奇偶破坏
 
-- [ ] 将 reference producer/consumer 语义改为完整 frame 原子操作；容量不足时整帧丢弃，不允许只提交 L 或只消费 ch0。
-- [ ] 修复旧 `skip_stale` 路径：stereo 丢弃数必须按完整 frame 对齐，不能丢奇数 samples。
-- [ ] 统一 CPAL reference 与 Process Tap reference 的 frame push/drop 规则。
-- [ ] 增加单 L 提交、仅余一个 slot、奇数 stale count、并发交错、高频 overflow 测试。
-- [ ] 验证：`cargo test -p echoless-cli --locked`，确认 mono 路径行为不变。
-- [ ] 独立 commit：`B-25`。
+- [x] 将 reference producer/consumer 语义改为完整 frame 原子操作；容量不足时整帧丢弃，不允许只提交 L 或只消费 ch0。
+- [x] 修复旧 `skip_stale` 路径：stereo 丢弃数必须按完整 frame 对齐，不能丢奇数 samples。
+- [x] 统一 CPAL reference 与 Process Tap reference 的 frame push/drop 规则。
+- [x] 增加单 L 提交、仅余一个 slot、奇数 stale count、并发交错、高频 overflow 测试。
+- [x] 验证：`cargo test -p echoless-cli --locked`，确认 mono 路径行为不变。
+- [x] 独立 commit：`B-25`。
 
 ### 5. B-29【P2】clock-skew 单向失明与 stereo 计数单位错误
 

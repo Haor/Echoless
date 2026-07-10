@@ -14,6 +14,7 @@ use serde_json::json;
 
 use echoless_core::ReferenceChannels;
 
+use super::frame_ring::push_interleaved_frames;
 use super::resample::InterleavedInputResampler;
 
 // --stream-stdout 流头:magic "ELTP" + u32 version + u32 sample_rate + u32 channels(全 LE)。
@@ -338,17 +339,9 @@ where
                     &remapped
                 };
                 if let Some(rs) = resampler.as_mut() {
-                    for &sample in rs.process(adapted) {
-                        if producer.try_push(sample).is_err() {
-                            drops.fetch_add(1, Ordering::Relaxed);
-                        }
-                    }
+                    push_interleaved_frames(&mut producer, rs.process(adapted), channels, &drops);
                 } else {
-                    for &sample in adapted {
-                        if producer.try_push(sample).is_err() {
-                            drops.fetch_add(1, Ordering::Relaxed);
-                        }
-                    }
+                    push_interleaved_frames(&mut producer, adapted, channels, &drops);
                 }
             }
             Err(err) if err.kind() == ErrorKind::Interrupted => continue,
@@ -573,6 +566,33 @@ mod tests {
         let out: Vec<f32> = std::iter::from_fn(|| consumer.try_pop()).collect();
         assert_eq!(out, vec![0.5, 0.375]);
         assert_eq!(drops.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn process_tap_overflow_drops_a_whole_stereo_frame() {
+        let mut bytes = stream_header(48_000, 2);
+        for sample in [1.0f32, -1.0, 2.0, -2.0] {
+            bytes.extend_from_slice(&sample.to_le_bytes());
+        }
+
+        let (producer, mut consumer) = HeapRb::<f32>::new(3).split();
+        let drops = Arc::new(AtomicU64::new(0));
+        let (ready_tx, ready_rx) = sync_channel(1);
+        let exit = read_pcm_stream(
+            std::io::Cursor::new(bytes),
+            2,
+            48_000,
+            producer,
+            drops.clone(),
+            Arc::new(AtomicBool::new(true)),
+            ready_tx,
+        );
+
+        assert_eq!(ready_rx.recv().unwrap(), Ok(()));
+        assert!(matches!(exit, ReaderExit::Failed(message) if message.contains("EOF")));
+        let out: Vec<f32> = std::iter::from_fn(|| consumer.try_pop()).collect();
+        assert_eq!(out, vec![1.0, -1.0]);
+        assert_eq!(drops.load(Ordering::Relaxed), 2);
     }
 
     #[test]
