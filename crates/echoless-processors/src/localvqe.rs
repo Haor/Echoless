@@ -261,16 +261,15 @@ impl EchoProcessor for LocalVqe {
     fn set_runtime_param(&mut self, key: &str, value: &toml::Value) -> Result<bool> {
         match key {
             "noise_gate" => {
-                self.noise_gate = value
+                let candidate = value
                     .as_bool()
                     .ok_or_else(|| anyhow::anyhow!("noise_gate must be a boolean"))?;
-                self.apply_runtime_noise_gate()?;
+                self.apply_runtime_noise_gate(candidate, self.noise_gate_threshold_dbfs)?;
                 Ok(true)
             }
             "noise_gate_threshold_dbfs" => {
-                self.noise_gate_threshold_dbfs =
-                    toml_value_to_f32(value, "noise_gate_threshold_dbfs")?;
-                self.apply_runtime_noise_gate()?;
+                let candidate = toml_value_to_f32(value, "noise_gate_threshold_dbfs")?;
+                self.apply_runtime_noise_gate(self.noise_gate, candidate)?;
                 Ok(true)
             }
             _ => Ok(false),
@@ -301,10 +300,12 @@ impl EchoProcessor for LocalVqe {
 }
 
 impl LocalVqe {
-    fn apply_runtime_noise_gate(&mut self) -> Result<()> {
+    fn apply_runtime_noise_gate(&mut self, enabled: bool, threshold_dbfs: f32) -> Result<()> {
         if let Some(runtime) = self.runtime.as_mut() {
-            runtime.set_noise_gate(self.noise_gate, self.noise_gate_threshold_dbfs)?;
+            runtime.set_noise_gate(enabled, threshold_dbfs)?;
         }
+        self.noise_gate = enabled;
+        self.noise_gate_threshold_dbfs = threshold_dbfs;
         Ok(())
     }
 }
@@ -745,12 +746,16 @@ fn check_runtime(api: &LocalVqeApi, ctx: LocalVqeCtx, ret: c_int, call: &str) ->
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    type NoiseGateState = Arc<Mutex<(bool, f32)>>;
 
     struct ScriptedBackend {
         hop: usize,
         fail_calls: VecDeque<bool>,
+        fail_noise_gate_calls: VecDeque<bool>,
+        noise_gate_state: NoiseGateState,
         resets: Arc<AtomicUsize>,
     }
 
@@ -771,7 +776,11 @@ mod tests {
             self.resets.fetch_add(1, Ordering::SeqCst);
         }
 
-        fn set_noise_gate(&mut self, _enabled: bool, _threshold_dbfs: f32) -> Result<()> {
+        fn set_noise_gate(&mut self, enabled: bool, threshold_dbfs: f32) -> Result<()> {
+            if self.fail_noise_gate_calls.pop_front().unwrap_or(false) {
+                bail!("scripted localvqe noise gate failure");
+            }
+            *self.noise_gate_state.lock().unwrap() = (enabled, threshold_dbfs);
             Ok(())
         }
     }
@@ -780,15 +789,28 @@ mod tests {
         hop: usize,
         fail_calls: impl IntoIterator<Item = bool>,
     ) -> (LocalVqe, Arc<AtomicUsize>) {
+        let (processor, resets, _) =
+            scripted_processor_with_noise_gate_failures(hop, fail_calls, []);
+        (processor, resets)
+    }
+
+    fn scripted_processor_with_noise_gate_failures(
+        hop: usize,
+        fail_calls: impl IntoIterator<Item = bool>,
+        fail_noise_gate_calls: impl IntoIterator<Item = bool>,
+    ) -> (LocalVqe, Arc<AtomicUsize>, NoiseGateState) {
         let resets = Arc::new(AtomicUsize::new(0));
+        let noise_gate_state = Arc::new(Mutex::new((false, DEFAULT_NOISE_GATE_THRESHOLD_DBFS)));
         let mut processor = LocalVqe::new();
         processor.frame_out.resize(hop, 0.0);
         processor.runtime = Some(Box::new(ScriptedBackend {
             hop,
             fail_calls: fail_calls.into_iter().collect(),
+            fail_noise_gate_calls: fail_noise_gate_calls.into_iter().collect(),
+            noise_gate_state: noise_gate_state.clone(),
             resets: resets.clone(),
         }));
-        (processor, resets)
+        (processor, resets, noise_gate_state)
     }
 
     fn process_block(processor: &mut LocalVqe, value: f32, hop: usize) -> Vec<f32> {
@@ -923,6 +945,54 @@ mod tests {
 
         assert!(processor.noise_gate);
         assert_eq!(processor.noise_gate_threshold_dbfs, -40.5);
+    }
+
+    #[test]
+    fn runtime_noise_gate_setter_failure_keeps_previous_gate_config() {
+        let (mut processor, resets, backend_state) =
+            scripted_processor_with_noise_gate_failures(4, [], [false, true]);
+        processor
+            .set_runtime_param("noise_gate_threshold_dbfs", &toml::Value::Float(-40.5))
+            .unwrap();
+
+        let err = processor
+            .set_runtime_param("noise_gate", &toml::Value::Boolean(true))
+            .unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("scripted localvqe noise gate failure"));
+        assert!(!processor.noise_gate);
+        assert_eq!(processor.noise_gate_threshold_dbfs, -40.5);
+        assert_eq!(*backend_state.lock().unwrap(), (false, -40.5));
+        assert_eq!(resets.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn runtime_noise_gate_setter_failure_keeps_previous_threshold_config() {
+        let (mut processor, resets, backend_state) =
+            scripted_processor_with_noise_gate_failures(4, [], [false, true]);
+        processor
+            .set_runtime_param("noise_gate", &toml::Value::Boolean(true))
+            .unwrap();
+
+        let err = processor
+            .set_runtime_param("noise_gate_threshold_dbfs", &toml::Value::Float(-40.5))
+            .unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("scripted localvqe noise gate failure"));
+        assert!(processor.noise_gate);
+        assert_eq!(
+            processor.noise_gate_threshold_dbfs,
+            DEFAULT_NOISE_GATE_THRESHOLD_DBFS
+        );
+        assert_eq!(
+            *backend_state.lock().unwrap(),
+            (true, DEFAULT_NOISE_GATE_THRESHOLD_DBFS)
+        );
+        assert_eq!(resets.load(Ordering::SeqCst), 0);
     }
 
     #[test]
