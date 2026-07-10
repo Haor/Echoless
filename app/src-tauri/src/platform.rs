@@ -115,38 +115,25 @@ pub(crate) fn validate_browser_url(url: &str) -> Result<String, String> {
         }
         return Err("only the system privacy settings pane is allowed".to_string());
     }
-    if !trimmed.starts_with("https://") {
+    let parsed = tauri::Url::parse(trimmed).map_err(|_| "URL is not valid".to_string())?;
+    if parsed.scheme() != "https" {
         return Err("only https URLs are allowed".to_string());
     }
-
-    let host = https_url_host(trimmed).ok_or_else(|| "URL is missing a host".to_string())?;
-    if !is_allowed_browser_host(&host) {
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err("URL credentials are not allowed".to_string());
+    }
+    if parsed.port().is_some_and(|port| port != 443) {
+        return Err("only the default HTTPS port is allowed".to_string());
+    }
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| "URL is missing a host".to_string())?
+        .trim_end_matches('.');
+    if !is_allowed_browser_host(host) {
         return Err("URL host is not in the allow list".to_string());
     }
 
-    Ok(trimmed.to_string())
-}
-
-fn https_url_host(url: &str) -> Option<String> {
-    let rest = url.strip_prefix("https://")?;
-    let host_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
-    if host_end == 0 {
-        return None;
-    }
-    let host_port = &rest[..host_end];
-    let host = host_port
-        .rsplit_once('@')
-        .map(|(_, host)| host)
-        .unwrap_or(host_port);
-    let host = host
-        .split_once(':')
-        .map(|(host, _)| host)
-        .unwrap_or(host)
-        .trim_end_matches('.');
-    if host.is_empty() {
-        return None;
-    }
-    Some(host.to_ascii_lowercase())
+    Ok(parsed.into())
 }
 
 fn is_allowed_browser_host(host: &str) -> bool {

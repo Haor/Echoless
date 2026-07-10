@@ -349,6 +349,11 @@ fn validates_only_allowlisted_browser_urls() {
         validate_browser_url("https://aka.ms/vs/17/release/vc_redist.x64.exe").unwrap(),
         "https://aka.ms/vs/17/release/vc_redist.x64.exe"
     );
+    assert_eq!(
+        validate_browser_url("HTTPS://GITHUB.COM:443/Haor/Echoless").unwrap(),
+        "https://github.com/Haor/Echoless"
+    );
+    assert!(validate_browser_url("https://github.com./Haor/Echoless").is_ok());
     // 系统设置深链白名单(隐私面板跳转)。
     assert_eq!(
         validate_browser_url(
@@ -369,6 +374,12 @@ fn validates_only_allowlisted_browser_urls() {
         "https://example.com/\ncmd",
         "http://vb-audio.com/Cable/",
         "https://vb-audio.com.evil.example/Cable/",
+        "https://evil.example\\@github.com/Haor/Echoless",
+        "https://user:password@github.com/Haor/Echoless",
+        "https://github.com@evil.example/Haor/Echoless",
+        "https://github.com%2f.evil.example/Haor/Echoless",
+        "https://github.com%40evil.example/Haor/Echoless",
+        "https://github.com:444/Haor/Echoless",
         "x-apple.systempreferences:com.apple.preference.security?General",
     ] {
         assert!(validate_browser_url(bad).is_err(), "{bad}");

@@ -155,11 +155,11 @@
 
 ### 12. S-14【P3】URL allowlist 标准化解析
 
-- [ ] 用已有 Tauri/URL 类型替换 `app/src-tauri/src/platform.rs` 的手写 authority parser；不新增依赖。
-- [ ] 拒绝 credentials，按规范化后的 scheme/hostname/port 检查 allowlist。
-- [ ] 扩展现有测试：backslash、userinfo、encoded delimiter、port、大小写、尾点与现有合法 URL。
-- [ ] 验证：`(cd app/src-tauri && cargo test --locked)`。
-- [ ] 独立 commit：`S-14`。
+- [x] 用已有 Tauri/URL 类型替换 `app/src-tauri/src/platform.rs` 的手写 authority parser；不新增依赖。
+- [x] 拒绝 credentials，按规范化后的 scheme/hostname/port 检查 allowlist。
+- [x] 扩展现有测试：backslash、userinfo、encoded delimiter、port、大小写、尾点与现有合法 URL。
+- [x] 验证：`(cd app/src-tauri && cargo test --locked)`。
+- [x] 独立 commit：`S-14`。
 
 ### 13. T-12【P2】增加 PR 自动质量门
 
