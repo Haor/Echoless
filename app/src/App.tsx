@@ -111,6 +111,7 @@ import {
 } from "./runtimeTelemetry";
 import { REQUIRED_RUN_CONTROLS } from "./runtimeControls";
 import { createAsyncListenerScope } from "./asyncListener";
+import { settleBootGate } from "./bootGate";
 
 const appWindow = getCurrentWindow();
 
@@ -1244,10 +1245,11 @@ function AppShell() {
     const lift = () => {
       if (!cancelled) setBooted(true);
     };
-    Promise.race([
-      document.fonts?.ready ?? Promise.resolve(),
-      new Promise((r) => setTimeout(r, 1200)),
-    ]).then(lift);
+    void settleBootGate(
+      document.fonts?.ready,
+      new Promise((resolve) => setTimeout(resolve, 1200)),
+      lift,
+    );
     return () => {
       cancelled = true;
     };
