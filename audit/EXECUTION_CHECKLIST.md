@@ -147,11 +147,11 @@
 
 ### 11. B-32【P3】日志文件名秒级碰撞
 
-- [ ] 在 `app/src-tauri/src/logging.rs` 为日志文件名加入 PID 与高精度/冲突 attempt，使用 `create_new(true)` 保证一启动一文件。
-- [ ] 保持单文件 8 MiB、7 天、20 文件的现有清理策略。
-- [ ] 增加同秒并发 init/冲突测试，确认文件不共享且 cap 独立生效。
-- [ ] 验证：`(cd app/src-tauri && cargo test --locked)`。
-- [ ] 独立 commit：`B-32`。
+- [x] 在 `app/src-tauri/src/logging.rs` 为日志文件名加入 PID 与高精度/冲突 attempt，使用 `create_new(true)` 保证一启动一文件。
+- [x] 保持单文件 8 MiB、7 天、20 文件的现有清理策略。
+- [x] 增加同秒并发 init/冲突测试，确认文件不共享且 cap 独立生效。
+- [x] 验证：`(cd app/src-tauri && cargo test --locked)`。
+- [x] 独立 commit：`B-32`。
 
 ### 12. S-14【P3】URL allowlist 标准化解析
 

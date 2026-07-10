@@ -10,14 +10,15 @@
 //   - 单文件 MAX_BYTES 封顶,超限写一行截断标记后本次不再落盘
 //     (防 stderr 风暴刷爆磁盘;事件转发不受影响,UI 照常)。
 use std::fs::{self, File, OpenOptions};
-use std::io::Write;
-use std::path::PathBuf;
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const KEEP_DAYS: u64 = 7;
 const KEEP_FILES: usize = 20;
 const MAX_BYTES: u64 = 8 * 1024 * 1024;
+const CREATE_ATTEMPTS: usize = 1_000;
 
 struct Sink {
     file: File,
@@ -36,16 +37,11 @@ pub(crate) fn init(app_version: &str) {
         return;
     }
     prune(&dir);
-    let path = dir.join(format!("echoless-{}.log", file_stamp()));
-    let Ok(file) = OpenOptions::new().create(true).append(true).open(&path) else {
+    let Ok((_path, sink)) = create_unique_sink(&dir, &file_stamp(), std::process::id()) else {
         return;
     };
     let _ = LOG_DIR.set(dir);
-    let _ = SINK.set(Mutex::new(Some(Sink {
-        file,
-        written: 0,
-        truncated: false,
-    })));
+    let _ = SINK.set(Mutex::new(Some(sink)));
     log(
         "info",
         "app",
@@ -62,12 +58,19 @@ pub(crate) fn log(level: &str, source: &str, msg: &str) {
     let Some(lock) = SINK.get() else { return };
     let Ok(mut guard) = lock.lock() else { return };
     let Some(sink) = guard.as_mut() else { return };
+    append_line(
+        sink,
+        &format!("{} [{level}] {source}: {msg}\n", line_stamp()),
+        MAX_BYTES,
+    );
+}
+
+fn append_line(sink: &mut Sink, line: &str, max_bytes: u64) {
     if sink.truncated {
         return;
     }
-    let line = format!("{} [{level}] {source}: {msg}\n", line_stamp());
     let bytes = line.len() as u64;
-    if sink.written + bytes > MAX_BYTES {
+    if sink.written + bytes > max_bytes {
         let _ = sink.file.write_all(
             format!("{} [warn] log: size cap reached, truncated\n", line_stamp()).as_bytes(),
         );
@@ -79,8 +82,32 @@ pub(crate) fn log(level: &str, source: &str, msg: &str) {
     }
 }
 
+fn create_unique_sink(dir: &Path, stamp: &str, pid: u32) -> io::Result<(PathBuf, Sink)> {
+    for attempt in 0..CREATE_ATTEMPTS {
+        let path = dir.join(format!("echoless-{stamp}-p{pid}-{attempt:03}.log"));
+        match OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(file) => {
+                return Ok((
+                    path,
+                    Sink {
+                        file,
+                        written: 0,
+                        truncated: false,
+                    },
+                ));
+            }
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(err) => return Err(err),
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        format!("failed to reserve a unique log file after {CREATE_ATTEMPTS} attempts"),
+    ))
+}
+
 /// 清理:先删超龄,再按 mtime 新→旧只保留 KEEP_FILES-1 个(本次启动还要新建一个)。
-fn prune(dir: &std::path::Path) {
+fn prune(dir: &Path) {
     let Ok(entries) = fs::read_dir(dir) else {
         return;
     };
@@ -127,25 +154,33 @@ pub(crate) fn frontend_log(level: String, message: String) {
 
 // ---- UTC 时间戳(不引 chrono:civil-from-days 算法,够用) ----
 
-fn now_parts() -> (u64, u64, u64, u64, u64, u64) {
-    let secs = SystemTime::now()
+fn now_parts() -> (u64, u64, u64, u64, u64, u64, u32) {
+    let elapsed = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+        .unwrap_or_default();
+    let secs = elapsed.as_secs();
     let days = secs / 86_400;
     let (y, m, d) = civil_from_days(days as i64);
     let rem = secs % 86_400;
-    (y, m, d, rem / 3600, (rem % 3600) / 60, rem % 60)
+    (
+        y,
+        m,
+        d,
+        rem / 3600,
+        (rem % 3600) / 60,
+        rem % 60,
+        elapsed.subsec_nanos(),
+    )
 }
 
 fn line_stamp() -> String {
-    let (y, mo, d, h, mi, s) = now_parts();
+    let (y, mo, d, h, mi, s, _) = now_parts();
     format!("{y:04}-{mo:02}-{d:02} {h:02}:{mi:02}:{s:02}Z")
 }
 
 fn file_stamp() -> String {
-    let (y, mo, d, h, mi, s) = now_parts();
-    format!("{y:04}{mo:02}{d:02}-{h:02}{mi:02}{s:02}")
+    let (y, mo, d, h, mi, s, nanos) = now_parts();
+    format!("{y:04}{mo:02}{d:02}-{h:02}{mi:02}{s:02}-{nanos:09}")
 }
 
 /// Howard Hinnant 的 civil_from_days(公历,proleptic)。
@@ -166,11 +201,79 @@ fn civil_from_days(z: i64) -> (u64, u64, u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
+    use std::sync::{Arc, Barrier};
+
+    struct TestDir(PathBuf);
+
+    impl TestDir {
+        fn new(label: &str) -> Self {
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let sequence = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "echoless-logging-{label}-{}-{sequence}",
+                std::process::id()
+            ));
+            fs::create_dir_all(&path).expect("create test log directory");
+            Self(path)
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
 
     #[test]
     fn civil_from_days_known_dates() {
         assert_eq!(civil_from_days(0), (1970, 1, 1));
         assert_eq!(civil_from_days(19_723), (2024, 1, 1)); // 2024-01-01
         assert_eq!(civil_from_days(20_643), (2026, 7, 9)); // 本 RCA 当天
+    }
+
+    #[test]
+    fn same_stamp_concurrent_creation_reserves_distinct_files() {
+        const WORKERS: usize = 8;
+        let dir = TestDir::new("concurrent");
+        let path = Arc::new(dir.0.clone());
+        let barrier = Arc::new(Barrier::new(WORKERS));
+        let workers: Vec<_> = (0..WORKERS)
+            .map(|_| {
+                let path = Arc::clone(&path);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    let (path, _sink) =
+                        create_unique_sink(&path, "20260710-010203-000000000", 1234)
+                            .expect("reserve unique log");
+                    path
+                })
+            })
+            .collect();
+
+        let paths: HashSet<_> = workers
+            .into_iter()
+            .map(|worker| worker.join().expect("worker must finish"))
+            .collect();
+
+        assert_eq!(paths.len(), WORKERS);
+        assert!(paths.iter().all(|path| path.exists()));
+    }
+
+    #[test]
+    fn colliding_sessions_keep_independent_size_caps() {
+        let dir = TestDir::new("caps");
+        let (_, mut first) = create_unique_sink(&dir.0, "same", 7).unwrap();
+        let (_, mut second) = create_unique_sink(&dir.0, "same", 7).unwrap();
+
+        append_line(&mut first, "1234\n", 5);
+        append_line(&mut first, "x\n", 5);
+        append_line(&mut second, "z\n", 5);
+
+        assert_eq!(first.written, 5);
+        assert!(first.truncated);
+        assert_eq!(second.written, 2);
+        assert!(!second.truncated);
     }
 }
