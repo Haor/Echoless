@@ -113,9 +113,21 @@ UI cleanup.
   zero reference.
 - Restarting the engine can no longer let a stale sidecar overwrite the active
   run, tray state, or frontend status.
+- Engine stop/restart and live controls stay responsive when sidecar status or
+  control pipes stall; shutdown now has bounded fallbacks instead of freezing
+  the desktop UI.
+- Re-selecting the active engine no longer reloads it. When NVAFX is selected,
+  its fixed `48 kHz / 10 ms / mono` pipeline is applied atomically and the three
+  incompatible Advanced choices are locked.
+- A rejected font-readiness promise no longer leaves the boot screen invisible,
+  and delayed desktop event subscriptions are fully removed after a page remount.
+- Launching Echoless again focuses the existing desktop window instead of
+  starting a second audio pipeline against the same devices and data directory.
 - LocalVQE native processing failures now clear stale queued audio, preserve
   failure telemetry, and pass through the current microphone frame while the
   backend recovers instead of accumulating or replaying old samples.
+- LocalVQE runtime tuning is now transactional: a native noise-gate setter error
+  leaves the last accepted gate and threshold in effect.
 - Stereo reference audio stays frame-aligned when its ring buffer is full or
   stale data is trimmed, preventing left/right channel desynchronization under
   pressure.
