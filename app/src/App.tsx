@@ -79,6 +79,7 @@ import {
   observeRunStart,
   type RunGeneration,
 } from "./runGeneration";
+import { controlErrorMessage } from "./runEventDisplay";
 import {
   RuntimeStatusStrip,
   RuntimeSubline,
@@ -907,7 +908,7 @@ function useRunLifecycle({
                 ...clearBypassPending(state),
               }));
             }
-            noteError(`${ev.cmd}: ${ev.message}`);
+            noteError(controlErrorMessage(ev));
             return;
           }
           // 实时音量变更回执:值由前端驱动,无需处理(否则会被当成 status 读到一堆 undefined,

@@ -24,8 +24,8 @@
 | 3 | B-27 | 第一 | done | `0de5877` | processors 44 passed / 3 ignored；clippy clean | native error 立即 reset 并清空 near/far/out；recovery warm-up 期 near passthrough；故障注入覆盖连续/瞬态/重复恢复 |
 | 4 | B-25 | 第一 | done | `9ad04cb` | CLI 88 passed；clippy clean | CPAL/Process Tap 共用完整 frame push；adaptive/direct consumer 只弹整帧；stale skip 按声道对齐；drop 计数单位留给 B-29 收口 |
 | 5 | B-29 | 第一 | done | `360eb06` | CLI 90 passed；clippy clean | reference/output loss 统一 frame 单位；真实 underrun 帧数；有符号 ±22.4% 双向检测；live/summary 共用 snapshot 与 direction；告警阈值不变 |
-| 6 | T-11 | 第一 | implemented-pending-remote-ci | this commit | Tauri 23 passed；clippy clean；workflow YAML parsed | Windows + macOS matrix 新增独立 backend test step；保留 clippy/build/smoke；远程日志待推送后验收 |
-| 7 | A-09 | 第二 | pending | — | — | complete frontend event types |
+| 6 | T-11 | 第一 | implemented-pending-remote-ci | `b3f8e90` | Tauri 23 passed；clippy clean；workflow YAML parsed | Windows + macOS matrix 新增独立 backend test step；保留 clippy/build/smoke；远程日志待推送后验收 |
+| 7 | A-09 | 第二 | done-pending-commit | this commit | frontend 31 passed + tsc + build | 补齐 17 个 runtime discriminator 的 union；覆盖 stream/skew/serde error、status correlation/direction 与 null control command；复用 run_id |
 | 8 | S-13 | 第二 | pending | — | — | text-only scramble animation |
 | 9 | B-30 | 第二 | pending | — | — | CoreAudio listener lifetime |
 | 10 | B-31 | 第二 | pending | — | — | TOML control escaping |

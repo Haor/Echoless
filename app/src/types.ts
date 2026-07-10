@@ -121,6 +121,8 @@ export interface RuntimeStatus {
   output_skew_pct?: number;
   ref_skew_pct?: number;
   clock_skew_warning?: boolean;
+  clock_skew_ref_correlated?: boolean;
+  clock_skew_direction?: ClockSkewDirection | null;
   node_process_time_ms: number;
   runtime_errors: number;
   diverged: boolean;
@@ -166,7 +168,33 @@ export interface DiagnosticsStoppingEvent {
 }
 export interface ControlErrorEvent {
   type: "control_error";
-  cmd: string;
+  cmd: string | null;
+  message: string;
+}
+export interface StreamErrorEvent {
+  type: "stream_error";
+  stream: string;
+  message: string;
+  fatal: boolean;
+}
+export type ClockSkewDirection =
+  | "output_faster_than_capture"
+  | "capture_faster_than_output";
+interface ClockSkewEventFields {
+  output_skew_pct: number;
+  ref_skew_pct: number;
+  ref_correlated: boolean;
+  direction: ClockSkewDirection | null;
+  hint: string;
+}
+export interface ClockSkewWarningEvent extends ClockSkewEventFields {
+  type: "clock_skew_warning";
+}
+export interface ClockSkewResolvedEvent extends ClockSkewEventFields {
+  type: "clock_skew_resolved";
+}
+export interface RuntimeErrorEvent {
+  type: "error";
   message: string;
 }
 // set_output_level 实时生效后的回执(值由前端驱动,UI 仅忽略)。
@@ -236,6 +264,10 @@ export type RunEventPayload =
   | DiagnosticsStartedEvent
   | DiagnosticsStoppingEvent
   | ControlErrorEvent
+  | StreamErrorEvent
+  | ClockSkewWarningEvent
+  | ClockSkewResolvedEvent
+  | RuntimeErrorEvent
   | OutputLevelChangedEvent
   | NearDelayChangedEvent
   | InitialDelayChangedEvent

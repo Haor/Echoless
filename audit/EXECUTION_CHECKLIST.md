@@ -98,13 +98,13 @@
 
 ### 第一梯队批次门
 
-- [ ] `cargo fmt --all --check`
-- [ ] `cargo test --workspace --locked`
-- [ ] `cargo clippy --workspace --all-targets --locked -- -D warnings`
-- [ ] `(cd aec3 && cargo fmt --all --check && cargo test --workspace --locked && cargo clippy --workspace --all-targets --locked -- -D warnings)`
-- [ ] `(cd app/src-tauri && cargo fmt --check && cargo test --locked && cargo clippy --all-targets --locked -- -D warnings)`
-- [ ] `(cd app && pnpm exec tsc --noEmit && pnpm test && pnpm build)`
-- [ ] 检查 `git status --short`，确认只有计划内改动。
+- [x] `cargo fmt --all --check`
+- [x] `cargo test --workspace --locked`
+- [x] `cargo clippy --workspace --all-targets --locked -- -D warnings`
+- [x] `(cd aec3 && cargo fmt --all --check && cargo test --workspace --locked && cargo clippy --workspace --all-targets --locked -- -D warnings)`
+- [x] `(cd app/src-tauri && cargo fmt --check && cargo test --locked && cargo clippy --all-targets --locked -- -D warnings)`
+- [x] `(cd app && pnpm exec tsc --noEmit && pnpm test && pnpm build)`
+- [x] 检查 `git status --short`，确认只有计划内改动。
 
 ---
 
@@ -112,14 +112,14 @@
 
 ### 7. A-09 缩水版【P3】补齐前端事件类型
 
-- [ ] 在 `app/src/types.ts` 补完整事件成员：`stream_error`、`clock_skew_warning`、`clock_skew_resolved`、serde 序列化失败兜底的 `error`。
-- [ ] 为 clock-skew 事件声明 `output_skew_pct`、`ref_skew_pct`、`ref_correlated`、`hint`；为 `RuntimeStatus` 补可选 `clock_skew_ref_correlated`。
-- [ ] 将 `control_error.cmd` 改为 `string | null`，并给 null command 提供明确显示文案。
-- [ ] 复用 B-28 的 `run_id`，不引入 schema/codegen/golden fixtures。
-- [ ] 保持现有 unknown-event 白名单与 ErrorBoundary 行为不变。
-- [ ] 增加类型/消费测试，覆盖四类新增事件、`control_error.cmd=null` 与包含 `clock_skew_ref_correlated` 的 status。
-- [ ] 验证：`(cd app && pnpm exec tsc --noEmit && pnpm test)`，并逐项对照 Rust 当前发出的全部 `type` discriminator。
-- [ ] 独立 commit：`A-09`。
+- [x] 在 `app/src/types.ts` 补完整事件成员：`stream_error`、`clock_skew_warning`、`clock_skew_resolved`、serde 序列化失败兜底的 `error`。
+- [x] 为 clock-skew 事件声明 `output_skew_pct`、`ref_skew_pct`、`ref_correlated`、`hint`；为 `RuntimeStatus` 补可选 `clock_skew_ref_correlated`。
+- [x] 将 `control_error.cmd` 改为 `string | null`，并给 null command 提供明确显示文案。
+- [x] 复用 B-28 的 `run_id`，不引入 schema/codegen/golden fixtures。
+- [x] 保持现有 unknown-event 白名单与 ErrorBoundary 行为不变。
+- [x] 增加类型/消费测试，覆盖四类新增事件、`control_error.cmd=null` 与包含 `clock_skew_ref_correlated` 的 status。
+- [x] 验证：`(cd app && pnpm exec tsc --noEmit && pnpm test)`，并逐项对照 Rust 当前发出的全部 `type` discriminator。
+- [x] 独立 commit：`A-09`。
 
 ### 8. S-13【P2】ScrambleText 设备名 HTML 注入
 
