@@ -1,7 +1,9 @@
+use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{mpsc, Arc, Mutex, MutexGuard};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
@@ -16,7 +18,188 @@ pub(crate) const NVAFX_INSTALL_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 // download-install 含 ~1 GB 下载:10 分钟对慢速链路(< ~14 Mbps)会中途被杀,给 30 分钟。
 pub(crate) const NVAFX_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 pub(crate) const MODEL_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+pub(crate) const RUN_CONTROL_ACK_TIMEOUT: Duration = Duration::from_millis(250);
+const RUN_CONTROL_QUEUE_CAPACITY: usize = 8;
+const RUN_CONTROL_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(100);
 pub(crate) type RunId = u64;
+
+struct RunControlRequest {
+    line: String,
+    ack: mpsc::SyncSender<Result<(), String>>,
+}
+
+enum RunControlMessage {
+    Write(RunControlRequest),
+    Shutdown,
+}
+
+#[derive(Clone)]
+pub(crate) struct RunControlSender {
+    sender: mpsc::SyncSender<RunControlMessage>,
+    closing: Arc<AtomicBool>,
+}
+
+impl RunControlSender {
+    pub(crate) fn send_line_with_timeout(
+        &self,
+        line: &str,
+        timeout: Duration,
+    ) -> Result<(), String> {
+        if self.closing.load(Ordering::SeqCst) {
+            return Err("run control writer is not running".to_string());
+        }
+        let (ack, confirmation) = mpsc::sync_channel(1);
+        let request = RunControlMessage::Write(RunControlRequest {
+            line: line.to_string(),
+            ack,
+        });
+        match self.sender.try_send(request) {
+            Ok(()) => {}
+            Err(mpsc::TrySendError::Full(_)) => {
+                return Err("run control queue is full".to_string());
+            }
+            Err(mpsc::TrySendError::Disconnected(_)) => {
+                return Err("run control writer is not running".to_string());
+            }
+        }
+
+        match confirmation.recv_timeout(timeout) {
+            Ok(result) => result,
+            Err(mpsc::RecvTimeoutError::Timeout) => Err(format!(
+                "run control writer timed out after {}ms",
+                timeout.as_millis()
+            )),
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                Err("run control writer exited before acknowledging command".to_string())
+            }
+        }
+    }
+}
+
+struct WriterDone(Option<mpsc::Sender<()>>);
+
+impl Drop for WriterDone {
+    fn drop(&mut self) {
+        if let Some(done) = self.0.take() {
+            let _ = done.send(());
+        }
+    }
+}
+
+pub(crate) struct RunControlWriter {
+    sender: Option<mpsc::SyncSender<RunControlMessage>>,
+    closing: Arc<AtomicBool>,
+    done: mpsc::Receiver<()>,
+    join: Option<JoinHandle<()>>,
+}
+
+impl RunControlWriter {
+    pub(crate) fn spawn<W>(writer: W) -> Result<Self, String>
+    where
+        W: Write + Send + 'static,
+    {
+        Self::spawn_with_capacity(writer, RUN_CONTROL_QUEUE_CAPACITY)
+    }
+
+    pub(crate) fn spawn_with_capacity<W>(writer: W, capacity: usize) -> Result<Self, String>
+    where
+        W: Write + Send + 'static,
+    {
+        let (sender, receiver) = mpsc::sync_channel(capacity);
+        let (done_sender, done) = mpsc::channel();
+        let closing = Arc::new(AtomicBool::new(false));
+        let worker_closing = closing.clone();
+        let join = std::thread::Builder::new()
+            .name("echoless-control-writer".to_string())
+            .spawn(move || {
+                let _done = WriterDone(Some(done_sender));
+                let mut writer = writer;
+                while let Ok(message) = receiver.recv() {
+                    if worker_closing.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    match message {
+                        RunControlMessage::Shutdown => break,
+                        RunControlMessage::Write(request) => {
+                            let result = write_run_control(&mut writer, &request.line);
+                            let failed = result.is_err();
+                            let _ = request.ack.send(result);
+                            if failed || worker_closing.load(Ordering::SeqCst) {
+                                break;
+                            }
+                        }
+                    }
+                }
+            })
+            .map_err(|err| format!("spawn run control writer failed: {err}"))?;
+        Ok(Self {
+            sender: Some(sender),
+            closing,
+            done,
+            join: Some(join),
+        })
+    }
+
+    pub(crate) fn sender(&self) -> Option<RunControlSender> {
+        self.sender.as_ref().map(|sender| RunControlSender {
+            sender: sender.clone(),
+            closing: self.closing.clone(),
+        })
+    }
+
+    fn begin_shutdown(&mut self) {
+        self.closing.store(true, Ordering::SeqCst);
+        if let Some(sender) = self.sender.take() {
+            let _ = sender.try_send(RunControlMessage::Shutdown);
+        }
+    }
+
+    fn wait_for_done(&mut self, timeout: Duration) -> bool {
+        if self.join.is_none() {
+            return true;
+        }
+        let completed = match self.done.recv_timeout(timeout) {
+            Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => true,
+            Err(mpsc::RecvTimeoutError::Timeout) => false,
+        };
+        if completed {
+            if let Some(join) = self.join.take() {
+                let _ = join.join();
+            }
+        }
+        completed
+    }
+
+    pub(crate) fn shutdown_with_timeout(&mut self, timeout: Duration) -> bool {
+        self.begin_shutdown();
+        self.wait_for_done(timeout)
+    }
+
+    fn finish_after_child_shutdown(&mut self, timeout: Duration) {
+        if !self.wait_for_done(timeout) {
+            drop(self.join.take());
+        }
+    }
+}
+
+impl Drop for RunControlWriter {
+    fn drop(&mut self) {
+        self.begin_shutdown();
+        if !self.wait_for_done(RUN_CONTROL_SHUTDOWN_TIMEOUT) {
+            drop(self.join.take());
+        }
+    }
+}
+
+fn write_run_control(writer: &mut impl Write, line: &str) -> Result<(), String> {
+    writer
+        .write_all(line.as_bytes())
+        .and_then(|_| writer.write_all(b"\n"))
+        .map_err(|err| format!("write run control failed: {err}"))?;
+    writer
+        .flush()
+        .map_err(|err| format!("flush run control failed: {err}"))
+}
 
 /// 运行中的 echoless run 子进程 + 它专属的「正在被主动停止」标记。
 /// 每个子进程独立持有 stopping flag,其 stdout reader 退出时据此判断本次退出是
@@ -26,23 +209,32 @@ pub(crate) struct RunChild {
     pub(crate) child: Child,
     pub(crate) stopping: Arc<AtomicBool>,
     pub(crate) config_path: PathBuf,
+    pub(crate) control_writer: Option<RunControlWriter>,
 }
 
-/// RAII 兜底(审计 B-01):RunChild 无论从哪条路径被丢弃(terminate_run、
-/// mark_run_exited、start_run 幂等回收、ExitRequested),都走同一套
-/// 优雅停机 + 临时配置清理,杜绝孤儿 CLI。
+/// RAII 兜底(审计 B-01/B-34):RunChild 无论从哪条路径被丢弃，都先请求
+/// writer 在短超时内 drop stdin；若 writer 阻塞则继续有限 child shutdown/kill，
+/// kill 后仅在 done signal 已到达时 join，否则安全 detach。
 impl Drop for RunChild {
     fn drop(&mut self) {
         self.stopping.store(true, Ordering::SeqCst);
+        let writer_finished = match self.control_writer.as_mut() {
+            Some(writer) => writer.shutdown_with_timeout(RUN_CONTROL_SHUTDOWN_TIMEOUT),
+            None => true,
+        };
         shutdown_child_gracefully(&mut self.child);
+        if !writer_finished {
+            if let Some(writer) = self.control_writer.as_mut() {
+                writer.finish_after_child_shutdown(RUN_CONTROL_SHUTDOWN_TIMEOUT);
+            }
+        }
         crate::platform::cleanup_run_config(&self.config_path);
     }
 }
 
-/// 优雅停机协议(审计 B-01):先关 stdin(CLI 侧「stdin EOF = 停机」契约,
-/// 让 CLI 正常走 Drop 链回收 macOS Process Tap helper),限时等待退出,
-/// 超时才兜底 kill。此前直接 kill(SIGKILL)会跳过 CLI 清理,macOS 上
-/// 每次停止都遗留 helper 持续占用系统音频 tap(录音指示器长亮)。
+/// 优雅停机协议(审计 B-01):正常 RunChild 路径已由 control writer 关闭 stdin；
+/// 启动失败等 writer 尚未接管的路径仍在这里关闭 child.stdin。随后限时等待，
+/// 超时才兜底 kill，保住 CLI 的 stdin EOF 清理契约且不无限阻塞。
 pub(crate) fn shutdown_child_gracefully(child: &mut Child) {
     drop(child.stdin.take());
     for _ in 0..40 {
@@ -154,6 +346,20 @@ pub(crate) fn cancel_run_start(state: &RunState, run_id: RunId) -> bool {
 /// status/exit payload 自带 run_id，由前端拒绝晚到事件。
 pub(crate) fn is_active_run(state: &RunState, run_id: RunId) -> bool {
     run_state_guard(state).active_run_id == Some(run_id)
+}
+
+/// 只在短锁内复制控制队列 sender；enqueue 与 ack 等待由调用者在锁外完成。
+pub(crate) fn run_control_sender(state: &RunState) -> Result<RunControlSender, String> {
+    let guard = run_state_guard(state);
+    let child = guard.child.as_ref().ok_or("not running")?;
+    if guard.active_run_id != Some(child.run_id) {
+        return Err("run state generation mismatch".to_string());
+    }
+    child
+        .control_writer
+        .as_ref()
+        .and_then(RunControlWriter::sender)
+        .ok_or("run control writer is not running".to_string())
 }
 
 pub(crate) fn terminate_run(state: &RunState) -> Option<RunId> {

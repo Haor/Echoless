@@ -1,4 +1,4 @@
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -12,9 +12,10 @@ use crate::bin_resolve::{echoless_command, suppress_child_console};
 use crate::platform::{cleanup_run_config, transient_config_dir, write_transient_config_toml};
 use crate::proc::{
     cancel_run_start, commit_run_finalization, commit_run_start, is_active_run,
-    parse_jsonl_line_event, push_tail_line, reserve_run_start, run_json_async, run_state_guard,
-    shutdown_child_gracefully, terminate_run, JsonlLineEvent, RunChild, RunFinalization, RunId,
-    RunState, PROBE_DELAY_TIMEOUT, STREAM_TAIL_LIMIT_BYTES, VALIDATE_COMMAND_TIMEOUT,
+    parse_jsonl_line_event, push_tail_line, reserve_run_start, run_control_sender, run_json_async,
+    shutdown_child_gracefully, terminate_run, JsonlLineEvent, RunChild, RunControlWriter,
+    RunFinalization, RunId, RunState, PROBE_DELAY_TIMEOUT, RUN_CONTROL_ACK_TIMEOUT,
+    STREAM_TAIL_LIMIT_BYTES, VALIDATE_COMMAND_TIMEOUT,
 };
 use crate::tray::update_tray_tooltip;
 
@@ -277,11 +278,31 @@ pub(crate) fn start_run(
     // 本子进程专属的 stopping flag:被主动停/重启时置 true。
     let stopping = Arc::new(AtomicBool::new(false));
 
+    let stdin = match child.stdin.take() {
+        Some(stdin) => stdin,
+        None => {
+            cancel_run_start(&state, run_id);
+            shutdown_child_gracefully(&mut child);
+            cleanup_run_config(&path);
+            return Err("no stdin".to_string());
+        }
+    };
+    let control_writer = match RunControlWriter::spawn(stdin) {
+        Ok(writer) => writer,
+        Err(err) => {
+            cancel_run_start(&state, run_id);
+            shutdown_child_gracefully(&mut child);
+            cleanup_run_config(&path);
+            return Err(err);
+        }
+    };
+
     // stdout = JSONL status events
     let stdout = match child.stdout.take() {
         Some(stdout) => stdout,
         None => {
             cancel_run_start(&state, run_id);
+            drop(control_writer);
             shutdown_child_gracefully(&mut child);
             cleanup_run_config(&path);
             return Err("no stdout".to_string());
@@ -291,6 +312,7 @@ pub(crate) fn start_run(
         Some(stderr) => stderr,
         None => {
             cancel_run_start(&state, run_id);
+            drop(control_writer);
             shutdown_child_gracefully(&mut child);
             cleanup_run_config(&path);
             return Err("no stderr".to_string());
@@ -306,6 +328,7 @@ pub(crate) fn start_run(
             child,
             stopping: stopping.clone(),
             config_path: path,
+            control_writer: Some(control_writer),
         },
     ) {
         crate::logging::log(
@@ -434,54 +457,31 @@ pub(crate) fn attach_run_id(mut value: Value, run_id: RunId) -> Result<Value, Va
 /// 向运行中的 echoless run 子进程 stdin 写一行 JSON 控制命令。
 /// 具体能力由 CLI started.supported_controls 上报。
 #[tauri::command]
-pub(crate) fn send_run_control(state: State<RunState>, line: String) -> Result<(), String> {
-    write_run_control_line(&state, &line)
+pub(crate) async fn send_run_control(
+    state: State<'_, RunState>,
+    line: String,
+) -> Result<(), String> {
+    enqueue_run_control(&state, line).await
 }
 
+#[cfg(test)]
 pub(crate) fn write_run_control_line(state: &RunState, line: &str) -> Result<(), String> {
-    let mut guard = run_state_guard(state);
-    let write_result = {
-        let rc = guard.child.as_mut().ok_or("not running")?;
-        let stdin = rc.child.stdin.as_mut().ok_or("no stdin")?;
-        stdin
-            .write_all(line.as_bytes())
-            .and_then(|_| stdin.write_all(b"\n"))
-            .and_then(|_| stdin.flush())
-            .map_err(|e| e.to_string())
-    };
-    if let Err(err) = write_result {
-        let status = guard
-            .child
-            .as_mut()
-            .and_then(|rc| rc.child.try_wait().ok().flatten());
-        if let Some(status) = status {
-            drop(guard.child.take());
-            return Err(format!(
-                "run process exited before control command was applied: {status}"
-            ));
-        }
-        return Err(err);
-    }
+    run_control_sender(state)?.send_line_with_timeout(line, RUN_CONTROL_ACK_TIMEOUT)
+}
 
-    let status = {
-        let rc = guard.child.as_mut().ok_or("not running")?;
-        rc.child
-            .try_wait()
-            .map_err(|e| format!("failed to check run process after control command: {e}"))?
-    };
-    if let Some(status) = status {
-        drop(guard.child.take());
-        return Err(format!(
-            "run process exited before control command was applied: {status}"
-        ));
-    }
-    Ok(())
+async fn enqueue_run_control(state: &RunState, line: String) -> Result<(), String> {
+    let sender = run_control_sender(state)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        sender.send_line_with_timeout(&line, RUN_CONTROL_ACK_TIMEOUT)
+    })
+    .await
+    .map_err(|err| format!("run control task join failed: {err}"))?
 }
 
 #[tauri::command]
-pub(crate) fn set_bypass(state: State<RunState>, enabled: bool) -> Result<(), String> {
+pub(crate) async fn set_bypass(state: State<'_, RunState>, enabled: bool) -> Result<(), String> {
     let line = bypass_control_line(enabled);
-    write_run_control_line(&state, &line)
+    enqueue_run_control(&state, line).await
 }
 
 pub(crate) fn bypass_control_line(enabled: bool) -> String {
