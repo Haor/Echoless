@@ -27,8 +27,12 @@ is entry point + setup only; `sidecar.rs` (run lifecycle / hot commands),
 ## Resolving the echoless binary
 
 `src-tauri/src/bin_resolve.rs::echoless_bin()`:
-1. The `ECHOLESS_BIN` environment variable (injected from the sidecar resource after packaging).
-2. Dev fallback: `../../target/release/echoless` (i.e. the `cargo build --release` artifact of this repo).
+
+1. Developer override from the `ECHOLESS_BIN` environment variable.
+2. `echoless` or `echoless-<target-triple>` next to the current executable (the packaged `externalBin` location).
+3. `echoless`, `binaries/echoless`, or the target-triple binary in the Tauri resource directory.
+4. Dev target-triple binary under `src-tauri/binaries/`.
+5. Repo-root `target/release/echoless`, then `target/debug/echoless`.
 
 In dev, build the CLI at the repo root first:
 

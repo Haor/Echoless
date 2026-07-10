@@ -183,9 +183,9 @@
 
 ### 16. D-14【P3】app README sidecar 解析顺序
 
-- [ ] 按 `app/src-tauri/src/bin_resolve.rs` 的真实顺序更新 `app/README.md` 与 `app/README.zh-CN.md`：env、当前 exe 邻接、Tauri resource、target-triple binaries、root release/debug。
-- [ ] 删除“打包后由 env 注入”的错误说法。
-- [ ] 独立 commit：`D-14`。
+- [x] 按 `app/src-tauri/src/bin_resolve.rs` 的真实顺序更新 `app/README.md` 与 `app/README.zh-CN.md`：env、当前 exe 邻接、Tauri resource、target-triple binaries、root release/debug。
+- [x] 删除“打包后由 env 注入”的错误说法。
+- [x] 独立 commit：`D-14`。
 
 ### 第二梯队批次门
 
