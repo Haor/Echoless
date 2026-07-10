@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { writeSafeText } from "./ScrambleText";
+import scrambleTextSource from "./ScrambleText.tsx?raw";
 
 const hostileText = [
   `<>&"'`,
@@ -8,6 +9,10 @@ const hostileText = [
 ];
 
 describe("ScrambleText", () => {
+  it("never writes through an innerHTML sink", () => {
+    expect(scrambleTextSource).not.toMatch(/\binnerHTML\b/);
+  });
+
   it.each(hostileText)("preserves hostile input as text: %s", (text) => {
     let written: string | null = null;
     const sink = {
