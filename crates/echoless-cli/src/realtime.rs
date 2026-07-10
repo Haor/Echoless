@@ -409,6 +409,7 @@ pub fn run_with_options(cfg: &PipelineConfig, options: RuntimeOptions) -> Result
                 p,
                 counters.ref_input_drops.clone(),
                 running.clone(),
+                options.status_json,
             )?)
         }
         _ => None,
@@ -507,6 +508,9 @@ pub fn run_with_options(cfg: &PipelineConfig, options: RuntimeOptions) -> Result
         s.play()?;
     }
     output_stream.play()?;
+    if !running.load(Ordering::SeqCst) {
+        bail!("an audio stream stopped during startup before the run became ready");
+    }
     if options.status_json {
         println!("{}", serde_json::to_string(&started_event)?);
     }

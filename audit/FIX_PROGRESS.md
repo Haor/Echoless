@@ -19,7 +19,7 @@
 
 | 顺序 | 条目 | 梯队 | 状态 | Commit | 专项验证 | 备注 |
 |---:|---|---|---|---|---|---|
-| 1 | B-26 | 第一 | pending | — | — | Process Tap 握手/异常 EOF |
+| 1 | B-26 | 第一 | done-pending-commit | this commit (`B-26`) | focused 10 passed；CLI 81 passed；clippy clean | ELTP v1 ready + EOF/read-error single fatal report；真实系统音频权限/硬件未自动触发 |
 | 2 | B-28 | 第一 | pending | — | — | sidecar run generation |
 | 3 | B-27 | 第一 | pending | — | — | LocalVQE error recovery |
 | 4 | B-25 | 第一 | pending | — | — | stereo frame atomicity |

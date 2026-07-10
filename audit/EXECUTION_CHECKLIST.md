@@ -43,12 +43,12 @@
 
 ### 1. B-26【P1】Process Tap 失联/拒权后的零参考假运行
 
-- [ ] 在 `crates/echoless-cli/src/realtime/macos_process_tap.rs` 增加启动 ready/header 握手；helper 在 header 前退出时，`start()` 返回错误，不允许上层发出有效 `started`。
-- [ ] 区分主动关闭与意外 EOF/read error；意外失联设置共享停止状态，并发出可诊断的结构化 stream error。
-- [ ] 确保 Drop/正常停止不产生误报警，reader 与 child 生命周期只结束一次。
-- [ ] 增加 fault-injection 测试：header 前退出、header 后意外 EOF、read error、主动 Drop。
-- [ ] 验证：`cargo test -p echoless-cli --locked`，并检查 macOS 正常 Process Tap 启动路径不回归。
-- [ ] 独立 commit：`B-26`。
+- [x] 在 `crates/echoless-cli/src/realtime/macos_process_tap.rs` 增加启动 ready/header 握手；helper 在 header 前退出时，`start()` 返回错误，不允许上层发出有效 `started`。
+- [x] 区分主动关闭与意外 EOF/read error；意外失联设置共享停止状态，并发出可诊断的结构化 stream error。
+- [x] 确保 Drop/正常停止不产生误报警，reader 与 child 生命周期只结束一次。
+- [x] 增加 fault-injection 测试：header 前退出、header 后意外 EOF、read error、主动 Drop。
+- [x] 验证：`cargo test -p echoless-cli --locked`，并检查 macOS 正常 Process Tap 启动路径不回归。
+- [x] 独立 commit：`B-26`。
 
 ### 2. B-28【P1】旧 sidecar exit 污染新 run
 
