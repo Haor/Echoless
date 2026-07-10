@@ -19,9 +19,10 @@ use crate::platform::{
     validate_open_path, write_toml_create_new, write_transient_config_toml,
 };
 use crate::proc::{
-    command_output_with_timeout, commit_run_finalization, install_test_generation,
-    parse_jsonl_line_event, push_tail_line, run_state_guard, terminate_run, with_active_run,
-    JsonlLineEvent, RunChild, RunFinalization, RunState,
+    cancel_run_start, command_output_with_timeout, commit_run_finalization, commit_run_start,
+    install_test_generation, is_active_run, parse_jsonl_line_event, push_tail_line,
+    reserve_run_start, run_state_guard, terminate_run, JsonlLineEvent, RunChild, RunFinalization,
+    RunState,
 };
 #[cfg(unix)]
 use crate::sidecar::write_run_control_line;
@@ -221,12 +222,204 @@ fn terminate_run_clears_generation_and_rejects_tail_status() {
     drop(guard);
 
     let tail_effects = AtomicUsize::new(0);
-    assert!(!with_active_run(&state, 1, || {
+    if is_active_run(&state, 1) {
         tail_effects.fetch_add(1, Ordering::SeqCst);
-    }));
+    }
     assert_eq!(tail_effects.load(Ordering::SeqCst), 0);
 
     let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn status_side_effect_does_not_hold_run_state_lock() {
+    let state = Arc::new(RunState::default());
+    install_test_generation(&state, 1);
+    let (effect_entered_tx, effect_entered_rx) = mpsc::channel();
+    let (release_effect_tx, release_effect_rx) = mpsc::channel();
+
+    let worker_state = state.clone();
+    let status_worker = std::thread::spawn(move || {
+        let active = is_active_run(&worker_state, 1);
+        if active {
+            let _ = effect_entered_tx.send(());
+            let _ = release_effect_rx.recv();
+        }
+        active
+    });
+
+    effect_entered_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("status side effect did not start");
+    let (lock_acquired_tx, lock_acquired_rx) = mpsc::channel();
+    let lock_state = state.clone();
+    let lock_attempt = std::thread::spawn(move || {
+        let _guard = run_state_guard(&lock_state);
+        let _ = lock_acquired_tx.send(());
+    });
+
+    let acquired_while_effect_blocked = lock_acquired_rx
+        .recv_timeout(Duration::from_millis(200))
+        .is_ok();
+    let _ = release_effect_tx.send(());
+    assert!(status_worker.join().unwrap());
+    lock_attempt.join().unwrap();
+
+    assert!(
+        acquired_while_effect_blocked,
+        "RunState stayed locked while the status side effect was blocked"
+    );
+}
+
+#[test]
+fn start_reservation_releases_state_before_old_child_drop() {
+    let dir = unique_temp_dir("echoless-start-reservation-lock");
+    let config_path = dir.join("run.toml");
+    std::fs::write(&config_path, "run = 1").unwrap();
+    let stopping = Arc::new(AtomicBool::new(false));
+    let child = slow_child_command().spawn().unwrap();
+    let state = Arc::new(RunState::default());
+    install_test_generation(&state, 1);
+    run_state_guard(&state).child = Some(RunChild {
+        run_id: 1,
+        child,
+        stopping: stopping.clone(),
+        config_path: config_path.clone(),
+    });
+
+    let (reserved_tx, reserved_rx) = mpsc::channel();
+    let (drop_finished_tx, drop_finished_rx) = mpsc::channel();
+    let worker_state = state.clone();
+    let starter = std::thread::spawn(move || {
+        let (run_id, old_child) = reserve_run_start(&worker_state).unwrap();
+        let _ = reserved_tx.send(run_id);
+        drop(old_child);
+        let _ = drop_finished_tx.send(());
+        run_id
+    });
+
+    assert_eq!(reserved_rx.recv_timeout(Duration::from_secs(1)).unwrap(), 2);
+    let stopping_deadline = Instant::now() + Duration::from_secs(1);
+    while !stopping.load(Ordering::SeqCst) && Instant::now() < stopping_deadline {
+        std::thread::yield_now();
+    }
+    assert!(
+        stopping.load(Ordering::SeqCst),
+        "old child drop did not start"
+    );
+    assert!(
+        drop_finished_rx
+            .recv_timeout(Duration::from_millis(50))
+            .is_err(),
+        "old child drop did not remain blocked long enough to test lock scope"
+    );
+
+    let (lock_acquired_tx, lock_acquired_rx) = mpsc::channel();
+    let lock_state = state.clone();
+    let lock_attempt = std::thread::spawn(move || {
+        let _guard = run_state_guard(&lock_state);
+        let _ = lock_acquired_tx.send(());
+    });
+    assert!(
+        lock_acquired_rx
+            .recv_timeout(Duration::from_millis(200))
+            .is_ok(),
+        "RunState stayed locked while the old child was stopping"
+    );
+
+    lock_attempt.join().unwrap();
+    assert_eq!(starter.join().unwrap(), 2);
+    assert!(!config_path.exists());
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn expired_start_reservation_reaps_late_child() {
+    let state = RunState::default();
+    let (expired_run_id, old_child) = reserve_run_start(&state).unwrap();
+    assert!(old_child.is_none());
+    let (current_run_id, old_child) = reserve_run_start(&state).unwrap();
+    assert!(old_child.is_none());
+
+    let dir = unique_temp_dir("echoless-expired-start");
+    let config_path = dir.join("run.toml");
+    std::fs::write(&config_path, "run = 1").unwrap();
+    let stopping = Arc::new(AtomicBool::new(false));
+    let child = slow_child_command().spawn().unwrap();
+    let installed = commit_run_start(
+        &state,
+        expired_run_id,
+        RunChild {
+            run_id: expired_run_id,
+            child,
+            stopping: stopping.clone(),
+            config_path: config_path.clone(),
+        },
+    );
+
+    assert!(!installed);
+    assert!(stopping.load(Ordering::SeqCst));
+    assert!(!config_path.exists());
+    let guard = run_state_guard(&state);
+    assert_eq!(guard.starting_run_id, Some(current_run_id));
+    assert!(guard.active_run_id.is_none());
+    assert!(guard.child.is_none());
+    drop(guard);
+
+    assert_eq!(terminate_run(&state), None);
+    assert_eq!(run_state_guard(&state).starting_run_id, None);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn committed_start_keeps_active_and_child_generations_consistent() {
+    let state = RunState::default();
+    let (run_id, old_child) = reserve_run_start(&state).unwrap();
+    assert!(old_child.is_none());
+    let dir = unique_temp_dir("echoless-committed-start");
+    let config_path = dir.join("run.toml");
+    std::fs::write(&config_path, "run = 1").unwrap();
+    let stopping = Arc::new(AtomicBool::new(false));
+    let child = slow_child_command().spawn().unwrap();
+
+    assert!(commit_run_start(
+        &state,
+        run_id,
+        RunChild {
+            run_id,
+            child,
+            stopping: stopping.clone(),
+            config_path: config_path.clone(),
+        },
+    ));
+    {
+        let guard = run_state_guard(&state);
+        assert_eq!(guard.starting_run_id, None);
+        assert_eq!(guard.active_run_id, Some(run_id));
+        assert_eq!(guard.child.as_ref().map(|child| child.run_id), Some(run_id));
+    }
+
+    assert_eq!(terminate_run(&state), Some(run_id));
+    assert!(stopping.load(Ordering::SeqCst));
+    assert!(!config_path.exists());
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn start_cancellation_only_clears_matching_reservation() {
+    let state = RunState::default();
+    let (expired_run_id, old_child) = reserve_run_start(&state).unwrap();
+    assert!(old_child.is_none());
+    let (current_run_id, old_child) = reserve_run_start(&state).unwrap();
+    assert!(old_child.is_none());
+
+    assert!(!cancel_run_start(&state, expired_run_id));
+    assert_eq!(
+        run_state_guard(&state).starting_run_id,
+        Some(current_run_id)
+    );
+    assert!(cancel_run_start(&state, current_run_id));
+    assert_eq!(run_state_guard(&state).starting_run_id, None);
 }
 
 #[cfg(unix)]

@@ -62,6 +62,7 @@ pub(crate) fn shutdown_child_gracefully(child: &mut Child) {
 pub(crate) struct RunStateInner {
     pub(crate) child: Option<RunChild>,
     pub(crate) active_run_id: Option<RunId>,
+    pub(crate) starting_run_id: Option<RunId>,
     next_run_id: RunId,
 }
 
@@ -70,6 +71,7 @@ impl Default for RunStateInner {
         Self {
             child: None,
             active_run_id: None,
+            starting_run_id: None,
             next_run_id: 1,
         }
     }
@@ -100,15 +102,58 @@ pub(crate) fn allocate_run_id(state: &mut RunStateInner) -> Result<RunId, String
     Ok(run_id)
 }
 
-/// 在同一临界区内验证代际并执行副作用。调用者用它包住 tray/status emit,
-/// 防止“检查 A 仍 active → B 启动 → A 再写副作用”的 TOCTOU。
-pub(crate) fn with_active_run(state: &RunState, run_id: RunId, action: impl FnOnce()) -> bool {
-    let guard = run_state_guard(state);
-    if guard.active_run_id != Some(run_id) {
+/// 在单个短临界区内摘走旧进程并预留下一代。调用者必须在锁外回收返回的
+/// child，并完成配置写入、binary resolve 与 spawn 等外部准备。
+pub(crate) fn reserve_run_start(state: &RunState) -> Result<(RunId, Option<RunChild>), String> {
+    let mut guard = run_state_guard(state);
+    let run_id = allocate_run_id(&mut guard)?;
+    let old_child = guard.child.take();
+    guard.active_run_id = None;
+    guard.starting_run_id = Some(run_id);
+    Ok((run_id, old_child))
+}
+
+/// 仅当 reservation 仍属于本代时，原子安装 child 与 active generation。
+/// 迟到或不一致的 child 在 guard 释放后立即走 RunChild::Drop 回收。
+pub(crate) fn commit_run_start(state: &RunState, run_id: RunId, child: RunChild) -> bool {
+    let mut child = Some(child);
+    let installed = {
+        let mut guard = run_state_guard(state);
+        let matches_reservation = guard.starting_run_id == Some(run_id);
+        let matches_child = child
+            .as_ref()
+            .is_some_and(|candidate| candidate.run_id == run_id);
+        if !matches_reservation
+            || !matches_child
+            || guard.active_run_id.is_some()
+            || guard.child.is_some()
+        {
+            false
+        } else {
+            guard.starting_run_id = None;
+            guard.active_run_id = Some(run_id);
+            guard.child = child.take();
+            true
+        }
+    };
+    drop(child);
+    installed
+}
+
+/// 仅撤销调用者自己的 reservation，不能让旧启动失败覆盖更新一代。
+pub(crate) fn cancel_run_start(state: &RunState, run_id: RunId) -> bool {
+    let mut guard = run_state_guard(state);
+    if guard.starting_run_id != Some(run_id) {
         return false;
     }
-    action();
+    guard.starting_run_id = None;
     true
+}
+
+/// 在短临界区内快照代际，再于锁外执行副作用。快照之后允许代际变化；
+/// status/exit payload 自带 run_id，由前端拒绝晚到事件。
+pub(crate) fn is_active_run(state: &RunState, run_id: RunId) -> bool {
+    run_state_guard(state).active_run_id == Some(run_id)
 }
 
 pub(crate) fn terminate_run(state: &RunState) -> Option<RunId> {
@@ -116,6 +161,7 @@ pub(crate) fn terminate_run(state: &RunState) -> Option<RunId> {
     // 临时配置清理全部在锁外执行。
     let (run_id, child_opt) = {
         let mut guard = run_state_guard(state);
+        guard.starting_run_id = None;
         (guard.active_run_id.take(), guard.child.take())
     };
     drop(child_opt);
@@ -153,6 +199,7 @@ pub(crate) fn commit_run_finalization(state: &RunState, run_id: RunId) -> RunFin
 pub(crate) fn install_test_generation(state: &RunState, run_id: RunId) {
     let mut guard = run_state_guard(state);
     guard.active_run_id = Some(run_id);
+    guard.starting_run_id = None;
     if guard.next_run_id <= run_id {
         guard.next_run_id = run_id.saturating_add(1);
     }

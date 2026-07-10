@@ -11,10 +11,10 @@ use tauri::{Emitter, Manager, State};
 use crate::bin_resolve::{echoless_command, suppress_child_console};
 use crate::platform::{cleanup_run_config, transient_config_dir, write_transient_config_toml};
 use crate::proc::{
-    allocate_run_id, commit_run_finalization, parse_jsonl_line_event, push_tail_line,
-    run_json_async, run_state_guard, shutdown_child_gracefully, terminate_run, with_active_run,
-    JsonlLineEvent, RunChild, RunFinalization, RunId, RunState, PROBE_DELAY_TIMEOUT,
-    STREAM_TAIL_LIMIT_BYTES, VALIDATE_COMMAND_TIMEOUT,
+    cancel_run_start, commit_run_finalization, commit_run_start, is_active_run,
+    parse_jsonl_line_event, push_tail_line, reserve_run_start, run_json_async, run_state_guard,
+    shutdown_child_gracefully, terminate_run, JsonlLineEvent, RunChild, RunFinalization, RunId,
+    RunState, PROBE_DELAY_TIMEOUT, STREAM_TAIL_LIMIT_BYTES, VALIDATE_COMMAND_TIMEOUT,
 };
 use crate::tray::update_tray_tooltip;
 
@@ -217,17 +217,35 @@ pub(crate) fn start_run(
     toml_text: String,
     stats_interval_ms: Option<u32>,
 ) -> Result<RunId, String> {
-    let mut guard = run_state_guard(&state);
-    // 幂等启动:若有残留子进程(并发重启 / 上次崩溃遗留),经 RunChild::Drop
-    // 优雅停机(stopping 标记使其 reader 判定为 intentional,不报崩溃)。
-    drop(guard.child.take());
-    let run_id = allocate_run_id(&mut guard)?;
-    let dir = transient_config_dir(&app)?;
-    let path = write_transient_config_toml(&dir, "run", &toml_text)?;
+    // 锁内只摘状态并预留代际；旧 child 的优雅停机和所有启动准备都在锁外。
+    let (run_id, old_child) = reserve_run_start(&state)?;
+    drop(old_child);
+
+    let dir = match transient_config_dir(&app) {
+        Ok(dir) => dir,
+        Err(err) => {
+            cancel_run_start(&state, run_id);
+            return Err(err);
+        }
+    };
+    let path = match write_transient_config_toml(&dir, "run", &toml_text) {
+        Ok(path) => path,
+        Err(err) => {
+            cancel_run_start(&state, run_id);
+            return Err(err);
+        }
+    };
     let config_arg = path.to_string_lossy().to_string();
     let interval = stats_interval_ms.unwrap_or(80).to_string();
 
-    let mut command = echoless_command(Some(&app))?;
+    let mut command = match echoless_command(Some(&app)) {
+        Ok(command) => command,
+        Err(err) => {
+            cancel_run_start(&state, run_id);
+            cleanup_run_config(&path);
+            return Err(err);
+        }
+    };
     suppress_child_console(&mut command);
     let child_result = command
         .args([
@@ -245,6 +263,7 @@ pub(crate) fn start_run(
     let mut child = match child_result {
         Ok(child) => child,
         Err(err) => {
+            cancel_run_start(&state, run_id);
             cleanup_run_config(&path);
             crate::logging::log(
                 "error",
@@ -254,7 +273,6 @@ pub(crate) fn start_run(
             return Err(format!("spawn echoless run failed: {err}"));
         }
     };
-    crate::logging::log("info", "sidecar", "echoless run started");
 
     // 本子进程专属的 stopping flag:被主动停/重启时置 true。
     let stopping = Arc::new(AtomicBool::new(false));
@@ -263,6 +281,7 @@ pub(crate) fn start_run(
     let stdout = match child.stdout.take() {
         Some(stdout) => stdout,
         None => {
+            cancel_run_start(&state, run_id);
             shutdown_child_gracefully(&mut child);
             cleanup_run_config(&path);
             return Err("no stdout".to_string());
@@ -271,14 +290,36 @@ pub(crate) fn start_run(
     let stderr = match child.stderr.take() {
         Some(stderr) => stderr,
         None => {
+            cancel_run_start(&state, run_id);
             shutdown_child_gracefully(&mut child);
             cleanup_run_config(&path);
             return Err("no stderr".to_string());
         }
     };
+
+    let reader_config_path = path.clone();
+    if !commit_run_start(
+        &state,
+        run_id,
+        RunChild {
+            run_id,
+            child,
+            stopping: stopping.clone(),
+            config_path: path,
+        },
+    ) {
+        crate::logging::log(
+            "info",
+            "sidecar",
+            &format!("discarded superseded run start {run_id}"),
+        );
+        return Err(format!("run start {run_id} was superseded or canceled"));
+    }
+
+    // readers 必须在 child/active generation 原子安装之后启动，避免首批
+    // started/status 被 generation 判定误丢。
     let app_out = app.clone();
     let stop_reader = stopping.clone();
-    let reader_config_path = path.clone();
     std::thread::spawn(move || {
         // CLI stdout 契约:只输出完整 JSONL status/control 行;坏行降级为日志保留证据。
         for line in BufReader::new(stdout).lines() {
@@ -288,42 +329,51 @@ pub(crate) fn start_run(
                     JsonlLineEvent::Json(value) => match attach_run_id(value, run_id) {
                         Ok(value) => {
                             let run_state = app_out.state::<RunState>();
-                            with_active_run(&run_state, run_id, || {
+                            if is_active_run(&run_state, run_id) {
                                 let _ = app_out.emit("echoless://status", value);
-                            });
+                            }
                         }
                         Err(value) => {
-                            crate::logging::log(
-                                "warn",
-                                "sidecar",
-                                &format!("non-object status JSON ignored: {value}"),
-                            );
-                            let _ = app_out.emit(
-                                "echoless://log",
-                                format!("non-object status JSON ignored: {value}"),
-                            );
+                            let run_state = app_out.state::<RunState>();
+                            if is_active_run(&run_state, run_id) {
+                                crate::logging::log(
+                                    "warn",
+                                    "sidecar",
+                                    &format!("non-object status JSON ignored: {value}"),
+                                );
+                                let _ = app_out.emit(
+                                    "echoless://log",
+                                    format!("non-object status JSON ignored: {value}"),
+                                );
+                            }
                         }
                     },
                     JsonlLineEvent::Unparsed(line) => {
-                        crate::logging::log(
-                            "warn",
-                            "sidecar",
-                            &format!("unparsed status line: {line}"),
-                        );
-                        let _ =
-                            app_out.emit("echoless://log", format!("unparsed status line: {line}"));
+                        let run_state = app_out.state::<RunState>();
+                        if is_active_run(&run_state, run_id) {
+                            crate::logging::log(
+                                "warn",
+                                "sidecar",
+                                &format!("unparsed status line: {line}"),
+                            );
+                            let _ = app_out
+                                .emit("echoless://log", format!("unparsed status line: {line}"));
+                        }
                     }
                 },
                 Err(err) => {
-                    crate::logging::log(
-                        "error",
-                        "sidecar",
-                        &format!("failed to read echoless stdout: {err}"),
-                    );
-                    let _ = app_out.emit(
-                        "echoless://log",
-                        format!("failed to read echoless stdout: {err}"),
-                    );
+                    let run_state = app_out.state::<RunState>();
+                    if is_active_run(&run_state, run_id) {
+                        crate::logging::log(
+                            "error",
+                            "sidecar",
+                            &format!("failed to read echoless stdout: {err}"),
+                        );
+                        let _ = app_out.emit(
+                            "echoless://log",
+                            format!("failed to read echoless stdout: {err}"),
+                        );
+                    }
                     break;
                 }
             }
@@ -345,29 +395,31 @@ pub(crate) fn start_run(
             match line {
                 Ok(line) => {
                     if !line.trim().is_empty() {
-                        crate::logging::log("info", "cli", &line);
-                        let _ = app_err.emit("echoless://log", line);
+                        let run_state = app_err.state::<RunState>();
+                        if is_active_run(&run_state, run_id) {
+                            crate::logging::log("info", "cli", &line);
+                            let _ = app_err.emit("echoless://log", line);
+                        }
                     }
                 }
                 Err(err) => {
-                    let _ = app_err.emit(
-                        "echoless://log",
-                        format!("failed to read echoless stderr: {err}"),
-                    );
+                    let run_state = app_err.state::<RunState>();
+                    if is_active_run(&run_state, run_id) {
+                        let _ = app_err.emit(
+                            "echoless://log",
+                            format!("failed to read echoless stderr: {err}"),
+                        );
+                    }
                     break;
                 }
             }
         }
     });
 
-    guard.child = Some(RunChild {
-        run_id,
-        child,
-        stopping,
-        config_path: path,
-    });
-    guard.active_run_id = Some(run_id);
-    update_tray_tooltip(&app, true);
+    crate::logging::log("info", "sidecar", "echoless run started");
+    if is_active_run(&state, run_id) {
+        update_tray_tooltip(&app, true);
+    }
     Ok(run_id)
 }
 
