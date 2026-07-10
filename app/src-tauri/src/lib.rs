@@ -4,6 +4,7 @@
 //   - run 的 --status-json 以 JSONL 流式解析,经事件推给前端
 //
 // 契约真理源:docs/CLI.md + CLI `--json` 实测。
+#[cfg(target_os = "windows")]
 use std::sync::Mutex;
 
 use tauri::{Manager, WebviewUrl, WebviewWindowBuilder, WindowEvent};
@@ -44,7 +45,7 @@ pub fn run() {
     let builder = tauri::Builder::default()
         .plugin(tauri_plugin_decorum::init())
         .plugin(tauri_plugin_dialog::init())
-        .manage(RunState(Mutex::new(None)))
+        .manage(RunState::default())
         .manage(TrayPrefs::default());
 
     #[cfg(target_os = "windows")]
@@ -146,7 +147,7 @@ pub fn run() {
                     let _ = window.hide();
                 } else {
                     let state = window.state::<RunState>();
-                    terminate_run(&state);
+                    let _ = terminate_run(&state);
                 }
             }
         })
@@ -156,7 +157,7 @@ pub fn run() {
             // Cmd+Q / 菜单退出 / Dock Quit 不产生 CloseRequested(审计 B-01):
             // 统一在 ExitRequested 回收 sidecar,避免孤儿 CLI 占用麦克风/虚拟麦。
             if let tauri::RunEvent::ExitRequested { .. } = event {
-                terminate_run(&app_handle.state::<RunState>());
+                let _ = terminate_run(&app_handle.state::<RunState>());
                 #[cfg(target_os = "macos")]
                 device_watch::stop(&app_handle.state::<device_watch::DeviceWatchState>());
             }

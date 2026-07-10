@@ -73,6 +73,13 @@ import { RuntimeSignalPanel } from "./components/RuntimeSignalPanel";
 import { ErrorBoundary } from "./components/ErrorBoundary";
 import { Hint } from "./components/Hint";
 import {
+  acceptRunEvent,
+  acceptRunExit,
+  INITIAL_RUN_GENERATION,
+  observeRunStart,
+  type RunGeneration,
+} from "./runGeneration";
+import {
   RuntimeStatusStrip,
   RuntimeSubline,
   useRunStatusKind,
@@ -825,6 +832,7 @@ function useRunLifecycle({
 }: RunLifecycleDeps) {
   // 当前 run 实际生效的参考源(由 started 给出),供 status 判断是否 Process Tap。
   const refSourceRef = useRef<string | null>(null);
+  const runGenerationRef = useRef<RunGeneration>(INITIAL_RUN_GENERATION);
   // 子进程最近一条 stderr 日志(用于在非预期退出时报错)。
   const lastLogRef = useRef<string>("");
   const probeBorrowedRunRef = useRef(false);
@@ -855,6 +863,9 @@ function useRunLifecycle({
     (async () => {
       uns.push(
         await onRunEvent((ev) => {
+          const decision = acceptRunEvent(runGenerationRef.current, ev);
+          runGenerationRef.current = decision.generation;
+          if (!decision.accepted) return;
           if (ev.type === "started") {
             telRef.current.on = true;
             cliVersionRef.current = ev.cli_version ?? null;
@@ -986,6 +997,9 @@ function useRunLifecycle({
       );
       uns.push(
         await onRunExit((ev) => {
+          const decision = acceptRunExit(runGenerationRef.current, ev);
+          runGenerationRef.current = decision.generation;
+          if (!decision.accepted) return;
           telRef.current.on = false;
           resetRuntimeLive(); // 清掉停机后残留的 dBFS / 延迟读数
           updateApp({ io: null, bypassed: false, bypassPending: null });
@@ -1047,7 +1061,11 @@ function useRunLifecycle({
         return;
       }
       telRef.current.on = true;
-      await startRun(toml, 80);
+      const runId = await startRun(toml, 80);
+      runGenerationRef.current = observeRunStart(
+        runGenerationRef.current,
+        runId,
+      );
       probeBorrowedRunRef.current = false;
       // 启动即 AEC on(toml 不写 bypass,后端默认 false)。
       updateApp({ powerOn: true, bypassed: false, bypassPending: null });
@@ -1161,7 +1179,11 @@ function useRunLifecycle({
         return;
       }
       telRef.current.on = true;
-      await startRun(toml, 80);
+      const runId = await startRun(toml, 80);
+      runGenerationRef.current = observeRunStart(
+        runGenerationRef.current,
+        runId,
+      );
       updateApp({ powerOn: true, bypassed: false, bypassPending: null });
       noteError(null);
     } catch (e) {

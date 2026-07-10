@@ -124,7 +124,7 @@ pub(crate) fn register_windows_tray(app: &mut tauri::App) -> tauri::Result<()> {
             TRAY_MENU_SHOW => show_main_window(app),
             TRAY_MENU_QUIT => {
                 let state = app.state::<RunState>();
-                terminate_run(&state);
+                let _ = terminate_run(&state);
                 update_tray_tooltip(app, false);
                 app.exit(0);
             }

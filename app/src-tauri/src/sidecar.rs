@@ -10,9 +10,10 @@ use tauri::{Emitter, Manager, State};
 use crate::bin_resolve::{echoless_command, suppress_child_console};
 use crate::platform::{cleanup_run_config, transient_config_dir, write_transient_config_toml};
 use crate::proc::{
-    mark_run_exited, parse_jsonl_line_event, push_tail_line, run_json_async, run_state_guard,
-    shutdown_child_gracefully, terminate_run, JsonlLineEvent, RunChild, RunState,
-    PROBE_DELAY_TIMEOUT, STREAM_TAIL_LIMIT_BYTES, VALIDATE_COMMAND_TIMEOUT,
+    allocate_run_id, finish_run_if_active, parse_jsonl_line_event, push_tail_line, run_json_async,
+    run_state_guard, shutdown_child_gracefully, terminate_run, with_active_run, JsonlLineEvent,
+    RunChild, RunId, RunState, PROBE_DELAY_TIMEOUT, STREAM_TAIL_LIMIT_BYTES,
+    VALIDATE_COMMAND_TIMEOUT,
 };
 use crate::tray::update_tray_tooltip;
 
@@ -154,11 +155,12 @@ pub(crate) fn start_run(
     state: State<RunState>,
     toml_text: String,
     stats_interval_ms: Option<u32>,
-) -> Result<(), String> {
+) -> Result<RunId, String> {
     let mut guard = run_state_guard(&state);
     // 幂等启动:若有残留子进程(并发重启 / 上次崩溃遗留),经 RunChild::Drop
     // 优雅停机(stopping 标记使其 reader 判定为 intentional,不报崩溃)。
-    drop(guard.take());
+    drop(guard.child.take());
+    let run_id = allocate_run_id(&mut guard)?;
     let dir = transient_config_dir(&app)?;
     let path = write_transient_config_toml(&dir, "run", &toml_text)?;
     let config_arg = path.to_string_lossy().to_string();
@@ -222,9 +224,25 @@ pub(crate) fn start_run(
             match line {
                 Ok(line) => match parse_jsonl_line_event(&line) {
                     JsonlLineEvent::Empty => {}
-                    JsonlLineEvent::Json(v) => {
-                        let _ = app_out.emit("echoless://status", v);
-                    }
+                    JsonlLineEvent::Json(value) => match attach_run_id(value, run_id) {
+                        Ok(value) => {
+                            let run_state = app_out.state::<RunState>();
+                            with_active_run(&run_state, run_id, || {
+                                let _ = app_out.emit("echoless://status", value);
+                            });
+                        }
+                        Err(value) => {
+                            crate::logging::log(
+                                "warn",
+                                "sidecar",
+                                &format!("non-object status JSON ignored: {value}"),
+                            );
+                            let _ = app_out.emit(
+                                "echoless://log",
+                                format!("non-object status JSON ignored: {value}"),
+                            );
+                        }
+                    },
                     JsonlLineEvent::Unparsed(line) => {
                         crate::logging::log(
                             "warn",
@@ -254,15 +272,16 @@ pub(crate) fn start_run(
         crate::logging::log(
             if intentional { "info" } else { "error" },
             "sidecar",
-            &format!("echoless run exited (intentional={intentional})"),
+            &format!("echoless run {run_id} exited (intentional={intentional})"),
         );
         let run_state = app_out.state::<RunState>();
-        mark_run_exited(&run_state, &reader_config_path);
-        update_tray_tooltip(&app_out, false);
-        let _ = app_out.emit(
-            "echoless://exit",
-            serde_json::json!({ "intentional": intentional }),
-        );
+        finish_run_if_active(&run_state, run_id, &reader_config_path, || {
+            update_tray_tooltip(&app_out, false);
+            let _ = app_out.emit(
+                "echoless://exit",
+                serde_json::json!({ "run_id": run_id, "intentional": intentional }),
+            );
+        });
     });
 
     // stderr = 人类日志(转发事件 + 落盘取证)
@@ -287,13 +306,23 @@ pub(crate) fn start_run(
         }
     });
 
-    *guard = Some(RunChild {
+    guard.child = Some(RunChild {
+        run_id,
         child,
         stopping,
         config_path: path,
     });
+    guard.active_run_id = Some(run_id);
     update_tray_tooltip(&app, true);
-    Ok(())
+    Ok(run_id)
+}
+
+pub(crate) fn attach_run_id(mut value: Value, run_id: RunId) -> Result<Value, Value> {
+    let Some(object) = value.as_object_mut() else {
+        return Err(value);
+    };
+    object.insert("run_id".to_string(), json!(run_id));
+    Ok(value)
 }
 
 /// 向运行中的 echoless run 子进程 stdin 写一行 JSON 控制命令。
@@ -306,7 +335,7 @@ pub(crate) fn send_run_control(state: State<RunState>, line: String) -> Result<(
 pub(crate) fn write_run_control_line(state: &RunState, line: &str) -> Result<(), String> {
     let mut guard = run_state_guard(state);
     let write_result = {
-        let rc = guard.as_mut().ok_or("not running")?;
+        let rc = guard.child.as_mut().ok_or("not running")?;
         let stdin = rc.child.stdin.as_mut().ok_or("no stdin")?;
         stdin
             .write_all(line.as_bytes())
@@ -316,10 +345,11 @@ pub(crate) fn write_run_control_line(state: &RunState, line: &str) -> Result<(),
     };
     if let Err(err) = write_result {
         let status = guard
+            .child
             .as_mut()
             .and_then(|rc| rc.child.try_wait().ok().flatten());
         if let Some(status) = status {
-            drop(guard.take());
+            drop(guard.child.take());
             return Err(format!(
                 "run process exited before control command was applied: {status}"
             ));
@@ -328,13 +358,13 @@ pub(crate) fn write_run_control_line(state: &RunState, line: &str) -> Result<(),
     }
 
     let status = {
-        let rc = guard.as_mut().ok_or("not running")?;
+        let rc = guard.child.as_mut().ok_or("not running")?;
         rc.child
             .try_wait()
             .map_err(|e| format!("failed to check run process after control command: {e}"))?
     };
     if let Some(status) = status {
-        drop(guard.take());
+        drop(guard.child.take());
         return Err(format!(
             "run process exited before control command was applied: {status}"
         ));
@@ -357,8 +387,13 @@ pub(crate) fn bypass_control_line(enabled: bool) -> String {
 }
 
 #[tauri::command]
-pub(crate) fn stop_run(app: tauri::AppHandle, state: State<RunState>) -> Result<(), String> {
-    terminate_run(&state);
-    update_tray_tooltip(&app, false);
-    Ok(())
+pub(crate) fn stop_run(
+    app: tauri::AppHandle,
+    state: State<RunState>,
+) -> Result<Option<RunId>, String> {
+    let run_id = terminate_run(&state);
+    if let Some(run_id) = run_id {
+        with_active_run(&state, run_id, || update_tray_tooltip(&app, false));
+    }
+    Ok(run_id)
 }

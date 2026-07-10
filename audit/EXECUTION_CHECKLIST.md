@@ -52,12 +52,12 @@
 
 ### 2. B-28【P1】旧 sidecar exit 污染新 run
 
-- [ ] 在 `app/src-tauri/src/proc.rs` / `sidecar.rs` 为每次 run 分配单调 `run_id`，并保存 active generation。
-- [ ] 让 status/exit 事件携带 `run_id`；只有 active run 可更新 RunState、tray tooltip 和全局运行状态。
-- [ ] 在 `app/src/App.tsx` 保存当前 active `run_id`，忽略旧代 status/exit；intentional exit 的清理也必须通过代际检查。
-- [ ] 增加确定性 barrier 测试：卡住 run A reader，启动 B 后释放 A，确认 B、tray、I/O、runtime controls 不变。
-- [ ] 验证：`(cd app/src-tauri && cargo test --locked)`、`(cd app && pnpm exec tsc --noEmit && pnpm test)`。
-- [ ] 独立 commit：`B-28`。
+- [x] 在 `app/src-tauri/src/proc.rs` / `sidecar.rs` 为每次 run 分配单调 `run_id`，并保存 active generation。
+- [x] 让 status/exit 事件携带 `run_id`；只有 active run 可更新 RunState、tray tooltip 和全局运行状态。
+- [x] 在 `app/src/App.tsx` 保存当前 active `run_id`，忽略旧代 status/exit；intentional exit 的清理也必须通过代际检查。
+- [x] 增加确定性 barrier 测试：卡住 run A reader，启动 B 后释放 A，确认 B、tray、I/O、runtime controls 不变。
+- [x] 验证：`(cd app/src-tauri && cargo test --locked)`、`(cd app && pnpm exec tsc --noEmit && pnpm test)`。
+- [x] 独立 commit：`B-28`。
 
 ### 3. B-27【P1】LocalVQE 错误态无界缓冲与旧音频回放
 

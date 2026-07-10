@@ -8,6 +8,7 @@ import type {
   Platform,
   ProcessorManifest,
   RunEvent,
+  RunExitEvent,
   ValidateResult,
 } from "./types";
 import {
@@ -164,12 +165,12 @@ export function validateConfig(tomlText: string): Promise<ValidateResult> {
 export function startRun(
   tomlText: string,
   statsIntervalMs = 80,
-): Promise<void> {
-  return invoke<void>("start_run", { tomlText, statsIntervalMs });
+): Promise<number> {
+  return invoke<number>("start_run", { tomlText, statsIntervalMs });
 }
 
-export function stopRun(): Promise<void> {
-  return invoke<void>("stop_run");
+export function stopRun(): Promise<number | null> {
+  return invoke<number | null>("stop_run");
 }
 
 // 向运行中的子进程 stdin 写一行 JSON 控制命令。具体能力以 started.supported_controls 为准。
@@ -226,11 +227,9 @@ export function onRunEvent(cb: (e: RunEvent) => void): Promise<UnlistenFn> {
   return listen<RunEvent>("echoless://status", (e) => cb(e.payload));
 }
 export function onRunExit(
-  cb: (e: { intentional?: boolean }) => void,
+  cb: (e: RunExitEvent) => void,
 ): Promise<UnlistenFn> {
-  return listen<{ intentional?: boolean }>("echoless://exit", (e) =>
-    cb(e.payload ?? {}),
-  );
+  return listen<RunExitEvent>("echoless://exit", (e) => cb(e.payload));
 }
 export function onRunLog(cb: (line: string) => void): Promise<UnlistenFn> {
   return listen<string>("echoless://log", (e) => cb(e.payload));

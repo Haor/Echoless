@@ -16,11 +16,13 @@ pub(crate) const NVAFX_INSTALL_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 // download-install 含 ~1 GB 下载:10 分钟对慢速链路(< ~14 Mbps)会中途被杀,给 30 分钟。
 pub(crate) const NVAFX_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 pub(crate) const MODEL_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+pub(crate) type RunId = u64;
 
 /// 运行中的 echoless run 子进程 + 它专属的「正在被主动停止」标记。
 /// 每个子进程独立持有 stopping flag,其 stdout reader 退出时据此判断本次退出是
 /// 主动停/重启(intentional)还是子进程自己崩了(crash),供前端区分。
 pub(crate) struct RunChild {
+    pub(crate) run_id: RunId,
     pub(crate) child: Child,
     pub(crate) stopping: Arc<AtomicBool>,
     pub(crate) config_path: PathBuf,
@@ -54,10 +56,34 @@ pub(crate) fn shutdown_child_gracefully(child: &mut Child) {
     let _ = child.wait();
 }
 
-/// 当前运行中的 echoless run 子进程(同一时刻最多一个)。
-pub(crate) struct RunState(pub(crate) Mutex<Option<RunChild>>);
+/// 当前运行中的 echoless run 子进程及其代际。
+/// `active_run_id` 与 `child` 分开保存:主动停止会先取走 child,但 reader
+/// 尚未收尾时仍需保留代际,才能拒绝旧 exit 污染随后启动的新 run。
+pub(crate) struct RunStateInner {
+    pub(crate) child: Option<RunChild>,
+    pub(crate) active_run_id: Option<RunId>,
+    next_run_id: RunId,
+}
 
-pub(crate) fn run_state_guard(state: &RunState) -> MutexGuard<'_, Option<RunChild>> {
+impl Default for RunStateInner {
+    fn default() -> Self {
+        Self {
+            child: None,
+            active_run_id: None,
+            next_run_id: 1,
+        }
+    }
+}
+
+pub(crate) struct RunState(pub(crate) Mutex<RunStateInner>);
+
+impl Default for RunState {
+    fn default() -> Self {
+        Self(Mutex::new(RunStateInner::default()))
+    }
+}
+
+pub(crate) fn run_state_guard(state: &RunState) -> MutexGuard<'_, RunStateInner> {
     // Keep the GUI backend recoverable after an unrelated panic while holding the run lock.
     state
         .0
@@ -65,31 +91,78 @@ pub(crate) fn run_state_guard(state: &RunState) -> MutexGuard<'_, Option<RunChil
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-pub(crate) fn terminate_run(state: &RunState) {
-    // 锁外 drop:RunChild::Drop 的限时等待(最长 1s)不占 run_state 锁。
-    let child_opt = {
-        let mut guard = run_state_guard(state);
-        guard.take()
-    };
-    drop(child_opt);
+pub(crate) fn allocate_run_id(state: &mut RunStateInner) -> Result<RunId, String> {
+    let run_id = state.next_run_id;
+    state.next_run_id = state
+        .next_run_id
+        .checked_add(1)
+        .ok_or("run id space exhausted")?;
+    Ok(run_id)
 }
 
-pub(crate) fn mark_run_exited(state: &RunState, config_path: &Path) {
-    let child_opt = {
+/// 在同一临界区内验证代际并执行副作用。调用者用它包住 tray/status emit,
+/// 防止“检查 A 仍 active → B 启动 → A 再写副作用”的 TOCTOU。
+pub(crate) fn with_active_run(state: &RunState, run_id: RunId, action: impl FnOnce()) -> bool {
+    let guard = run_state_guard(state);
+    if guard.active_run_id != Some(run_id) {
+        return false;
+    }
+    action();
+    true
+}
+
+pub(crate) fn terminate_run(state: &RunState) -> Option<RunId> {
+    // 锁外 drop:RunChild::Drop 的限时等待(最长 1s)不占 run_state 锁。
+    let (run_id, child_opt) = {
         let mut guard = run_state_guard(state);
-        if guard
-            .as_ref()
-            .is_some_and(|rc| rc.config_path == config_path)
-        {
-            guard.take()
+        (guard.active_run_id, guard.child.take())
+    };
+    drop(child_opt);
+    run_id
+}
+
+/// reader 收尾只允许当前代执行 tray/exit 副作用。旧代只清理自己的临时配置,
+/// 绝不触碰新 child；当前代的判断、状态清除与副作用在同一把锁内完成。
+pub(crate) fn finish_run_if_active(
+    state: &RunState,
+    run_id: RunId,
+    config_path: &Path,
+    on_active: impl FnOnce(),
+) -> bool {
+    let mut child_opt = None;
+    let active = {
+        let mut guard = run_state_guard(state);
+        if guard.active_run_id != Some(run_id) {
+            false
         } else {
-            None
+            if guard
+                .child
+                .as_ref()
+                .is_some_and(|child| child.run_id == run_id)
+            {
+                child_opt = guard.child.take();
+            }
+            guard.active_run_id = None;
+            on_active();
+            true
         }
     };
-    if child_opt.is_none() {
+    if active {
+        // Some(_) 由 RunChild::Drop 收尾(子进程已自行退出,try_wait 立即命中)。
+        drop(child_opt);
+    } else {
         crate::platform::cleanup_run_config(config_path);
     }
-    // Some(_) 由 RunChild::Drop 收尾(子进程已自行退出,try_wait 立即命中)。
+    active
+}
+
+#[cfg(test)]
+pub(crate) fn install_test_generation(state: &RunState, run_id: RunId) {
+    let mut guard = run_state_guard(state);
+    guard.active_run_id = Some(run_id);
+    if guard.next_run_id <= run_id {
+        guard.next_run_id = run_id.saturating_add(1);
+    }
 }
 
 pub(crate) fn command_output_with_timeout(

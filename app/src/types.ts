@@ -229,7 +229,7 @@ export interface StartedEvent {
   reference_source?: string | null;
 }
 
-export type RunEvent =
+export type RunEventPayload =
   | RuntimeStatus
   | StartedEvent
   | DiagnosticsDoneEvent
@@ -243,6 +243,13 @@ export type RunEvent =
   | Aec3AgcChangedEvent
   | LocalvqeNoiseGateChangedEvent
   | BypassChangedEvent;
+
+export type RunEvent = RunEventPayload & { run_id: number };
+
+export interface RunExitEvent {
+  run_id: number;
+  intentional?: boolean;
+}
 
 // ---- doctor audio --json(虚拟声卡检测) ----
 export interface DoctorCandidate {

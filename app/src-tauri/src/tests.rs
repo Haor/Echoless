@@ -2,8 +2,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 #[cfg(unix)]
 use std::process::Stdio;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Barrier, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::json;
@@ -19,12 +19,13 @@ use crate::platform::{
     validate_open_path, write_toml_create_new, write_transient_config_toml,
 };
 use crate::proc::{
-    command_output_with_timeout, parse_jsonl_line_event, push_tail_line, run_state_guard,
-    terminate_run, JsonlLineEvent, RunChild, RunState,
+    command_output_with_timeout, finish_run_if_active, install_test_generation,
+    parse_jsonl_line_event, push_tail_line, run_state_guard, terminate_run, JsonlLineEvent,
+    RunChild, RunState,
 };
-use crate::sidecar::bypass_control_line;
 #[cfg(unix)]
 use crate::sidecar::write_run_control_line;
+use crate::sidecar::{attach_run_id, bypass_control_line};
 use crate::tray::{set_tray_prefs_inner, TrayPrefs};
 
 static DATA_ROOT_ENV_LOCK: Mutex<()> = Mutex::new(());
@@ -88,7 +89,7 @@ fn command_timeout_kills_hung_child() {
 
 #[test]
 fn run_state_guard_recovers_poisoned_lock() {
-    let state = RunState(Mutex::new(None));
+    let state = RunState::default();
     let _ = std::panic::catch_unwind(|| {
         let _guard = state.0.lock().expect("test lock should start healthy");
         panic!("poison run state");
@@ -96,7 +97,8 @@ fn run_state_guard_recovers_poisoned_lock() {
 
     assert!(state.0.is_poisoned());
     let guard = run_state_guard(&state);
-    assert!(guard.is_none());
+    assert!(guard.child.is_none());
+    assert!(guard.active_run_id.is_none());
 }
 
 #[test]
@@ -177,16 +179,24 @@ fn terminate_run_marks_stopping_waits_and_cleans_config() {
     std::fs::write(&config_path, "stub = true").unwrap();
     let stopping = Arc::new(AtomicBool::new(false));
     let child = slow_child_command().spawn().unwrap();
-    let state = RunState(Mutex::new(Some(RunChild {
-        child,
-        stopping: stopping.clone(),
-        config_path: config_path.clone(),
-    })));
+    let state = RunState::default();
+    {
+        let mut guard = run_state_guard(&state);
+        guard.active_run_id = Some(1);
+        guard.child = Some(RunChild {
+            run_id: 1,
+            child,
+            stopping: stopping.clone(),
+            config_path: config_path.clone(),
+        });
+    }
 
     terminate_run(&state);
 
     assert!(stopping.load(Ordering::SeqCst));
-    assert!(run_state_guard(&state).is_none());
+    let guard = run_state_guard(&state);
+    assert!(guard.child.is_none());
+    assert_eq!(guard.active_run_id, Some(1));
     assert!(!config_path.exists());
 
     let _ = std::fs::remove_dir_all(dir);
@@ -200,14 +210,21 @@ fn write_run_control_line_reaps_exited_child_after_successful_write() {
     std::fs::write(&config_path, "stub = true").unwrap();
     let stopping = Arc::new(AtomicBool::new(false));
     let child = exited_child_with_open_stdin_command().spawn().unwrap();
-    let state = RunState(Mutex::new(Some(RunChild {
-        child,
-        stopping: stopping.clone(),
-        config_path: config_path.clone(),
-    })));
+    let state = RunState::default();
+    {
+        let mut guard = run_state_guard(&state);
+        guard.active_run_id = Some(1);
+        guard.child = Some(RunChild {
+            run_id: 1,
+            child,
+            stopping: stopping.clone(),
+            config_path: config_path.clone(),
+        });
+    }
 
     for _ in 0..50 {
         let exited = run_state_guard(&state)
+            .child
             .as_mut()
             .and_then(|rc| rc.child.try_wait().ok().flatten())
             .is_some();
@@ -224,10 +241,61 @@ fn write_run_control_line_reaps_exited_child_after_successful_write() {
         "{err}"
     );
     assert!(stopping.load(Ordering::SeqCst));
-    assert!(run_state_guard(&state).is_none());
+    assert!(run_state_guard(&state).child.is_none());
     assert!(!config_path.exists());
 
     let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn stale_reader_cannot_finalize_new_generation() {
+    let state = Arc::new(RunState::default());
+    install_test_generation(&state, 1);
+    let old_config_dir = unique_temp_dir("echoless-stale-run-a");
+    let old_config = old_config_dir.join("run.toml");
+    std::fs::write(&old_config, "run = 1").unwrap();
+    let barrier = Arc::new(Barrier::new(2));
+    let side_effects = Arc::new(AtomicUsize::new(0));
+
+    let worker_state = state.clone();
+    let worker_barrier = barrier.clone();
+    let worker_effects = side_effects.clone();
+    let worker_config = old_config.clone();
+    let old_reader = std::thread::spawn(move || {
+        worker_barrier.wait();
+        finish_run_if_active(&worker_state, 1, &worker_config, || {
+            worker_effects.fetch_add(1, Ordering::SeqCst);
+        })
+    });
+
+    install_test_generation(&state, 2);
+    barrier.wait();
+
+    assert!(!old_reader.join().unwrap());
+    assert_eq!(run_state_guard(&state).active_run_id, Some(2));
+    assert_eq!(side_effects.load(Ordering::SeqCst), 0);
+    assert!(!old_config.exists());
+
+    let current_config = old_config_dir.join("run-b.toml");
+    assert!(finish_run_if_active(&state, 2, &current_config, || {
+        side_effects.fetch_add(1, Ordering::SeqCst);
+    }));
+    assert!(!finish_run_if_active(&state, 2, &current_config, || {
+        side_effects.fetch_add(1, Ordering::SeqCst);
+    }));
+    assert_eq!(side_effects.load(Ordering::SeqCst), 1);
+    assert_eq!(run_state_guard(&state).active_run_id, None);
+
+    let _ = std::fs::remove_dir_all(old_config_dir);
+}
+
+#[test]
+fn run_id_injection_requires_object_and_overrides_cli_value() {
+    assert_eq!(
+        attach_run_id(json!({"type": "status", "run_id": 999}), 7).unwrap(),
+        json!({"type": "status", "run_id": 7})
+    );
+    assert_eq!(attach_run_id(json!(["status"]), 7), Err(json!(["status"])));
 }
 
 #[test]
