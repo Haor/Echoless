@@ -93,7 +93,7 @@
 - [x] 不新增 Linux 质量承诺；不为 Linux 单独补测试或 fail-closed 门。
 - [x] 保留现有 clippy/build，不能用 test 替代静态检查或构建 smoke。
 - [x] 本地验证 23 tests（B-28 新增后的实际数量）全执行，并确认 workflow YAML 可解析。
-- [ ] 推送后验证 supported-platform jobs 的 Tauri tests 日志；预计净增约 5 秒。
+- [x] 推送后验证 supported-platform jobs 的 Tauri tests 日志；PR #1 / run `29072427764` 的 Windows、macOS Apple Silicon、macOS Intel 均通过。
 - [x] 独立 commit：`T-11`。
 
 ### 第一梯队批次门
@@ -165,7 +165,7 @@
 
 - [x] 为 `.github/workflows/build.yml` 增加 `pull_request` 触发，覆盖目标为 `main`/`dev`。
 - [x] 不新增 Linux 专项保证；保持现有 job 结构，不在本条重构昂贵打包步骤。
-- [ ] 本地检查 workflow YAML；推送测试 PR 后确认基础 quality jobs 自动出现。（本地 YAML 已通过；远端 PR 待最终推送阶段验收。）
+- [x] 本地检查 workflow YAML；测试 PR #1 自动触发四平台 jobs，run `29072427764` 完整通过。
 - [x] 独立 commit：`T-12`。
 
 ### 14. D-12【P2】收口已经存在的 example.toml/SRC 注释修复
