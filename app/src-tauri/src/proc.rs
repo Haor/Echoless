@@ -184,7 +184,7 @@ pub(crate) fn command_output_with_timeout(
                     .map_err(|e| format!("read {label} output failed: {e}"));
             }
             Ok(None) if started.elapsed() >= timeout => {
-                let _ = child.kill();
+                kill_child_tree(&mut child);
                 let output = child
                     .wait_with_output()
                     .map_err(|e| format!("wait timed out {label} failed: {e}"))?;
@@ -199,6 +199,21 @@ pub(crate) fn command_output_with_timeout(
             Err(e) => return Err(format!("wait {label} failed: {e}")),
         }
     }
+}
+
+#[cfg(windows)]
+fn kill_child_tree(child: &mut Child) {
+    let pid = child.id().to_string();
+    let mut taskkill = Command::new("taskkill");
+    taskkill.args(["/PID", &pid, "/T", "/F"]);
+    suppress_child_console(&mut taskkill);
+    let _ = taskkill.status();
+    let _ = child.kill();
+}
+
+#[cfg(not(windows))]
+fn kill_child_tree(child: &mut Child) {
+    let _ = child.kill();
 }
 
 pub(crate) fn command_status_error(label: &str, out: &Output) -> String {
