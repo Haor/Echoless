@@ -27,7 +27,6 @@ struct Sink {
 }
 
 static SINK: OnceLock<Mutex<Option<Sink>>> = OnceLock::new();
-static LOG_DIR: OnceLock<PathBuf> = OnceLock::new();
 
 /// 进程启动时调用一次。失败静默(日志是辅助设施,绝不影响主功能)。
 pub(crate) fn init(app_version: &str) {
@@ -40,7 +39,6 @@ pub(crate) fn init(app_version: &str) {
     let Ok((_path, sink)) = create_unique_sink(&dir, &file_stamp(), std::process::id()) else {
         return;
     };
-    let _ = LOG_DIR.set(dir);
     let _ = SINK.set(Mutex::new(Some(sink)));
     log(
         "info",
