@@ -706,16 +706,7 @@ fn download_file(
     });
 
     match download_with_powershell(url, &tmp) {
-        Ok(()) => {
-            let _ = std::fs::remove_file(dest);
-            rename(&tmp, dest).with_context(|| {
-                format!(
-                    "failed to commit downloaded file: {} -> {}",
-                    tmp.display(),
-                    dest.display()
-                )
-            })
-        }
+        Ok(()) => Ok(()),
         Err(power_shell_err) => {
             let _ = std::fs::remove_file(&tmp);
             install_log(
@@ -723,24 +714,32 @@ fn download_file(
                 format!("PowerShell download failed, trying curl.exe: {power_shell_err:#}"),
             );
             download_with_curl(url, &tmp)
-                .with_context(|| format!("PowerShell download also failed: {power_shell_err:#}"))?;
-            let _ = std::fs::remove_file(dest);
-            rename(&tmp, dest).with_context(|| {
-                format!(
-                    "failed to commit downloaded file: {} -> {}",
-                    tmp.display(),
-                    dest.display()
-                )
-            })
+                .with_context(|| format!("PowerShell download also failed: {power_shell_err:#}"))
         }
     }?;
 
-    if let Some(observer) = progress {
-        observer.stop();
-    }
+    commit_downloaded_file(&tmp, dest, progress)?;
     let received = std::fs::metadata(dest).map(|meta| meta.len()).unwrap_or(0);
     emit_download_progress(log_to_stderr, label, received, expected_size);
     Ok(())
+}
+
+fn commit_downloaded_file(
+    partial: &Path,
+    destination: &Path,
+    progress: Option<DownloadProgressObserver>,
+) -> Result<()> {
+    if let Some(observer) = progress {
+        observer.stop();
+    }
+    let _ = std::fs::remove_file(destination);
+    rename(partial, destination).with_context(|| {
+        format!(
+            "failed to commit downloaded file: {} -> {}",
+            partial.display(),
+            destination.display()
+        )
+    })
 }
 
 struct DownloadProgressObserver {
@@ -1270,6 +1269,40 @@ mod tests {
 
         let _ = release_tx.send(());
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn committing_download_stops_observer_before_partial_file_disappears() {
+        let base = env::temp_dir().join(format!(
+            "echoless-nvafx-progress-commit-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let partial = base.with_extension("zip.part");
+        let destination = base.with_extension("zip");
+        std::fs::write(&partial, vec![0u8; 100]).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let observer = spawn_download_progress_observer(
+            partial.clone(),
+            "common runtime".to_string(),
+            Some(100),
+            Duration::from_millis(5),
+            Duration::from_millis(50),
+            move |_, received, _| {
+                let _ = tx.send(received);
+            },
+        );
+        assert_eq!(rx.recv_timeout(Duration::from_millis(250)).unwrap(), 100);
+
+        commit_downloaded_file(&partial, &destination, Some(observer)).unwrap();
+
+        assert!(rx.try_iter().all(|received| received != 0));
+        assert!(!partial.exists());
+        assert_eq!(std::fs::metadata(&destination).unwrap().len(), 100);
+        std::fs::remove_file(destination).unwrap();
     }
 
     #[test]
