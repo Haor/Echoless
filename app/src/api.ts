@@ -81,8 +81,9 @@ export function downloadLocalvqeModel(filename: string): Promise<string> {
   return invoke<string>("download_localvqe_model", { filename });
 }
 
-// 主动近端延迟侦测 / AEC 链路诊断。后端 shell `echoless probe-delay --json`,约 15 秒,
-// 会外放一串蜂鸣 —— 调用前必须先停掉主 run。字段以 CLI `probe-delay --json` 实测为准(docs/CLI.md)。
+// 主动近端延迟侦测 / AEC 链路诊断。后端 shell `echoless probe-delay --json`,通常约 15 秒;
+// 首次 macOS 权限/Process Tap 启动可能更久。会外放一串蜂鸣 —— 调用前必须先停掉主 run。
+// 字段以 CLI `probe-delay --json` 实测为准(docs/CLI.md)。
 export interface NearDelayProbeResult {
   session_dir: string;
   session_retained: boolean;

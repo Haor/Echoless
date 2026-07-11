@@ -13,7 +13,7 @@ use crate::bin_resolve::{echoless_command, suppress_child_console};
 pub(crate) const STREAM_TAIL_LIMIT_BYTES: usize = 4096;
 pub(crate) const JSON_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 pub(crate) const VALIDATE_COMMAND_TIMEOUT: Duration = Duration::from_secs(60);
-pub(crate) const PROBE_DELAY_TIMEOUT: Duration = Duration::from_secs(45);
+pub(crate) const PROBE_DELAY_TIMEOUT: Duration = Duration::from_secs(60);
 pub(crate) const NVAFX_INSTALL_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 // download-install 含 ~1 GB 下载:10 分钟对慢速链路(< ~14 Mbps)会中途被杀,给 30 分钟。
 pub(crate) const NVAFX_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(30 * 60);

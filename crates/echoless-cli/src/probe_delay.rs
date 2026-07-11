@@ -166,6 +166,7 @@ fn remove_probe_session_under(root: &Path, session_dir: &Path) -> Result<()> {
 }
 
 const PROBE_SAMPLE_RATE: u32 = 48_000;
+const PROBE_PIPELINE_READY_TIMEOUT: Duration = Duration::from_secs(30);
 const PROBE_PRE_ROLL_S: f64 = 0.5;
 const PROBE_POST_ROLL_S: f64 = 0.8;
 const PROBE_BEEP_MS: f64 = 70.0;
@@ -336,16 +337,42 @@ fn run_native_delay_probe(
     // beep 播完后关闭它 → run 收 stdin EOF 优雅停机(比进程组 SIGINT 可靠,dev/打包都稳)。
     let mut run_stdin = child.stdin.take();
     let rx = spawn_probe_line_reader(stdout);
+    let mut saw_started = false;
     let mut session_dir: Option<PathBuf> = None;
     let mut saw_done = false;
 
+    let ready_deadline = Instant::now() + PROBE_PIPELINE_READY_TIMEOUT;
+    while !probe_pipeline_ready(saw_started, &session_dir) {
+        if cancel.load(Ordering::SeqCst) {
+            stop_probe_child(&mut child)?;
+            bail!("probe-delay cancelled");
+        }
+        drain_probe_output(&rx, &mut saw_started, &mut session_dir, &mut saw_done);
+        if let Some(status) = child.try_wait()? {
+            bail!("echoless run probe exited before the pipeline became ready: {status}");
+        }
+        if probe_pipeline_ready(saw_started, &session_dir) {
+            break;
+        }
+        if Instant::now() >= ready_deadline {
+            stop_probe_child(&mut child)?;
+            bail!(
+                "echoless run probe did not emit started and diagnostics_started within {} seconds",
+                PROBE_PIPELINE_READY_TIMEOUT.as_secs()
+            );
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    // startup_delay is a stabilization period for live streams, not a substitute
+    // for readiness. Start it only after both the run and diagnostics writer exist.
     let startup_deadline = Instant::now() + Duration::from_secs_f64(a.startup_delay);
     while Instant::now() < startup_deadline {
         if cancel.load(Ordering::SeqCst) {
             stop_probe_child(&mut child)?;
             bail!("probe-delay cancelled");
         }
-        drain_probe_output(&rx, &mut session_dir, &mut saw_done);
+        drain_probe_output(&rx, &mut saw_started, &mut session_dir, &mut saw_done);
         if let Some(status) = child.try_wait()? {
             bail!("echoless run probe exited prematurely: {status}");
         }
@@ -375,7 +402,7 @@ fn run_native_delay_probe(
 
     // beep 播完 = run 已录够诊断。关闭 stdin 触发 run 优雅停机(flush diagnostic、输出
     // 「诊断录制完成」后退出),不再靠 finish loop 空等 deadline + SIGINT —— dev sidecar 下
-    // 进程组 SIGINT 停不干净,run 会常驻 R 态、把 probe 拖到逼近 45s 超时(前端一直 PROBING)。
+    // 进程组 SIGINT 停不干净,run 会常驻 R 态、把 probe 拖到外层超时(前端一直 PROBING)。
     drop(run_stdin.take());
 
     let finish_deadline = Instant::now() + Duration::from_secs(u64::from(diagnostic_seconds) + 2);
@@ -384,7 +411,7 @@ fn run_native_delay_probe(
             stop_probe_child(&mut child)?;
             bail!("probe-delay cancelled");
         }
-        drain_probe_output(&rx, &mut session_dir, &mut saw_done);
+        drain_probe_output(&rx, &mut saw_started, &mut session_dir, &mut saw_done);
         if saw_done {
             break;
         }
@@ -398,8 +425,14 @@ fn run_native_delay_probe(
     }
 
     stop_probe_child(&mut child)?;
-    drain_probe_output(&rx, &mut session_dir, &mut saw_done);
-    drain_probe_output_until_closed(&rx, &mut session_dir, &mut saw_done, Duration::from_secs(1));
+    drain_probe_output(&rx, &mut saw_started, &mut session_dir, &mut saw_done);
+    drain_probe_output_until_closed(
+        &rx,
+        &mut saw_started,
+        &mut session_dir,
+        &mut saw_done,
+        Duration::from_secs(1),
+    );
 
     session_dir
         .filter(|path| path.is_dir())
@@ -555,16 +588,18 @@ where
 
 fn drain_probe_output(
     rx: &Receiver<String>,
+    saw_started: &mut bool,
     session_dir: &mut Option<PathBuf>,
     saw_done: &mut bool,
 ) {
     while let Ok(line) = rx.try_recv() {
-        handle_probe_output_line(&line, session_dir, saw_done);
+        handle_probe_output_line(&line, saw_started, session_dir, saw_done);
     }
 }
 
 fn drain_probe_output_until_closed(
     rx: &Receiver<String>,
+    saw_started: &mut bool,
     session_dir: &mut Option<PathBuf>,
     saw_done: &mut bool,
     timeout: Duration,
@@ -572,7 +607,7 @@ fn drain_probe_output_until_closed(
     let deadline = Instant::now() + timeout;
     loop {
         match rx.recv_timeout(Duration::from_millis(25)) {
-            Ok(line) => handle_probe_output_line(&line, session_dir, saw_done),
+            Ok(line) => handle_probe_output_line(&line, saw_started, session_dir, saw_done),
             Err(RecvTimeoutError::Disconnected) => break,
             Err(RecvTimeoutError::Timeout) if Instant::now() < deadline => continue,
             Err(RecvTimeoutError::Timeout) => break,
@@ -580,11 +615,17 @@ fn drain_probe_output_until_closed(
     }
 }
 
-fn handle_probe_output_line(line: &str, session_dir: &mut Option<PathBuf>, saw_done: &mut bool) {
+fn handle_probe_output_line(
+    line: &str,
+    saw_started: &mut bool,
+    session_dir: &mut Option<PathBuf>,
+    saw_done: &mut bool,
+) {
     let Ok(event) = serde_json::from_str::<serde_json::Value>(line) else {
         return;
     };
     match event.get("type").and_then(serde_json::Value::as_str) {
+        Some("started") => *saw_started = true,
         Some("diagnostics_started") => {
             if let Some(path) = event.get("session_dir").and_then(serde_json::Value::as_str) {
                 *session_dir = Some(PathBuf::from(path));
@@ -593,6 +634,10 @@ fn handle_probe_output_line(line: &str, session_dir: &mut Option<PathBuf>, saw_d
         Some("diagnostics_done") => *saw_done = true,
         _ => {}
     }
+}
+
+fn probe_pipeline_ready(saw_started: bool, session_dir: &Option<PathBuf>) -> bool {
+    saw_started && session_dir.is_some()
 }
 
 fn stop_probe_child(child: &mut std::process::Child) -> Result<()> {
@@ -1055,7 +1100,7 @@ mod tests {
     }
 
     #[test]
-    fn probe_uses_only_the_diagnostics_started_session_event() {
+    fn probe_waits_for_run_and_diagnostics_readiness_before_playback() {
         let (sender, receiver) = channel();
         sender
             .send("diagnostics recording directory: /tmp/human-fallback".to_string())
@@ -1065,6 +1110,16 @@ mod tests {
                 r#"{"type":"started","diagnostics_session_dir":"/tmp/started-field"}"#.to_string(),
             )
             .unwrap();
+        let mut started = false;
+        let mut session = None;
+        let mut done = false;
+
+        drain_probe_output(&receiver, &mut started, &mut session, &mut done);
+
+        assert!(started);
+        assert_eq!(session, None);
+        assert!(!probe_pipeline_ready(started, &session));
+
         sender
             .send(
                 r#"{"type":"diagnostics_started","session_dir":"/tmp/exact-session"}"#.to_string(),
@@ -1073,12 +1128,11 @@ mod tests {
         sender
             .send(r#"{"type":"diagnostics_done","session_dir":"/tmp/done-session"}"#.to_string())
             .unwrap();
-        let mut session = None;
-        let mut done = false;
 
-        drain_probe_output(&receiver, &mut session, &mut done);
+        drain_probe_output(&receiver, &mut started, &mut session, &mut done);
 
         assert_eq!(session, Some(PathBuf::from("/tmp/exact-session")));
+        assert!(probe_pipeline_ready(started, &session));
         assert!(done);
     }
 

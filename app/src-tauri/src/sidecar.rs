@@ -98,7 +98,8 @@ fn run_probe_streaming(
 }
 
 /// 同时录 ref/mic、分析两路相对到达时差,返回 NearDelayProbeResult(含 recommended_near_delay_ms)。
-/// 约 15 秒、会外放蜂鸣 —— 故必须先停掉主 run(probe 内部自起子进程占用设备),由前端 gating。
+/// 通常约 15 秒(首次 macOS 权限/Process Tap 启动可能更久)、会外放蜂鸣 —— 故必须先停掉
+/// 主 run(probe 内部自起子进程占用设备),由前端 gating。
 /// 支持 macOS / Windows / Linux(见 probe_delay.rs);不支持的平台 CLI 会非 0 退出,错误经 stderr 透传给前端。
 #[tauri::command]
 pub(crate) async fn probe_delay(
