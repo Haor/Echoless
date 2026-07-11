@@ -78,7 +78,7 @@ pub(crate) fn cmd_probe_delay(a: ProbeDelayArgs) -> Result<()> {
     })
     .context("failed to install probe-delay cancel handler")?;
 
-    let (result, cleanup_beep_dir, cleanup_session, session_retained) =
+    let (result, cleanup_beep_dir, cleanup_session, mut session_retained) =
         if let Some(session_dir) = &a.analyze_only {
             (analyze_probe_session(&a, session_dir)?, None, None, true)
         } else {
@@ -95,7 +95,7 @@ pub(crate) fn cmd_probe_delay(a: ProbeDelayArgs) -> Result<()> {
         let _ = remove_dir_all(dir);
     }
     if let Some(session_dir) = cleanup_session {
-        remove_generated_probe_session(&session_dir)?;
+        session_retained = cleanup_generated_probe_session(&session_dir, a.json);
     }
     emit_probe_result(&result, a.json, session_retained)?;
     if let Some(warning) = result.warnings.first() {
@@ -104,8 +104,35 @@ pub(crate) fn cmd_probe_delay(a: ProbeDelayArgs) -> Result<()> {
     Ok(())
 }
 
-fn remove_generated_probe_session(session_dir: &Path) -> Result<()> {
-    remove_probe_session_under(&echoless_paths::diagnostics_dir(), session_dir)
+fn cleanup_generated_probe_session(session_dir: &Path, json_mode: bool) -> bool {
+    cleanup_probe_session_under(&echoless_paths::diagnostics_dir(), session_dir, json_mode)
+}
+
+fn cleanup_probe_session_under(root: &Path, session_dir: &Path, json_mode: bool) -> bool {
+    match remove_probe_session_under(root, session_dir) {
+        Ok(()) => false,
+        Err(error) => {
+            let retained = session_dir.is_dir();
+            let message = format!(
+                "failed to clean generated probe session {}: {error:#}",
+                session_dir.display()
+            );
+            if json_mode {
+                eprintln!(
+                    "{}",
+                    json!({
+                        "type": "probe_warning",
+                        "stage": "cleanup",
+                        "message": message,
+                        "session_retained": retained,
+                    })
+                );
+            } else {
+                eprintln!("probe-delay warning: {message}");
+            }
+            retained
+        }
+    }
 }
 
 fn remove_probe_session_under(root: &Path, session_dir: &Path) -> Result<()> {
@@ -1038,6 +1065,25 @@ mod tests {
         assert!(!session.exists());
         assert!(root.is_dir());
         let _ = remove_dir_all(root);
+    }
+
+    #[test]
+    fn probe_cleanup_failure_keeps_the_result_and_reports_actual_retention() {
+        let root = temp_probe_test_dir("cleanup-best-effort-root");
+        let external = temp_probe_test_dir("cleanup-best-effort-external");
+        std::fs::write(external.join("sentinel"), b"external").unwrap();
+
+        assert!(cleanup_probe_session_under(&root, &external, true));
+        assert_eq!(
+            std::fs::read(external.join("sentinel")).unwrap(),
+            b"external"
+        );
+
+        let missing = root.join("session-missing");
+        assert!(!cleanup_probe_session_under(&root, &missing, true));
+
+        let _ = remove_dir_all(root);
+        let _ = remove_dir_all(external);
     }
 
     #[test]
