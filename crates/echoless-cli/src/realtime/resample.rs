@@ -2,20 +2,15 @@ use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use ringbuf::traits::Consumer;
-use rubato::{FftFixedIn, FftFixedOut, Resampler};
+use rubato::{FftFixedOut, Resampler};
 
 use super::frame_ring::try_pop_frame;
 
 pub(super) struct InterleavedInputResampler {
     in_rate: u32,
     out_rate: u32,
-    channels: usize,
-    configured_input_frames: usize,
-    planes: Vec<Vec<f32>>,
-    resampled_planes: Vec<Vec<f32>>,
     output: Vec<f32>,
-    resampler: Option<FftFixedIn<f32>>,
-    linear_fallback: InterleavedLinearFallback,
+    streaming: InterleavedLinearResampler,
 }
 
 impl InterleavedInputResampler {
@@ -24,13 +19,8 @@ impl InterleavedInputResampler {
         Self {
             in_rate,
             out_rate,
-            channels,
-            configured_input_frames: 0,
-            planes: Vec::new(),
-            resampled_planes: Vec::new(),
             output: Vec::new(),
-            resampler: None,
-            linear_fallback: InterleavedLinearFallback::new(in_rate, out_rate, channels),
+            streaming: InterleavedLinearResampler::new(in_rate, out_rate, channels),
         }
     }
 
@@ -44,82 +34,27 @@ impl InterleavedInputResampler {
             return &self.output;
         }
 
-        let frames = input.len() / self.channels;
-        if frames == 0 {
-            return &self.output;
-        }
-
-        self.ensure_layout(frames);
-        self.fill_planes(input, frames);
-
-        if let Some((_, out_frames)) = self.resampler.as_mut().and_then(|resampler| {
-            resampler
-                .process_into_buffer(&self.planes, &mut self.resampled_planes, None)
-                .ok()
-        }) {
-            self.interleave_from_resampled(out_frames);
-        } else {
-            self.linear_fallback.process_into(input, &mut self.output);
-        }
+        self.streaming.process_into(input, &mut self.output);
 
         &self.output
     }
-
-    fn ensure_layout(&mut self, input_frames: usize) {
-        if self.configured_input_frames == input_frames {
-            return;
-        }
-        self.configured_input_frames = input_frames;
-        resize_planes(&mut self.planes, self.channels, input_frames);
-
-        self.resampler = FftFixedIn::<f32>::new(
-            self.in_rate as usize,
-            self.out_rate as usize,
-            input_frames,
-            1,
-            self.channels,
-        )
-        .ok();
-        let output_frames_max = self
-            .resampler
-            .as_ref()
-            .map(Resampler::output_frames_max)
-            .unwrap_or_else(|| scaled_frames(input_frames, self.in_rate, self.out_rate));
-        resize_planes(&mut self.resampled_planes, self.channels, output_frames_max);
-        self.output.resize(output_frames_max * self.channels, 0.0);
-        self.output.clear();
-    }
-
-    fn fill_planes(&mut self, input: &[f32], frames: usize) {
-        for frame in 0..frames {
-            let frame_start = frame * self.channels;
-            for channel in 0..self.channels {
-                self.planes[channel][frame] = input[frame_start + channel];
-            }
-        }
-    }
-
-    fn interleave_from_resampled(&mut self, frames: usize) {
-        self.output.resize(frames * self.channels, 0.0);
-        for frame in 0..frames {
-            for channel in 0..self.channels {
-                self.output[frame * self.channels + channel] =
-                    self.resampled_planes[channel][frame];
-            }
-        }
-    }
 }
 
-struct InterleavedLinearFallback {
+/// 持久的交织输入线性 SRC。
+///
+/// 相位和上一输入帧跨 callback 保留，因此 callback 尺寸变化不会重建滤波器或插入静音。
+/// 一帧 look-ahead 是固定启动延迟；之后输出速率只由累计绝对 source position 决定。
+struct InterleavedLinearResampler {
     in_rate: u32,
     out_rate: u32,
     channels: usize,
     input_frames_seen: u64,
     next_output_source_pos: f64,
-    prev_frame: Option<Vec<f32>>,
+    has_prev_frame: bool,
+    prev_frame: Vec<f32>,
 }
 
-impl InterleavedLinearFallback {
+impl InterleavedLinearResampler {
     fn new(in_rate: u32, out_rate: u32, channels: usize) -> Self {
         Self {
             in_rate,
@@ -127,7 +62,8 @@ impl InterleavedLinearFallback {
             channels: channels.max(1),
             input_frames_seen: 0,
             next_output_source_pos: 0.0,
-            prev_frame: None,
+            has_prev_frame: false,
+            prev_frame: vec![0.0; channels.max(1)],
         }
     }
 
@@ -162,7 +98,9 @@ impl InterleavedLinearFallback {
 
         self.input_frames_seen = end_abs;
         let last_start = (frames - 1) * self.channels;
-        self.prev_frame = Some(input[last_start..last_start + self.channels].to_vec());
+        self.prev_frame
+            .copy_from_slice(&input[last_start..last_start + self.channels]);
+        self.has_prev_frame = true;
     }
 
     fn sample_at(
@@ -172,11 +110,8 @@ impl InterleavedLinearFallback {
         index_abs: u64,
         channel: usize,
     ) -> Option<f32> {
-        if index_abs + 1 == start_abs {
-            return self
-                .prev_frame
-                .as_ref()
-                .and_then(|frame| frame.get(channel).copied());
+        if index_abs + 1 == start_abs && self.has_prev_frame {
+            return self.prev_frame.get(channel).copied();
         }
         if index_abs < start_abs {
             return None;
@@ -697,7 +632,16 @@ mod tests {
         let capacity = input_capacity_signature(&resampler);
         let second = resampler.process(&input).to_vec();
 
-        assert!(first.len() >= 480);
+        assert_eq!(
+            first.len(),
+            478,
+            "one source-frame look-ahead is fixed startup latency"
+        );
+        assert_eq!(
+            second.len(),
+            480,
+            "steady-state output must recover the nominal rate"
+        );
         assert!(first.iter().all(|sample| sample.is_finite()));
         assert!(second.iter().all(|sample| sample.is_finite()));
         assert_eq!(input_capacity_signature(&resampler), capacity);
@@ -795,11 +739,161 @@ mod tests {
     }
 
     fn input_capacity_signature(resampler: &InterleavedInputResampler) -> Vec<usize> {
-        let mut caps = vec![resampler.output.capacity(), resampler.planes.capacity()];
-        caps.extend(resampler.planes.iter().map(Vec::capacity));
-        caps.push(resampler.resampled_planes.capacity());
-        caps.extend(resampler.resampled_planes.iter().map(Vec::capacity));
-        caps
+        vec![
+            resampler.output.capacity(),
+            resampler.streaming.prev_frame.capacity(),
+        ]
+    }
+
+    fn continuous_interleaved_signal(frames: usize, rate: u32, channels: usize) -> Vec<f32> {
+        let mut input = Vec::with_capacity(frames * channels);
+        for frame in 0..frames {
+            let t = frame as f32 / rate as f32;
+            input.push(0.2 + 0.04 * (440.0 * std::f32::consts::TAU * t).sin());
+            if channels == 2 {
+                input.push(-0.35 + 0.03 * (730.0 * std::f32::consts::TAU * t).cos());
+            }
+        }
+        input
+    }
+
+    #[test]
+    fn input_resampler_preserves_phase_across_variable_callbacks() {
+        let callback_frames = [441usize, 441, 220, 221, 441, 441];
+        let total_frames: usize = callback_frames.iter().sum();
+
+        for (in_rate, out_rate) in [(44_100, 48_000), (48_000, 44_100)] {
+            for channels in [1usize, 2] {
+                let input = continuous_interleaved_signal(total_frames, in_rate, channels);
+                let mut monolithic = InterleavedInputResampler::new(in_rate, out_rate, channels);
+                let expected = monolithic.process(&input).to_vec();
+
+                let mut streaming = InterleavedInputResampler::new(in_rate, out_rate, channels);
+                let mut actual = Vec::with_capacity(expected.len());
+                let mut input_offset = 0usize;
+                let mut warm_capacity = None;
+                for frames in callback_frames {
+                    let start = input_offset * channels;
+                    let end = (input_offset + frames) * channels;
+                    let chunk = streaming.process(&input[start..end]);
+                    assert!(
+                        !chunk.is_empty(),
+                        "{in_rate}->{out_rate} {channels}ch callback {frames} reset to silence"
+                    );
+                    assert!(chunk.iter().all(|sample| sample.is_finite()));
+                    actual.extend_from_slice(chunk);
+                    input_offset += frames;
+
+                    let capacity = input_capacity_signature(&streaming);
+                    match &warm_capacity {
+                        Some(expected_capacity) => assert_eq!(
+                            &capacity, expected_capacity,
+                            "callback size change rebuilt input SRC buffers"
+                        ),
+                        None => warm_capacity = Some(capacity),
+                    }
+                }
+
+                assert_eq!(actual.len(), expected.len());
+                for (index, (actual, expected)) in actual.iter().zip(expected.iter()).enumerate() {
+                    assert!(
+                        (actual - expected).abs() <= 1.0e-6,
+                        "phase discontinuity at sample {index}: {actual} != {expected}"
+                    );
+                }
+                for frame in actual.chunks_exact(channels) {
+                    assert!(
+                        (0.14..=0.26).contains(&frame[0]),
+                        "left/mono channel contains reset silence: {}",
+                        frame[0]
+                    );
+                    if channels == 2 {
+                        assert!(
+                            (-0.39..=-0.31).contains(&frame[1]),
+                            "stereo channel order or continuity changed: {}",
+                            frame[1]
+                        );
+                    }
+                }
+
+                let actual_frames = actual.len() / channels;
+                let nominal_frames = total_frames as f64 * out_rate as f64 / in_rate as f64;
+                assert!(
+                    (actual_frames as f64 - nominal_frames).abs() <= 2.0,
+                    "unexpected cumulative frame count: actual={actual_frames}, nominal={nominal_frames:.3}"
+                );
+                eprintln!(
+                    "input SRC {in_rate}->{out_rate} {channels}ch callbacks={callback_frames:?}: frames={actual_frames}, nominal={nominal_frames:.3}, capacities={:?}",
+                    warm_capacity.expect("first callback records capacity")
+                );
+            }
+        }
+    }
+
+    fn speech_band_sample(time_seconds: f64) -> f32 {
+        let envelope = 0.65 + 0.25 * (3.1 * std::f64::consts::TAU * time_seconds).sin();
+        let harmonics = [
+            (120.0, 0.22),
+            (220.0, 0.18),
+            (700.0, 0.14),
+            (1_400.0, 0.11),
+            (2_800.0, 0.08),
+            (5_600.0, 0.05),
+        ];
+        (envelope
+            * harmonics
+                .iter()
+                .map(|(hz, amplitude)| {
+                    amplitude * (hz * std::f64::consts::TAU * time_seconds).sin()
+                })
+                .sum::<f64>()) as f32
+    }
+
+    #[test]
+    fn input_linear_src_keeps_speech_band_error_below_release_threshold() {
+        for (in_rate, out_rate) in [(44_100, 48_000), (48_000, 44_100)] {
+            let input_frames = in_rate as usize * 2;
+            let input: Vec<f32> = (0..input_frames)
+                .map(|frame| speech_band_sample(frame as f64 / in_rate as f64))
+                .collect();
+            let callback_pattern = [441usize, 220, 221, 480, 317, 604];
+            let mut resampler = InterleavedInputResampler::new(in_rate, out_rate, 1);
+            let mut output = Vec::new();
+            let mut offset = 0usize;
+            let mut callback = 0usize;
+            while offset < input.len() {
+                let frames =
+                    callback_pattern[callback % callback_pattern.len()].min(input.len() - offset);
+                output.extend_from_slice(resampler.process(&input[offset..offset + frames]));
+                offset += frames;
+                callback += 1;
+            }
+
+            let (signal_energy, error_energy) = output.iter().enumerate().fold(
+                (0.0f64, 0.0f64),
+                |(signal_energy, error_energy), (frame, actual)| {
+                    let expected = speech_band_sample(frame as f64 / out_rate as f64) as f64;
+                    let error = *actual as f64 - expected;
+                    (
+                        signal_energy + expected * expected,
+                        error_energy + error * error,
+                    )
+                },
+            );
+            let snr_db = 10.0 * (signal_energy / error_energy).log10();
+            eprintln!(
+                "input SRC speech-band {in_rate}->{out_rate}: frames={}, SNR={snr_db:.2} dB",
+                output.len()
+            );
+            assert!(
+                output.iter().all(|sample| sample.is_finite()),
+                "speech-band output contains a non-finite sample"
+            );
+            assert!(
+                snr_db >= 35.0,
+                "speech-band interpolation quality regressed: {snr_db:.2} dB"
+            );
+        }
     }
 
     // ── T3 输出侧自适应速率匹配回归 ──────────────────────────────────────────────
