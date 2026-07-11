@@ -150,6 +150,9 @@ UI cleanup.
   point installation, recording, probe cleanup, or session deletion at an
   arbitrary directory; delay-probe cleanup is limited to the exact session it
   created.
+- Fixed diagnostics recording so its enabled state is independent of the
+  optional time cap. CLI and TOML users can again record until stopped while
+  the output directory remains managed by Echoless.
 - Undersized AEC3 filter-tail settings now fail validation instead of reaching
   an internal assertion, and all physical capture paths replace non-finite
   device samples before they can poison a stateful processor.

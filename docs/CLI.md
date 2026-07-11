@@ -44,7 +44,10 @@ Key flags (all override the config file): `--mic`, `--reference`,
 `--near-delay-ms`, `--output-level 0..100` (50 = unity),
 `--processor aec3|localvqe|nvidia_afx_aec|…`, `--ns/--no-ns`, `--ns-level`,
 `--tail-ms`, `--verbose`, `--status-json`,
-`--diagnostic-seconds N` (records under the managed Echoless diagnostics directory).
+`--diagnostics` (records until stopped), and `--diagnostic-seconds N` (records
+for a bounded duration). Diagnostics always use the managed Echoless directory.
+The config equivalents are `diagnostics.enabled = true` and the optional
+`diagnostics.max_seconds = N`.
 
 With `--status-json`, stdout is JSONL: first a `started` event (negotiated
 devices, `supported_controls`, resampling info), then periodic status frames

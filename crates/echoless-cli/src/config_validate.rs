@@ -197,6 +197,7 @@ fn validate_config_shape(value: &toml::Value) -> Vec<ConfigValidationError> {
     }
     if let Some(value) = table.get("diagnostics") {
         if let Some(diagnostics) = value.as_table() {
+            expect_bool(diagnostics, "diagnostics", "enabled", &mut errors);
             expect_top_i64(diagnostics, "diagnostics.max_seconds", &mut errors);
         } else {
             errors.push(ConfigValidationError::new(
@@ -729,6 +730,22 @@ mod tests {
         .unwrap();
 
         assert!(cfg.bypass);
+    }
+
+    #[test]
+    fn config_shape_validation_reports_non_boolean_diagnostics_enabled() {
+        let value: toml::Value = toml::from_str(
+            r#"
+            [diagnostics]
+            enabled = "yes"
+            "#,
+        )
+        .unwrap();
+
+        let errors = validate_config_shape(&value);
+
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].path, "diagnostics.enabled");
     }
 
     #[test]

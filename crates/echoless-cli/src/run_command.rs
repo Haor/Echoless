@@ -104,10 +104,15 @@ fn apply_run_overrides(mut cfg: PipelineConfig, a: &RunArgs) -> Result<PipelineC
             toml::Value::Integer(tail_ms.into()),
         )?;
     }
+    if a.diagnostics {
+        cfg.diagnostics.enabled = true;
+        cfg.diagnostics.max_seconds = None;
+    }
     if let Some(seconds) = a.diagnostic_seconds {
         if seconds == 0 {
             bail!("--diagnostic-seconds must be greater than 0");
         }
+        cfg.diagnostics.enabled = true;
         cfg.diagnostics.max_seconds = Some(seconds);
     }
 
@@ -162,6 +167,7 @@ mod tests {
             verbose: false,
             stats_interval_ms: None,
             status_json: false,
+            diagnostics: false,
             diagnostic_seconds: None,
         }
     }
@@ -212,7 +218,22 @@ mod tests {
 
         let cfg = apply_run_overrides(PipelineConfig::default(), &args).unwrap();
 
+        assert!(cfg.diagnostics.recording_enabled());
         assert_eq!(cfg.diagnostics.max_seconds, Some(30));
+    }
+
+    #[test]
+    fn run_overrides_enable_unbounded_fixed_diagnostics() {
+        let mut args = run_args();
+        args.diagnostics = true;
+        let mut base = PipelineConfig::default();
+        base.diagnostics.enabled = true;
+        base.diagnostics.max_seconds = Some(30);
+
+        let cfg = apply_run_overrides(base, &args).unwrap();
+
+        assert!(cfg.diagnostics.recording_enabled());
+        assert_eq!(cfg.diagnostics.max_seconds, None);
     }
 
     #[test]

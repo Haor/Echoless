@@ -377,6 +377,7 @@ export function buildConfigToml(c: ConfigChoice): string {
   lines.push(``);
   if (c.diagnostics) {
     lines.push(`[diagnostics]`);
+    lines.push(`enabled = true`);
     if (c.diagnostics.max_seconds != null)
       lines.push(`max_seconds = ${c.diagnostics.max_seconds}`);
     lines.push(``);

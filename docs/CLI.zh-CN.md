@@ -44,7 +44,9 @@ echoless run --config my.toml --status-json
 `--near-delay-ms`、`--output-level 0..100`(50 = 原始音量)、
 `--processor aec3|localvqe|nvidia_afx_aec|…`、`--ns/--no-ns`、`--ns-level`、
 `--tail-ms`、`--verbose`、`--status-json`、
-`--diagnostic-seconds N`(录制到 Echoless 固定诊断目录)。
+`--diagnostics`(持续录制到停止)、`--diagnostic-seconds N`(限时录制)。诊断文件
+始终写入 Echoless 固定目录；配置文件对应 `diagnostics.enabled = true`，并可选
+设置 `diagnostics.max_seconds = N`。
 
 加上 `--status-json` 后,stdout 输出 JSONL:首先是一个 `started` 事件
 (协商后的设备、`supported_controls`、重采样信息),随后是周期性的状态帧

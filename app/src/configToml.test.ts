@@ -121,7 +121,7 @@ describe("TOML basic string encoding", () => {
       diagnostics: { max_seconds: 30 },
     });
 
-    expect(config).toContain("[diagnostics]\nmax_seconds = 30");
+    expect(config).toContain("[diagnostics]\nenabled = true\nmax_seconds = 30");
     expect(config).not.toContain("record_dir");
   });
 });

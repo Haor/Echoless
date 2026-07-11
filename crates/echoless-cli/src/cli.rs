@@ -157,6 +157,9 @@ pub(crate) struct RunArgs {
     /// Emit JSONL runtime status for GUI/sidecar consumers
     #[arg(long)]
     pub(crate) status_json: bool,
+    /// Record diagnostics in the managed diagnostics directory until stopped
+    #[arg(long)]
+    pub(crate) diagnostics: bool,
     /// Record diagnostics in the managed diagnostics directory for this many seconds
     #[arg(long)]
     pub(crate) diagnostic_seconds: Option<u32>,
@@ -174,7 +177,18 @@ fn parse_reference_channels(s: &str) -> Result<ReferenceChannels, String> {
 mod tests {
     use clap::{error::ErrorKind, Parser};
 
-    use super::Cli;
+    use super::{Cli, Cmd};
+
+    #[test]
+    fn run_accepts_unbounded_fixed_diagnostics() {
+        let cli = Cli::try_parse_from(["echoless", "run", "--diagnostics"]).unwrap();
+        let Cmd::Run(args) = cli.cmd else {
+            panic!("run command was not parsed");
+        };
+
+        assert!(args.diagnostics);
+        assert_eq!(args.diagnostic_seconds, None);
+    }
 
     #[test]
     fn nvafx_commands_reject_removed_runtime_dir_option() {
