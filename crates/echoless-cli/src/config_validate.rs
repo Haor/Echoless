@@ -6,7 +6,7 @@ use echoless_core::{
     PipelineConfig, ReferenceChannels, MAX_INITIAL_DELAY_MS, MAX_NEAR_DELAY_MS, MAX_OUTPUT_LEVEL,
     MIN_OUTPUT_LEVEL,
 };
-use echoless_processors::{registry, NodeConfig};
+use echoless_processors::{aec3::MIN_TAIL_MS, registry, NodeConfig};
 
 #[derive(Args)]
 pub(crate) struct ConfigArgs {
@@ -356,7 +356,7 @@ fn validate_aec3_node(base: &str, params: &toml::Table, errors: &mut Vec<ConfigV
         i64::from(MAX_INITIAL_DELAY_MS),
         errors,
     );
-    expect_i64_min(params, base, "tail_ms", 4, errors);
+    expect_i64_min(params, base, "tail_ms", i64::from(MIN_TAIL_MS), errors);
     expect_i64_min(params, base, "delay_num_filters", 1, errors);
     expect_string_one_of(
         params,
@@ -674,6 +674,27 @@ mod tests {
 
         let errors = validate_pipeline_config(&cfg);
 
+        assert!(errors.is_empty(), "{errors:?}");
+    }
+
+    #[test]
+    fn aec3_tail_validation_matches_the_runtime_boundary() {
+        let mut params = toml::Table::new();
+        params.insert(
+            "tail_ms".into(),
+            toml::Value::Integer(i64::from(MIN_TAIL_MS - 1)),
+        );
+        let mut errors = Vec::new();
+        validate_aec3_node("chain[0]", &params, &mut errors);
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].path, "chain[0].tail_ms");
+
+        params.insert(
+            "tail_ms".into(),
+            toml::Value::Integer(i64::from(MIN_TAIL_MS)),
+        );
+        errors.clear();
+        validate_aec3_node("chain[0]", &params, &mut errors);
         assert!(errors.is_empty(), "{errors:?}");
     }
 

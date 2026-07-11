@@ -7,7 +7,7 @@ use echoless_core::{
     MAX_OUTPUT_LEVEL, MIN_OUTPUT_LEVEL, OUTPUT_LEVEL_CURVE_EXPONENT, OUTPUT_LEVEL_MAX_BOOST_DB,
     OUTPUT_LEVEL_MAX_GAIN, UNITY_OUTPUT_LEVEL,
 };
-use echoless_processors::registry;
+use echoless_processors::{aec3::MIN_TAIL_MS, registry};
 
 pub(crate) fn cmd_processors(args: ProcessorsArgs) -> Result<()> {
     if args.json {
@@ -106,7 +106,7 @@ fn processor_manifest() -> serde_json::Value {
                     "tail_ms": {
                         "type": "number",
                         "default": null,
-                        "min": 4,
+                        "min": MIN_TAIL_MS,
                         "advanced": true
                     },
                     "delay_num_filters": {
@@ -197,6 +197,7 @@ mod tests {
             json!(["mono", "stereo"])
         );
         assert_eq!(aec3["params"]["initial_delay_ms"]["min"], json!(0));
+        assert_eq!(aec3["params"]["tail_ms"]["min"], json!(MIN_TAIL_MS));
         assert_eq!(
             aec3["params"]["initial_delay_ms"]["max"],
             json!(MAX_INITIAL_DELAY_MS)

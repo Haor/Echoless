@@ -14,6 +14,8 @@ use crate::{EchoProcessor, IoSpec, ProcessorStats};
 
 const SR: u32 = 48_000;
 const FRAME: usize = 480; // 10ms @ 48k
+const AEC3_BLOCK_MS: u32 = 4;
+pub const MIN_TAIL_MS: u32 = 14;
 
 /// 我们的高层调参。tail/num_filters/linear 映射到 EchoCanceller3Config;ns/agc 走 aec3 APM。
 #[derive(Clone)]
@@ -100,8 +102,15 @@ impl EchoProcessor for Aec3Engine {
         if let Some(v) = params.get("initial_delay_ms").and_then(|v| v.as_integer()) {
             self.initial_delay_ms = v as i32;
         }
-        if let Some(v) = params.get("tail_ms").and_then(|v| v.as_integer()) {
-            self.tuning.tail_ms = Some(v.max(4) as u32);
+        if let Some(value) = params.get("tail_ms") {
+            let v = value
+                .as_integer()
+                .ok_or_else(|| anyhow::anyhow!("tail_ms must be an integer"))?;
+            if v < i64::from(MIN_TAIL_MS) {
+                anyhow::bail!("tail_ms must be >= {MIN_TAIL_MS}");
+            }
+            self.tuning.tail_ms =
+                Some(u32::try_from(v).map_err(|_| anyhow::anyhow!("tail_ms is too large"))?);
         }
         if let Some(v) = params.get("delay_num_filters").and_then(|v| v.as_integer()) {
             self.tuning.delay_num_filters = Some(v.max(1) as usize);
@@ -196,11 +205,10 @@ impl EchoProcessor for Aec3Engine {
 // ── 把高层 tuning 映射成底层 EchoCanceller3Config ──────────────────────────────
 #[cfg(feature = "aec3-engine")]
 fn build_aec3_config(t: &Aec3Tuning) -> aec3_apm::EchoCanceller3Config {
-    const BLOCK_MS: u32 = 4; // 底层 4ms/block(common.rs)
     let mut c = aec3_apm::EchoCanceller3Config::default();
 
     if let Some(tail_ms) = t.tail_ms {
-        let blocks = ((tail_ms + BLOCK_MS / 2) / BLOCK_MS).max(1) as usize; // 四舍五入到 block
+        let blocks = tail_ms_to_filter_blocks(tail_ms);
         c.filter.refined.length_blocks = blocks;
         c.filter.coarse.length_blocks = blocks;
         // 注:不动 refined_initial / coarse_initial。上游初始滤波器故意短(快速粗收敛,
@@ -220,6 +228,10 @@ fn build_aec3_config(t: &Aec3Tuning) -> aec3_apm::EchoCanceller3Config {
 
     c.validate(); // clamp 所有字段到合法范围
     c
+}
+
+fn tail_ms_to_filter_blocks(tail_ms: u32) -> usize {
+    ((u64::from(tail_ms) + u64::from(AEC3_BLOCK_MS / 2)) / u64::from(AEC3_BLOCK_MS)) as usize
 }
 
 #[cfg(feature = "aec3-engine")]
@@ -480,6 +492,33 @@ mod tests {
         assert!(processor.tuning.ns);
         assert_eq!(processor.tuning.ns_level, "high");
         assert!(processor.tuning.agc);
+    }
+
+    #[test]
+    fn aec3_tail_boundary_rejects_three_blocks_and_builds_four() {
+        let mut invalid = Aec3Engine::new();
+        let mut params = toml::Table::new();
+        params.insert(
+            "tail_ms".into(),
+            toml::Value::Integer(i64::from(MIN_TAIL_MS - 1)),
+        );
+        assert!(invalid.configure(&params).is_err());
+
+        let mut valid = Aec3Engine::new();
+        params.insert(
+            "tail_ms".into(),
+            toml::Value::Integer(i64::from(MIN_TAIL_MS)),
+        );
+        valid.configure(&params).unwrap();
+        assert_eq!(valid.tuning.tail_ms, Some(MIN_TAIL_MS));
+        assert_eq!(tail_ms_to_filter_blocks(MIN_TAIL_MS), 4);
+
+        #[cfg(feature = "aec3-engine")]
+        {
+            let config = build_aec3_config(&valid.tuning);
+            assert_eq!(config.filter.refined.length_blocks, 4);
+            assert_eq!(config.filter.coarse.length_blocks, 4);
+        }
     }
 
     #[test]
