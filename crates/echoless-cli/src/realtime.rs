@@ -518,6 +518,20 @@ pub fn run_with_options(cfg: &PipelineConfig, options: RuntimeOptions) -> Result
     }
     if options.status_json {
         println!("{}", serde_json::to_string(&started_event)?);
+        if let Some(session_dir) = started_event
+            .get("diagnostics_session_dir")
+            .and_then(serde_json::Value::as_str)
+        {
+            println!(
+                "{}",
+                serde_json::to_string(&json!({
+                    "type": "diagnostics_started",
+                    "session_dir": session_dir,
+                    "max_seconds": cfg.diagnostics.max_seconds,
+                    "recording": true,
+                }))?
+            );
+        }
     }
 
     print_human(

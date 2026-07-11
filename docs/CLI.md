@@ -87,7 +87,8 @@ calibration rig. Portable scripts should pass `--mic`, `--reference`, and
 
 Stops nothing by itself — don't run it while another `run` holds the devices.
 Flags: `--beeps N` (12), `--startup-delay S` (4), `--volume 0..1` (0.35),
-`--out-dir/--keep-session/--keep-beep`, `--analyze-only <session>`.
+`--keep-session` (retain this run's fixed-directory session), `--keep-beep`,
+`--analyze-only <session>`.
 
 JSON result includes `recommended_near_delay_ms` (measured lag + 8 ms
 safety), per-beep lags, stddev/drift and warnings. In `--json` mode progress

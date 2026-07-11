@@ -86,7 +86,8 @@ echoless probe-delay --json --mic default --reference system --output "CABLE Inp
 
 它本身不会停止任何东西——不要在另一个 `run` 正占用设备时运行它。
 Flag:`--beeps N`(12)、`--startup-delay S`(4)、`--volume 0..1`(0.35)、
-`--out-dir/--keep-session/--keep-beep`、`--analyze-only <session>`。
+`--keep-session`(保留本次固定目录 session)、`--keep-beep`、
+`--analyze-only <session>`。
 
 JSON 结果包含 `recommended_near_delay_ms`(实测延迟 + 8 ms 安全余量)、
 逐蜂鸣延迟、标准差/漂移和告警。在 `--json` 模式下,进度标记以 JSONL

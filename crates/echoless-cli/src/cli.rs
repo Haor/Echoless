@@ -230,4 +230,13 @@ mod tests {
         };
         assert_eq!(error.kind(), ErrorKind::UnknownArgument);
     }
+
+    #[test]
+    fn probe_delay_rejects_removed_out_dir_option() {
+        let error = match Cli::try_parse_from(["echoless", "probe-delay", "--out-dir", "custom"]) {
+            Ok(_) => panic!("removed --out-dir option was accepted"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), ErrorKind::UnknownArgument);
+    }
 }
