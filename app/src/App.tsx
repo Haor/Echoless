@@ -1513,7 +1513,7 @@ function AppShell() {
 
   // NVAFX 下载进度:CLI download-install 在 stderr 打的 JSONL,后端转成事件。
   // label 是「common runtime」/「model」两段,归一成 stage 让 UI 分别标注。
-  // pct 为 null(GitHub CDN 的 HEAD 拿不到 Content-Length)时,前端退化为显示已下字节数。
+  // 生产路径不额外查询远端大小:pct 恒为 null,有 received 时显示已接收字节。
   useEffect(() => {
     let alive = true;
     const un = onNvafxProgress((p) => {
@@ -1642,15 +1642,14 @@ function AppShell() {
   // 从公共 GitHub release 下载并安装(按 GPU 架构自动选模型)。dev 下模拟。
   function downloadInstallNvafx() {
     if (dev) {
-      // 模拟真实下载的两段(runtime → model),顺带演示两种显示模式:
-      //  runtime 段有 Content-Length → 显示百分比;
-      //  model 段模拟 GitHub CDN 的 HEAD 拿不到 Content-Length(pct=null)→ 走已下字节数兜底。
+      // 模拟真实下载的两段(runtime → model):不额外查询远端大小,
+      // 两段都用 pct=null + 已接收字节展示。
       const RUNTIME_TOTAL = 955 * 1024 * 1024;
       const MODEL_TOTAL = 46 * 1024 * 1024;
       updateApp({
         nvafxBusy: true,
         nvafxStage: "runtime",
-        nvafxPct: 0,
+        nvafxPct: null,
         nvafxRecv: 0,
         err: null,
       });
@@ -1677,11 +1676,10 @@ function AppShell() {
           const p = Math.min(pct, 99);
           updateApp({
             nvafxStage: "runtime",
-            nvafxPct: p,
+            nvafxPct: null,
             nvafxRecv: Math.round((p / 100) * RUNTIME_TOTAL),
           });
         } else {
-          // model 段:无 total → pct=null,只报字节数
           updateApp({
             nvafxStage: "model",
             nvafxPct: null,
