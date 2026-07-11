@@ -102,6 +102,7 @@ import {
   settleBypassObservation,
   clearBypassPending,
   routeEngineKindSelection,
+  shouldPickLocalvqeModel,
   canChangePipeline,
   pipelineForEngineKind,
 } from "./engineLogic";
@@ -723,12 +724,20 @@ function useEngineConfig({
 
   // 选 LocalVQE 模型(清单常驻):原子地切到 localvqe 引擎并设 model,避免把 model 写到当前引擎上。
   function pickLocalvqeModel(path: string) {
+    const selectedModel =
+      kindRef.current === "localvqe"
+        ? paramsRef.current.model
+        : paramsByKind.current["localvqe"]?.model;
+    if (!shouldPickLocalvqeModel(selectedModel, path)) return;
+
     const base =
       paramsByKind.current["localvqe"] ??
       defaultParams(processors.find((p) => p.kind === "localvqe"));
     const np = { ...base, model: path };
-    paramsByKind.current[kind] = paramsRef.current; // 存下当前引擎
+    paramsByKind.current[kindRef.current] = paramsRef.current;
     paramsByKind.current["localvqe"] = np;
+    kindRef.current = "localvqe";
+    paramsRef.current = np;
     updateEngine({ kind: "localvqe", params: np });
     applyChangeRef.current({ kind: "localvqe", params: np });
   }

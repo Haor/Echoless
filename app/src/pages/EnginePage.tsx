@@ -419,9 +419,10 @@ export function EnginePage({
             type="button"
             key={m.file}
             className={`lvmod ${selected ? "on" : found ? "have" : "miss"}`}
-            disabled={downloading}
+            disabled={downloading || selected}
             onClick={(e) => {
               e.stopPropagation();
+              if (selected) return;
               found ? onPickModel(found.path) : downloadModel(m.file);
             }}
             title={`${m.ver} · ${m.params} · ${found ? found.path : `${t("lvqeDownload")} ${m.file}`}`}

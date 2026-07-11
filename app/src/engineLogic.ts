@@ -46,6 +46,13 @@ export function routeEngineKindSelection(
   return "apply";
 }
 
+export function shouldPickLocalvqeModel(
+  selected: unknown,
+  next: string,
+): boolean {
+  return selected !== next;
+}
+
 export function canChangePipeline(
   kind: string,
   patch: Partial<PipelineCfg>,

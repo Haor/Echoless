@@ -13,6 +13,7 @@ import {
   clearBypassPending,
   createSerialQueue,
   routeEngineKindSelection,
+  shouldPickLocalvqeModel,
 } from "./engineLogic";
 
 describe("routeEngineKindSelection", () => {
@@ -71,6 +72,18 @@ describe("routeEngineKindSelection", () => {
       expect(applies).toBe(1);
     },
   );
+});
+
+describe("shouldPickLocalvqeModel", () => {
+  it("rejects the selected path and accepts a different or first model", () => {
+    expect(shouldPickLocalvqeModel("/models/a.gguf", "/models/a.gguf")).toBe(
+      false,
+    );
+    expect(shouldPickLocalvqeModel("/models/a.gguf", "/models/b.gguf")).toBe(
+      true,
+    );
+    expect(shouldPickLocalvqeModel(undefined, "/models/a.gguf")).toBe(true);
+  });
 });
 
 describe("LocalVQE NOISE ↔ model mapping", () => {

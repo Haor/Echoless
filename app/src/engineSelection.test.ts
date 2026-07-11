@@ -78,4 +78,15 @@ describe("current engine UI lock wiring", () => {
       'className={`ecard wide ${active ? "active" : ""}',
     );
   });
+
+  it("natively disables the selected LocalVQE model and guards direct handler calls", () => {
+    expect(enginePageSource).toContain("disabled={downloading || selected}");
+    expect(enginePageSource).toContain("if (selected) return;");
+    expect(appSource).toMatch(
+      /function pickLocalvqeModel\(path: string\) \{\s*const selectedModel =[\s\S]*?if \(!shouldPickLocalvqeModel\(selectedModel, path\)\) return;/,
+    );
+    expect(appSource).toContain(
+      'applyChangeRef.current({ kind: "localvqe", params: np });',
+    );
+  });
 });
