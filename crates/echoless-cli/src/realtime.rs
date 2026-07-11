@@ -1086,36 +1086,36 @@ where
     let mut resampler =
         OutputDeviceResampler::new(choice.pipeline_sample_rate, choice.stream_sample_rate());
     let needs_resampling = choice.requires_resampling();
-    // T3:设备率==管线率(Windows WASAPI shared 的活跃路径)时,用水位反馈自适应重采样
-    // 吸收生产/消费时钟漂移。设备率≠管线率时仍走固定比率 next_chunk(内部已含插值)。
+    // T3:启用 rate match 时始终使用 base-ratio + 水位反馈的连续重采样。名义采样率
+    // 不同时 base_ratio 处理 44.1↔48 kHz，trim 继续吸收两块设备时钟的 ppm 漂移。
     let mut adaptive = AdaptiveOutputResampler::new(
         choice.pipeline_sample_rate,
         choice.stream_sample_rate(),
         rate_match.setpoint_samples,
         rate_match.deadband_samples,
     );
-    let use_adaptive = rate_match.enabled && !needs_resampling;
+    let use_adaptive = rate_match.enabled;
     let mut adaptive_buf: Vec<f32> = Vec::new();
     device
         .build_output_stream(
             &config,
             move |data: &mut [T], _: &cpal::OutputCallbackInfo| {
                 let frames = data.len() / channels;
-                if needs_resampling {
-                    let samples = resampler.next_chunk(frames, &mut consumer, &underruns);
-                    for (frame_index, frame) in data.chunks_mut(channels).enumerate() {
-                        let s = T::from_sample(samples.get(frame_index).copied().unwrap_or(0.0));
-                        for out in frame {
-                            *out = s; // 单声道铺到所有输出声道
-                        }
-                    }
-                } else if use_adaptive {
+                if use_adaptive {
                     let occupied = consumer.occupied_len();
                     adaptive_buf.clear();
                     adaptive_buf.resize(frames, 0.0);
                     adaptive.fill(&mut adaptive_buf, occupied, &mut consumer, &underruns);
                     for (frame_index, frame) in data.chunks_mut(channels).enumerate() {
                         let s = T::from_sample(adaptive_buf[frame_index]);
+                        for out in frame {
+                            *out = s; // 单声道铺到所有输出声道
+                        }
+                    }
+                } else if needs_resampling {
+                    let samples = resampler.next_chunk(frames, &mut consumer, &underruns);
+                    for (frame_index, frame) in data.chunks_mut(channels).enumerate() {
+                        let s = T::from_sample(samples.get(frame_index).copied().unwrap_or(0.0));
                         for out in frame {
                             *out = s; // 单声道铺到所有输出声道
                         }

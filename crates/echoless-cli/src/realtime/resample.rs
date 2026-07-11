@@ -488,6 +488,11 @@ impl AdaptiveOutputResampler {
         self.controller.clamped
     }
 
+    #[cfg(test)]
+    pub(super) fn buffer_capacity(&self) -> usize {
+        self.buffer.capacity()
+    }
+
     /// 用当前水位 `occupied` 更新有效比率,然后连续插值填满 `output`。
     pub(super) fn fill<C>(
         &mut self,
@@ -498,17 +503,31 @@ impl AdaptiveOutputResampler {
     ) where
         C: Consumer<Item = f32>,
     {
-        // 预测本次回调消费后的水位(occupied - output.len()),交控制器求 trim。
-        let projected = occupied as f64 - output.len() as f64;
+        // occupied/setpoint 均以 pipeline frames 计。跨采样率时先把设备回调帧数换算到
+        // pipeline 时钟域，避免拿 44.1 kHz device frames 直接减 48 kHz ring frames。
+        let projected = occupied as f64 - output.len() as f64 * self.base_ratio;
         let trim = self.controller.update(projected);
         let step = (self.base_ratio * (1.0 + trim)).max(1.0e-6);
 
+        let mut missing_device_frames = 0usize;
         for sample in output.iter_mut() {
-            *sample = self.next_sample(step, consumer, underruns);
+            *sample = match self.next_sample(step, consumer) {
+                Some(sample) => sample,
+                None => {
+                    missing_device_frames += 1;
+                    0.0
+                }
+            };
+        }
+        if missing_device_frames != 0 {
+            // Diagnostics and clock-skew accounting use pipeline frames everywhere else.
+            let missing_pipeline_frames =
+                (missing_device_frames as f64 * self.base_ratio).round() as u64;
+            underruns.fetch_add(missing_pipeline_frames, Ordering::Relaxed);
         }
     }
 
-    fn next_sample<C>(&mut self, step: f64, consumer: &mut C, underruns: &AtomicU64) -> f32
+    fn next_sample<C>(&mut self, step: f64, consumer: &mut C) -> Option<f32>
     where
         C: Consumer<Item = f32>,
     {
@@ -516,10 +535,7 @@ impl AdaptiveOutputResampler {
         while self.buffer.len() < needed {
             match consumer.try_pop() {
                 Some(sample) => self.buffer.push_back(sample.clamp(-1.0, 1.0)),
-                None => {
-                    underruns.fetch_add(1, Ordering::Relaxed);
-                    return 0.0;
-                }
+                None => return None,
             }
         }
 
@@ -535,7 +551,7 @@ impl AdaptiveOutputResampler {
             let _ = self.buffer.pop_front();
         }
         self.pos -= consumed as f64;
-        sample
+        Some(sample)
     }
 }
 
@@ -840,6 +856,188 @@ mod tests {
             clamp_ratio,
             steady_underruns as usize,
         )
+    }
+
+    #[derive(Debug)]
+    struct CrossRateMetrics {
+        elapsed_seconds: f64,
+        underruns: u64,
+        early_steady_mean: f64,
+        late_steady_mean: f64,
+        steady_min: usize,
+        steady_max: usize,
+        min_trim: f64,
+        max_trim: f64,
+        clamp_callbacks: usize,
+        warm_buffer_capacity: usize,
+        final_buffer_capacity: usize,
+    }
+
+    fn run_cross_rate_output_drift(
+        in_rate: u32,
+        out_rate: u32,
+        ppm: f64,
+        callback_count: usize,
+    ) -> CrossRateMetrics {
+        let pipeline_frame = (in_rate / 100) as usize;
+        let device_frame = (out_rate / 100) as usize;
+        let setpoint = pipeline_frame * 2;
+        let deadband = pipeline_frame / 2;
+        let (mut producer, mut consumer) = HeapRb::<f32>::new(pipeline_frame * 16).split();
+        assert_eq!(producer.push_slice(&vec![0.0; setpoint]), setpoint);
+
+        let mut resampler = AdaptiveOutputResampler::new(in_rate, out_rate, setpoint, deadband);
+        let underruns = AtomicU64::new(0);
+        let callback_pattern = [
+            device_frame,
+            device_frame / 2,
+            device_frame - device_frame / 2,
+            device_frame * 2,
+            device_frame - 17,
+            device_frame + 17,
+        ];
+        let mut produced_fraction = 0.0f64;
+        let device_rate = out_rate as f64 * (1.0 + ppm * 1.0e-6);
+        let mut elapsed_seconds = 0.0f64;
+        let mut producer_block = Vec::<f32>::new();
+        let mut output = Vec::<f32>::new();
+        let steady_start = callback_count * 3 / 4;
+        let window = 1_000usize;
+        let late_start = callback_count - window;
+        let mut early_sum = 0usize;
+        let mut early_count = 0usize;
+        let mut late_sum = 0usize;
+        let mut steady_min = usize::MAX;
+        let mut steady_max = 0usize;
+        let mut min_trim = 0.0f64;
+        let mut max_trim = 0.0f64;
+        let mut clamp_callbacks = 0usize;
+        let mut warm_buffer_capacity = 0usize;
+
+        for callback in 0..callback_count {
+            let device_frames = callback_pattern[callback % callback_pattern.len()];
+            let elapsed = device_frames as f64 / device_rate;
+            elapsed_seconds += elapsed;
+            produced_fraction += elapsed * in_rate as f64;
+            let produced_frames = produced_fraction.floor() as usize;
+            produced_fraction -= produced_frames as f64;
+            producer_block.resize(produced_frames, 0.1);
+            assert_eq!(
+                producer.push_slice(&producer_block),
+                produced_frames,
+                "cross-rate simulation ring overflowed"
+            );
+
+            output.resize(device_frames, 0.0);
+            let occupied = consumer.occupied_len();
+            resampler.fill(&mut output, occupied, &mut consumer, &underruns);
+            assert!(output.iter().all(|sample| sample.is_finite()));
+
+            if callback == 100 {
+                warm_buffer_capacity = resampler.buffer_capacity();
+            }
+            let trim = resampler.trim();
+            min_trim = min_trim.min(trim);
+            max_trim = max_trim.max(trim);
+            if resampler.is_clamped() {
+                clamp_callbacks += 1;
+            }
+
+            if callback >= callback_count / 2 {
+                let level = consumer.occupied_len();
+                steady_min = steady_min.min(level);
+                steady_max = steady_max.max(level);
+                if callback >= steady_start && callback < steady_start + window {
+                    early_sum += level;
+                    early_count += 1;
+                }
+                if callback >= late_start {
+                    late_sum += level;
+                }
+            }
+        }
+
+        CrossRateMetrics {
+            elapsed_seconds,
+            underruns: underruns.load(Ordering::Relaxed),
+            early_steady_mean: early_sum as f64 / early_count as f64,
+            late_steady_mean: late_sum as f64 / window as f64,
+            steady_min,
+            steady_max,
+            min_trim,
+            max_trim,
+            clamp_callbacks,
+            warm_buffer_capacity,
+            final_buffer_capacity: resampler.buffer_capacity(),
+        }
+    }
+
+    #[test]
+    fn adaptive_output_cross_rate_absorbs_100_ppm_with_variable_callbacks() {
+        for (in_rate, out_rate) in [(48_000, 44_100), (44_100, 48_000)] {
+            for ppm in [-100.0, 100.0] {
+                let metrics = run_cross_rate_output_drift(in_rate, out_rate, ppm, 30_000);
+                let pipeline_frame = (in_rate / 100) as usize;
+                let steady_drift = (metrics.late_steady_mean - metrics.early_steady_mean).abs();
+                eprintln!(
+                    "cross-rate {in_rate}->{out_rate} {ppm:+.0}ppm: {metrics:?}, steady_drift={steady_drift:.3}"
+                );
+
+                assert!(
+                    metrics.elapsed_seconds >= 299.0,
+                    "long-run simulation was too short: {metrics:?}"
+                );
+                assert_eq!(metrics.underruns, 0, "unexpected underrun: {metrics:?}");
+                assert!(
+                    steady_drift <= pipeline_frame as f64 / 4.0,
+                    "ring level still drifts monotonically: {metrics:?}"
+                );
+                assert!(
+                    metrics.steady_max - metrics.steady_min <= pipeline_frame * 2,
+                    "steady ring excursion is unbounded: {metrics:?}"
+                );
+                if ppm > 0.0 {
+                    assert!(
+                        metrics.min_trim < -1.0e-6,
+                        "fast device clock never reduced consumption: {metrics:?}"
+                    );
+                } else {
+                    assert!(
+                        metrics.max_trim > 1.0e-6,
+                        "slow device clock never increased consumption: {metrics:?}"
+                    );
+                }
+                assert_eq!(
+                    metrics.clamp_callbacks, 0,
+                    "100 ppm must remain far below the 3% clamp: {metrics:?}"
+                );
+                assert_eq!(
+                    metrics.final_buffer_capacity, metrics.warm_buffer_capacity,
+                    "persistent adaptive SRC rebuilt its interpolation buffer: {metrics:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn adaptive_output_cross_rate_underruns_use_pipeline_frames() {
+        for (in_rate, out_rate, device_frames, expected_pipeline_frames) in
+            [(48_000, 44_100, 441, 480), (44_100, 48_000, 480, 441)]
+        {
+            let (_producer, mut consumer) = HeapRb::<f32>::new(1024).split();
+            let mut resampler = AdaptiveOutputResampler::new(in_rate, out_rate, 960, 240);
+            let underruns = AtomicU64::new(0);
+            let mut output = vec![1.0f32; device_frames];
+
+            resampler.fill(&mut output, 0, &mut consumer, &underruns);
+
+            assert_eq!(output, vec![0.0; device_frames]);
+            assert_eq!(
+                underruns.load(Ordering::Relaxed),
+                expected_pipeline_frames,
+                "{in_rate}->{out_rate} underrun accounting left the pipeline clock domain"
+            );
+        }
     }
 
     #[test]
