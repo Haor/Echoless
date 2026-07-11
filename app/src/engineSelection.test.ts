@@ -46,15 +46,34 @@ describe("current engine UI lock wiring", () => {
     );
     expect(appSource).toContain("paramsByKind.current[target] = np;");
     expect(appSource).toMatch(
-      /stopForEngineSetupRef\.current = \(\) => \{\s*if \(!powerOnRef\.current \|\| engineSetupStopPendingRef\.current\) return;\s*engineSetupStopPendingRef\.current = true;\s*powerOnRef\.current = false;\s*void stop\(\);/,
+      /stopForEngineSetupRef\.current = \(\) => \{\s*if \(!runIntentRef\.current\.wantsRun\(\) \|\| engineSetupStopPendingRef\.current\)\s*return;\s*engineSetupStopPendingRef\.current = true;\s*void stop\(\);/,
     );
     expect(appSource).toContain("onClick={() => changeKind(m.kind)}");
     expect(appSource).not.toContain("if (powerOnRef.current) stop();");
   });
 
+  it("invalidates queued and in-flight apply restarts before an engine setup stop", () => {
+    expect(appSource).toContain(
+      "const runIntentRef = useRef(createRunIntentGuard(powerOn));",
+    );
+    expect(appSource).toContain(
+      "const applyIntent = runIntentRef.current.snapshot();",
+    );
+    expect(appSource).toContain(
+      "if (!runIntentRef.current.allowsStart(applyIntent)) return;",
+    );
+    expect(appSource).toMatch(
+      /async function stop\(\) \{\s*runIntentRef\.current\.request\(false\);\s*powerOnRef\.current = false;/,
+    );
+    expect(appSource).toContain(
+      "if (!runIntentRef.current.wantsRun()) return Promise.resolve();",
+    );
+    expect(appSource).toContain("disabled={busy || !supported || active}");
+  });
+
   it("keeps active engine segments locked", () => {
     expect(appSource).toContain("const active = kind === m.kind;");
-    expect(appSource).toContain("disabled={!supported || active}");
+    expect(appSource).toContain("disabled={busy || !supported || active}");
   });
 
   it("locks the active AEC3 and LocalVQE cards without removing active styling", () => {

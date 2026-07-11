@@ -97,6 +97,7 @@ import {
   hotInitialDelayValue,
   hotLocalvqeNoiseGateValue,
   platformNearDelayDefault,
+  createRunIntentGuard,
   createSerialQueue,
   bypassToggleTarget,
   settleBypassObservation,
@@ -873,6 +874,7 @@ function useRunLifecycle({
   const lastLogRef = useRef<string>("");
   const probeBorrowedRunRef = useRef(false);
   const engineSetupStopPendingRef = useRef(false);
+  const runIntentRef = useRef(createRunIntentGuard(powerOn));
   if (!powerOn) engineSetupStopPendingRef.current = false;
   const recRef = useRef(rec);
   recRef.current = rec;
@@ -947,6 +949,7 @@ function useRunLifecycle({
               noteError(message);
               return;
             }
+            runIntentRef.current.request(false);
             powerOnRef.current = false;
             telRef.current.on = false;
             resetRuntimeLive();
@@ -1057,9 +1060,11 @@ function useRunLifecycle({
           if (ev.intentional) return;
           // 非预期退出(子进程自己挂了,如设备不支持采样率)→ 如实反映失败 + 报错。
           // 稍等让 stderr 末行(真正的错误原因)到达,再显示。
-          if (powerOnRef.current) {
+          if (runIntentRef.current.wantsRun()) {
+            const exitIntent = runIntentRef.current.request(false);
+            powerOnRef.current = false;
             window.setTimeout(() => {
-              if (!powerOnRef.current) return;
+              if (runIntentRef.current.snapshot() !== exitIntent) return;
               updateApp({
                 powerOn: false,
                 err: lastLogRef.current || "运行已停止:子进程意外退出",
@@ -1087,6 +1092,8 @@ function useRunLifecycle({
   }
 
   async function start() {
+    const startIntent = runIntentRef.current.request(true);
+    powerOnRef.current = true;
     updateApp({ busy: true, err: null });
     resetRuntimeHealth();
     resetRuntimeLive();
@@ -1095,14 +1102,25 @@ function useRunLifecycle({
       const toml = currentToml();
       const v = await validateConfig(toml);
       if (!v.ok) {
+        if (runIntentRef.current.allowsStart(startIntent)) {
+          runIntentRef.current.request(false);
+          powerOnRef.current = false;
+        }
         updateApp({
           err: v.errors.map((e) => `${e.path}: ${e.message}`).join("; "),
+          powerOn: false,
           busy: false,
         });
         return;
       }
+      if (!runIntentRef.current.allowsStart(startIntent)) return;
       telRef.current.on = true;
       const runId = await startRun(toml, 80);
+      if (!runIntentRef.current.allowsStart(startIntent)) {
+        telRef.current.on = false;
+        await stopRun().catch(() => {});
+        return;
+      }
       runGenerationRef.current = observeRunStart(
         runGenerationRef.current,
         runId,
@@ -1111,14 +1129,21 @@ function useRunLifecycle({
       // 启动即 AEC on(toml 不写 bypass,后端默认 false)。
       updateApp({ powerOn: true, bypassed: false, bypassPending: null });
     } catch (e) {
-      noteError(String(e));
-      telRef.current.on = false;
+      if (runIntentRef.current.allowsStart(startIntent)) {
+        runIntentRef.current.request(false);
+        powerOnRef.current = false;
+        noteError(String(e));
+        telRef.current.on = false;
+        updateApp({ powerOn: false });
+      }
     } finally {
       updateApp({ busy: false });
     }
   }
 
   async function stop() {
+    runIntentRef.current.request(false);
+    powerOnRef.current = false;
     updateApp({ busy: true });
     try {
       await stopRun();
@@ -1136,9 +1161,9 @@ function useRunLifecycle({
   }
 
   stopForEngineSetupRef.current = () => {
-    if (!powerOnRef.current || engineSetupStopPendingRef.current) return;
+    if (!runIntentRef.current.wantsRun() || engineSetupStopPendingRef.current)
+      return;
     engineSetupStopPendingRef.current = true;
-    powerOnRef.current = false;
     void stop();
   };
 
@@ -1199,7 +1224,7 @@ function useRunLifecycle({
   doApplyRef.current = doApplyChange;
   const applyQueueRef = useRef(
     createSerialQueue<Override>((merged) => {
-      if (!powerOnRef.current) return Promise.resolve();
+      if (!runIntentRef.current.wantsRun()) return Promise.resolve();
       return doApplyRef.current(merged);
     }),
   );
@@ -1211,12 +1236,19 @@ function useRunLifecycle({
   applyChangeRef.current = applyChange;
 
   async function doApplyChange(next: Override) {
+    const applyIntent = runIntentRef.current.snapshot();
+    if (!runIntentRef.current.allowsStart(applyIntent)) return;
     updateApp({ busy: true });
     try {
       await stopRun();
+      if (!runIntentRef.current.allowsStart(applyIntent)) return;
       const toml = currentToml(next);
       const v = await validateConfig(toml);
       if (!v.ok) {
+        if (runIntentRef.current.allowsStart(applyIntent)) {
+          runIntentRef.current.request(false);
+          powerOnRef.current = false;
+        }
         updateApp({
           err: v.errors.map((e) => `${e.path}: ${e.message}`).join("; "),
           powerOn: false,
@@ -1226,8 +1258,14 @@ function useRunLifecycle({
         telRef.current.on = false;
         return;
       }
+      if (!runIntentRef.current.allowsStart(applyIntent)) return;
       telRef.current.on = true;
       const runId = await startRun(toml, 80);
+      if (!runIntentRef.current.allowsStart(applyIntent)) {
+        telRef.current.on = false;
+        await stopRun().catch(() => {});
+        return;
+      }
       runGenerationRef.current = observeRunStart(
         runGenerationRef.current,
         runId,
@@ -1235,6 +1273,9 @@ function useRunLifecycle({
       updateApp({ powerOn: true, bypassed: false, bypassPending: null });
       noteError(null);
     } catch (e) {
+      if (!runIntentRef.current.allowsStart(applyIntent)) return;
+      runIntentRef.current.request(false);
+      powerOnRef.current = false;
       noteError(String(e));
       telRef.current.on = false;
       updateApp({ powerOn: false, bypassed: false, bypassPending: null });
@@ -1340,7 +1381,11 @@ function AppShell() {
   const cliVersionRef = useRef<string | null>(null);
   const runControlsRef = useRef<Set<string> | null>(null);
   const powerOnRef = useRef(powerOn);
-  powerOnRef.current = powerOn;
+  const renderedPowerOnRef = useRef(powerOn);
+  if (renderedPowerOnRef.current !== powerOn) {
+    renderedPowerOnRef.current = powerOn;
+    powerOnRef.current = powerOn;
+  }
   const applyChangeRef = useRef<(next: Override) => void>(() => {});
   const stopForEngineSetupRef = useRef<() => void>(() => {});
   const doctorRef = useRef(doctor);
@@ -1998,7 +2043,7 @@ function AppShell() {
                     className={`b ${active ? "active" : ""} ${
                       supported && !rdy ? "unready" : ""
                     }`}
-                    disabled={!supported || active}
+                    disabled={busy || !supported || active}
                     onClick={() => changeKind(m.kind)}
                   >
                     {m.label}

@@ -148,6 +148,31 @@ export function clearBypassPending(
   return { ...state, bypassPending: null };
 }
 
+export interface RunIntentGuard {
+  /** Generation captured by an async restart transaction. */
+  snapshot(): number;
+  /** Replace the desired terminal state and invalidate older async work. */
+  request(on: boolean): number;
+  wantsRun(): boolean;
+  /** Only the current generation may start a sidecar while ON is still desired. */
+  allowsStart(generation: number): boolean;
+}
+
+export function createRunIntentGuard(initiallyOn: boolean): RunIntentGuard {
+  let generation = 0;
+  let desiredOn = initiallyOn;
+  return {
+    snapshot: () => generation,
+    request(on) {
+      generation += 1;
+      desiredOn = on;
+      return generation;
+    },
+    wantsRun: () => desiredOn,
+    allowsStart: (captured) => desiredOn && captured === generation,
+  };
+}
+
 export interface SerialQueue<T> {
   /** 入队一个 delta;若已有排队项则合并,只在当前执行结束后跑一次合并结果。 */
   enqueue(delta: Partial<T>): void;

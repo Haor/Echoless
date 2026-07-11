@@ -11,6 +11,7 @@ import {
   bypassToggleTarget,
   settleBypassObservation,
   clearBypassPending,
+  createRunIntentGuard,
   createSerialQueue,
   routeEngineKindSelection,
   shouldPickLocalvqeModel,
@@ -187,6 +188,29 @@ describe("bypass pending state", () => {
     expect(
       clearBypassPending({ bypassed: false, bypassPending: true }, true),
     ).toEqual({ bypassed: false, bypassPending: null });
+  });
+});
+
+describe("run intent guard", () => {
+  it("invalidates an in-flight restart as soon as stop becomes the terminal intent", () => {
+    const guard = createRunIntentGuard(true);
+    const applyIntent = guard.snapshot();
+
+    expect(guard.allowsStart(applyIntent)).toBe(true);
+    guard.request(false);
+
+    expect(guard.wantsRun()).toBe(false);
+    expect(guard.allowsStart(applyIntent)).toBe(false);
+  });
+
+  it("requires a fresh generation before a later explicit start", () => {
+    const guard = createRunIntentGuard(true);
+    const staleApply = guard.snapshot();
+    guard.request(false);
+    const explicitStart = guard.request(true);
+
+    expect(guard.allowsStart(staleApply)).toBe(false);
+    expect(guard.allowsStart(explicitStart)).toBe(true);
   });
 });
 
