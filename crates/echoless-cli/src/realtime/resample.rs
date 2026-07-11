@@ -466,24 +466,28 @@ impl AdaptiveOutputResampler {
     where
         C: Consumer<Item = f32>,
     {
-        let needed = (self.pos.floor() as usize).saturating_add(2);
+        let i0 = self.pos.floor() as usize;
+        let next_pos = self.pos + step;
+        let consumed = next_pos.floor() as usize;
+        // Large downsample ratios can advance beyond the two samples needed for
+        // interpolation. Buffer every sample that this step consumes so none of
+        // the skipped source interval is lost as an ineffective pop on an empty
+        // deque (for example 48 kHz -> 16 kHz must advance by three samples).
+        let needed = i0.saturating_add(2).max(consumed);
         while self.buffer.len() < needed {
             let sample = consumer.try_pop()?;
             self.buffer.push_back(sample.clamp(-1.0, 1.0));
         }
 
-        let i0 = self.pos.floor() as usize;
         let frac = (self.pos - i0 as f64) as f32;
         let a = self.buffer.get(i0).copied().unwrap_or(0.0);
         let b = self.buffer.get(i0 + 1).copied().unwrap_or(a);
         let sample = (a + (b - a) * frac).clamp(-1.0, 1.0);
 
-        self.pos += step;
-        let consumed = self.pos.floor() as usize;
         for _ in 0..consumed {
             let _ = self.buffer.pop_front();
         }
-        self.pos -= consumed as f64;
+        self.pos = next_pos - consumed as f64;
         Some(sample)
     }
 }
@@ -1130,6 +1134,27 @@ mod tests {
                 "{in_rate}->{out_rate} underrun accounting left the pipeline clock domain"
             );
         }
+    }
+
+    #[test]
+    fn adaptive_output_large_downsample_ratio_consumes_every_skipped_source_sample() {
+        let input = (0..18)
+            .map(|sample| sample as f32 / 20.0)
+            .collect::<Vec<_>>();
+        let (mut producer, mut consumer) = HeapRb::<f32>::new(input.len()).split();
+        assert_eq!(producer.push_slice(&input), input.len());
+
+        let mut resampler = AdaptiveOutputResampler::new(48_000, 16_000, 0, 0);
+        let underruns = AtomicU64::new(0);
+        let mut output = vec![0.0f32; 6];
+        let occupied = consumer.occupied_len();
+
+        resampler.fill(&mut output, occupied, &mut consumer, &underruns);
+
+        let expected = [0, 3, 6, 9, 12, 15].map(|index| input[index]).to_vec();
+        assert_eq!(output, expected);
+        assert_eq!(consumer.occupied_len(), 0);
+        assert_eq!(underruns.load(Ordering::Relaxed), 0);
     }
 
     #[test]
