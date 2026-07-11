@@ -4,6 +4,7 @@ import type { NvafxDoctor } from "../types";
 import { openUrl } from "../api";
 import { useI18n } from "../i18n";
 import { SegButtons } from "../components/Controls";
+import { Hint } from "../components/Hint";
 import {
   deriveRtxState,
   ladderStatus,
@@ -47,10 +48,13 @@ async function pickZip(set: (v: string) => void) {
 interface Props {
   doctor: NvafxDoctor | null;
   busy: boolean;
+  pct?: number | null;
+  stage?: "runtime" | "model" | null;
+  recv?: number | null;
   dev: boolean;
   devState: RtxState;
   onDevState: (s: RtxState) => void;
-  onRecheck: (runtimeDir?: string) => void;
+  onRecheck: () => void;
   onInstall: (commonZip: string, modelZip: string) => void;
   onDownloadInstall: () => void;
   onUse: () => void;
@@ -59,6 +63,9 @@ interface Props {
 export function RtxSetupPage({
   doctor,
   busy,
+  pct,
+  stage,
+  recv,
   dev,
   devState,
   onDevState,
@@ -125,7 +132,7 @@ export function RtxSetupPage({
             <button type="button" className="wzbtn" onClick={() => openUrl(DRIVER_URL)}>
               {t("wzOpenDriver")} <span className="mk">↗</span>
             </button>
-            <button type="button" className="dopen" onClick={() => onRecheck(runtimeDir)}>
+            <button type="button" className="dopen" onClick={onRecheck}>
               {t("recheck")} <span className="mk">↻</span>
             </button>
           </div>
@@ -141,7 +148,7 @@ export function RtxSetupPage({
             <button type="button" className="wzbtn" onClick={() => openUrl(VC_URL)}>
               {t("wzOpenVc")} <span className="mk">↗</span>
             </button>
-            <button type="button" className="dopen" onClick={() => onRecheck(runtimeDir)}>
+            <button type="button" className="dopen" onClick={onRecheck}>
               {t("recheck")} <span className="mk">↻</span>
             </button>
           </div>
@@ -227,28 +234,30 @@ export function RtxSetupPage({
             <div className="wzassets">
               <div>
                 <span className="dk">{t("wzCommon")}</span>{" "}
-                <button
-                  type="button"
-                  className="wzasset plainbtn"
-                  onClick={() => openUrl(nvafxAssetUrl(NVAFX_COMMON_ASSET))}
-                  title={t("wzAssetDownload")}
-                >
-                  {NVAFX_COMMON_ASSET}
-                </button>
+                <Hint text={t("wzAssetDownload")} attach>
+                  <button
+                    type="button"
+                    className="wzasset plainbtn"
+                    onClick={() => openUrl(nvafxAssetUrl(NVAFX_COMMON_ASSET))}
+                  >
+                    {NVAFX_COMMON_ASSET}
+                  </button>
+                </Hint>
                 <span className="sz"> · 955 MiB</span>
               </div>
               <div>
                 <span className="dk">{t("wzModel")}</span>{" "}
                 {arch ? (
                   <>
-                    <button
-                      type="button"
-                      className="wzasset plainbtn"
-                      onClick={() => openUrl(nvafxAssetUrl(nvafxModelAsset(arch)))}
-                      title={t("wzAssetDownload")}
-                    >
-                      {nvafxModelAsset(arch)}
-                    </button>
+                    <Hint text={t("wzAssetDownload")} attach>
+                      <button
+                        type="button"
+                        className="wzasset plainbtn"
+                        onClick={() => openUrl(nvafxAssetUrl(nvafxModelAsset(arch)))}
+                      >
+                        {nvafxModelAsset(arch)}
+                      </button>
+                    </Hint>
                     <span className="sz"> · 46 MiB</span>
                   </>
                 ) : (
@@ -258,7 +267,17 @@ export function RtxSetupPage({
             </div>
             <div className="wzgo">
               {busy ? (
-                <span className="wzbusy">{t("wzDownloading")}</span>
+                <span className="wzbusy">
+                  {stage != null
+                    ? `${t("wzDl")} · ${stage === "model" ? t("wzModel") : t("wzCommon")}${
+                        pct != null
+                          ? ` ${pct}%`
+                          : recv != null && recv > 0
+                            ? ` ${(recv / 1048576).toFixed(1)} MiB`
+                            : ""
+                      }`
+                    : t("wzDownloading")}
+                </span>
               ) : (
                 <button
                   type="button"
@@ -331,7 +350,7 @@ export function RtxSetupPage({
           <span className="dpath" title={runtimeDir}>
             {runtimeDir}
           </span>
-          <button type="button" className="dopen" onClick={() => onRecheck(runtimeDir)}>
+          <button type="button" className="dopen" onClick={onRecheck}>
             {t("recheck")} <span className="mk">↻</span>
           </button>
         </div>

@@ -116,15 +116,15 @@ export function simNvafxDoctor(state: RtxState): NvafxDoctor {
   const ok = (name: string, detail: string): C => ({ name, status: "ok", detail, action: null });
   const miss = (name: string, detail: string): C => ({ name, status: "missing", detail, action: "" });
   const uns = (name: string, detail: string): C => ({ name, status: "unsupported", detail, action: "" });
-  const vcOk = ok("vc-runtime:VCRUNTIME140.dll", "Microsoft VC++ runtime 已存在");
+  const vcOk = ok("vc-runtime:VCRUNTIME140.dll", "Microsoft VC++ runtime present");
   const nvcudaOk = ok("nvcuda.dll", "CUDA driver DLL present");
   const driverOk = ok("gpu:0:driver", `${gpu.name} driver=${gpu.driver_version}`);
   const archOk = ok("gpu:0:arch", `${gpu.name} compute_cap=120 -> blackwell`);
-  const rtDirOk = ok("runtime-dir", `runtime 目录: ${RT}`);
+  const rtDirOk = ok("runtime-dir", `runtime directory: ${RT}`);
   const rtBinOk = ok("runtime:bin/NVAudioEffects.dll", `found ${RT}\\bin\\NVAudioEffects.dll`);
   const modelOk = ok("runtime:model", "found blackwell aec_48k.trtpkg");
   const rtBinMiss = miss("runtime:bin/NVAudioEffects.dll", `missing ${RT}\\bin\\NVAudioEffects.dll`);
-  const rtDirMiss = miss("runtime-dir", `runtime 目录不存在: ${RT}`);
+  const rtDirMiss = miss("runtime-dir", `runtime directory does not exist: ${RT}`);
   const modelMiss = miss("runtime:model", "missing blackwell aec_48k.trtpkg");
 
   const mk = (
@@ -147,14 +147,14 @@ export function simNvafxDoctor(state: RtxState): NvafxDoctor {
       return mk(false, [gpu], "blackwell", [vcOk, nvcudaOk, driverOk, archOk, rtDirMiss, rtBinMiss, modelMiss]);
     case "missing_vc_redist":
       return mk(false, [gpu], "blackwell", [
-        miss("vc-runtime:VCRUNTIME140.dll", "未找到 Microsoft VC++ runtime DLL"),
+        miss("vc-runtime:VCRUNTIME140.dll", "Microsoft VC++ runtime DLL not found"),
         nvcudaOk, driverOk, archOk, rtDirMiss,
       ]);
     case "driver_too_old": {
       const old = { ...gpu, driver_version: "551.86" };
       return mk(false, [old], "blackwell", [
         vcOk, nvcudaOk,
-        miss("gpu:0:driver", `${old.name} driver=551.86 低于最低要求 572.61`),
+        miss("gpu:0:driver", `${old.name} driver=551.86 is below the minimum 572.61`),
         archOk, rtDirMiss,
       ]);
     }
@@ -162,20 +162,20 @@ export function simNvafxDoctor(state: RtxState): NvafxDoctor {
       const g = { name: "NVIDIA GeForce GTX 1060", driver_version: "596.49", compute_capability: "61", arch: null };
       return mk(false, [g as unknown as typeof gpu], null, [
         vcOk, nvcudaOk, ok("gpu:0:driver", `${g.name} driver=596.49`),
-        uns("gpu:0:arch", `${g.name} compute_cap=61 不在支持列表`),
+        uns("gpu:0:arch", `${g.name} compute_cap=61 is not in the supported list`),
       ]);
     }
     case "missing_driver":
       return mk(false, [], null, [
-        miss("nvidia-smi", "无法运行 nvidia-smi"),
-        miss("gpu", "未检测到 NVIDIA GPU"),
+        miss("nvidia-smi", "could not run nvidia-smi"),
+        miss("gpu", "No NVIDIA GPU detected"),
         rtDirMiss,
       ]);
     case "unsupported_platform":
       return mk(false, [], null, [
-        uns("platform", "NVIDIA AFX AEC runtime 目前只支持 Windows x64"),
-        miss("nvidia-smi", "无法运行 nvidia-smi"),
-        miss("gpu", "未检测到 NVIDIA GPU"),
+        uns("platform", "The NVIDIA AFX AEC runtime currently supports Windows x64 only"),
+        miss("nvidia-smi", "could not run nvidia-smi"),
+        miss("gpu", "No NVIDIA GPU detected"),
       ], "/Users/you/.local/share/Echoless/nvafx/2.1.0");
     default:
       return mk(false, [gpu], "blackwell", [vcOk, nvcudaOk, driverOk, archOk, rtDirMiss, rtBinMiss, modelMiss]);

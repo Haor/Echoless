@@ -25,8 +25,12 @@ Rust 侧按职责拆模块(`src-tauri/src/`):`lib.rs` 仅入口 + setup;
 ## echoless 二进制定位
 
 `src-tauri/src/bin_resolve.rs::echoless_bin()`:
-1. 环境变量 `ECHOLESS_BIN`(打包后由 sidecar 资源注入)
-2. dev 回退:`../../target/release/echoless`(即本仓库 `cargo build --release` 产物)
+
+1. 开发者通过环境变量 `ECHOLESS_BIN` 显式覆盖。
+2. 当前可执行文件旁的 `echoless` 或 `echoless-<target-triple>`(打包后的 `externalBin` 位置)。
+3. Tauri resource 目录中的 `echoless`、`binaries/echoless` 或 target-triple 二进制。
+4. `src-tauri/binaries/` 下的 dev target-triple 二进制。
+5. 仓库根 `target/release/echoless`,最后回退到 `target/debug/echoless`。
 
 dev 前先在仓库根构建 CLI:
 

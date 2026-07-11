@@ -42,12 +42,13 @@ pub(crate) fn cmd_offline(a: OfflineArgs) -> Result<()> {
         near_delay_ms: 0,
         output_level,
         bypass: false,
+        output_rate_match: echoless_core::default_output_rate_match(),
         diagnostics: DiagnosticsConfig::default(),
         chain,
     };
     let validation_errors = validate_pipeline_config(&cfg);
     if let Some(error) = validation_errors.first() {
-        bail!("配置无效: {}: {}", error.path, error.message);
+        bail!("invalid config: {}: {}", error.path, error.message);
     }
     validate_nvafx_constraints(&cfg)?;
 
@@ -57,23 +58,23 @@ pub(crate) fn cmd_offline(a: OfflineArgs) -> Result<()> {
     let sink = WavFileSink::new(&a.out);
 
     let chain_desc = if cfg.chain.is_empty() {
-        "直通(passthrough)".to_string()
+        "passthrough".to_string()
     } else {
         cfg.chain
             .iter()
             .map(|n| n.kind.clone())
             .collect::<Vec<_>>()
-            .join(" → ")
+            .join(" -> ")
     };
-    println!("离线运行: {} + {} → {}", a.mic, a.reference, a.out);
+    println!("offline run: {} + {} -> {}", a.mic, a.reference, a.out);
     println!(
-        "采样率 {} Hz · 帧 {} ms · output_level={} · 链: {}",
+        "sample_rate {} Hz · frame {} ms · output_level={} · chain: {}",
         rate, frame_ms, output_level, chain_desc
     );
 
     let rep = run_offline(&cfg, mic, reference, sink)?;
     println!(
-        "完成: {} 帧 (~{:.2}s) · 链 [{}] · 累计算法延迟 {:.1} ms",
+        "done: {} frames (~{:.2}s) · chain [{}] · total algorithmic latency {:.1} ms",
         rep.frames,
         rep.seconds,
         rep.chain.join(", "),

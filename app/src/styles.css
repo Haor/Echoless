@@ -181,6 +181,11 @@ body {
   height: 100%;
   display: block;
 }
+/* WebGL context 丢失止血:画布内容变未定义(常为黑),经 multiply 会把整窗
+   UI 乘成黑屏。丢失瞬间隐藏本层,恢复(webglcontextrestored)后由 JS 摘除。 */
+.tvnoise.ctxlost {
+  opacity: 0 !important;
+}
 /* OFF(穿透/停机):CRT 噪与 VHS 熄灭 —— 动效只属于活着的系统 */
 .window.sysoff > .tvnoise {
   opacity: 0;
@@ -377,15 +382,15 @@ body {
   margin-top: 0;
 }
 
-/* 自绘悬浮提示(单色直角,匹配主题) */
+/* 自绘悬浮提示(单色直角,匹配主题)。弹层经 portal 挂 body + fixed 定位
+   (坐标由 Hint 组件按锚点矩形计算),在 overflow:hidden 容器里也不被裁剪 */
 .hint {
   position: relative;
   display: inline-flex;
+  min-width: 0;
 }
 .hint-pop {
-  position: absolute;
-  top: calc(100% + 6px);
-  left: 0;
+  position: fixed;
   z-index: 80;
   background: var(--raised);
   border: 1px solid var(--line);
@@ -407,6 +412,9 @@ body {
   letter-spacing: 2px;
   text-transform: uppercase;
   margin: 16px 0 6px;
+  /* 数值 line-height 锁死行盒高度(不随字体变):否则中文字形(如「延迟侦测」)
+     的默认 line box 比拉丁文高几像素,多个段头累加 → 切换语言时下方各行整体上下漂移。 */
+  line-height: 1.3;
 }
 .asec::before {
   content: "[ ";
@@ -541,6 +549,7 @@ body {
   overflow: hidden;
   text-overflow: ellipsis;
   text-transform: uppercase; /* 用户反馈:小写提示不符合全大写主题 */
+  line-height: 1.3; /* 定死行盒:probe 提示中英文切换不改行高、不推 SESSION 段 */
 }
 /* 12 点进度:蜂鸣一声亮一个  ⚠ 问题 B7:与按钮/读数左缘对齐待调 */
 .pdots {
@@ -759,9 +768,9 @@ body {
   border-color: var(--t-mut);
 }
 .lvbox.miss {
-  /* 默认与其它 pill 同为中性灰;仅悬停时逐渐亮成橙(用户 2026-07-06) */
-  color: var(--t-mut);
-  border-color: var(--t-faint);
+  /* 静态与 OK/✓ 完全同款(color+border 均 --t-soft/--t-mut,消除 get 偏暗);仅悬停亮成橙(用户 2026-07-06) */
+  color: var(--t-soft);
+  border-color: var(--t-mut);
   transition:
     color 0.18s ease,
     border-color 0.18s ease;
@@ -903,6 +912,10 @@ button.ecard:disabled {
 .ecard.wide:not(.na),
 .ecard.lvwide:not(.na) {
   cursor: pointer;
+}
+.ecard.wide[aria-disabled="true"],
+.ecard.lvwide[aria-disabled="true"] {
+  cursor: default;
 }
 .ecard.wide {
   margin-top: 14px;
@@ -1158,7 +1171,8 @@ button.ecard:disabled {
 .cdetail.warn {
   color: var(--warn);
 }
-/* LocalVQE 下载错误:最多 3 行截断(后端已截 240 字,双保险),全文在 title */
+/* LocalVQE 下载错误:小字号 mono、最多 3 行截断(后端已截 240 字,双保险),
+   全文在 title。不设 font-size 会继承卡片大字号,长 URL 撑破卡片 */
 .cdetail.warn.lverr {
   display: -webkit-box;
   -webkit-box-orient: vertical;
@@ -1166,6 +1180,11 @@ button.ecard:disabled {
   overflow: hidden;
   overflow-wrap: anywhere;
   white-space: normal;
+  margin-top: 4px;
+  font-family: var(--mono);
+  font-size: 10px;
+  line-height: 1.35;
+  letter-spacing: 0.2px;
 }
 .drow.nvrt {
   margin-top: 9px;
@@ -1505,6 +1524,8 @@ button.ecard:disabled {
   font-size: 10px;
   letter-spacing: 3px;
   text-transform: uppercase;
+  /* 同 .asec:定死行盒高度,避免中文标题(如「高级参数」)行盒偏高把整页下推。 */
+  line-height: 1.3;
 }
 .kick .d {
   display: flex;
@@ -2187,7 +2208,10 @@ hr.hair {
 }
 
 @media (prefers-reduced-motion: reduce) {
-  * {
+  /* 尊重系统减弱动效:关闭功能性 UI 动画/过渡。
+     但氛围件(VHS 亮带/细线、WebGL 底噪)是产品恒常质感,常驻不受此开关影响
+     —— 底噪走 WebGL rAF 本就不受 CSS animation 约束,VHS 在此显式豁免。 */
+  *:not(.vhs):not(.vhs *) {
     animation: none !important;
   }
 }

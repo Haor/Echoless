@@ -7,18 +7,18 @@ use echoless_core::{
     MAX_OUTPUT_LEVEL, MIN_OUTPUT_LEVEL, OUTPUT_LEVEL_CURVE_EXPONENT, OUTPUT_LEVEL_MAX_BOOST_DB,
     OUTPUT_LEVEL_MAX_GAIN, UNITY_OUTPUT_LEVEL,
 };
-use echoless_processors::registry;
+use echoless_processors::{aec3::MIN_TAIL_MS, registry};
 
 pub(crate) fn cmd_processors(args: ProcessorsArgs) -> Result<()> {
     if args.json {
         println!("{}", serde_json::to_string_pretty(&processor_manifest())?);
         return Ok(());
     }
-    println!("可用处理器种类:");
+    println!("available processor kinds:");
     for k in registry::kinds() {
         println!("  - {k}");
     }
-    println!("(在 --chain 或 config 的 [[chain]] 里按 kind 引用;默认建议 aec3)");
+    println!("(reference by kind in --chain or the config [[chain]] section; aec3 is the default recommendation)");
     Ok(())
 }
 
@@ -106,7 +106,7 @@ fn processor_manifest() -> serde_json::Value {
                     "tail_ms": {
                         "type": "number",
                         "default": null,
-                        "min": 4,
+                        "min": MIN_TAIL_MS,
                         "advanced": true
                     },
                     "delay_num_filters": {
@@ -160,7 +160,6 @@ fn processor_manifest() -> serde_json::Value {
                     "reference_channels": "mono"
                 },
                 "params": {
-                    "runtime_dir": { "type": "path", "required": false },
                     "model_path": { "type": "path", "required": false },
                     "intensity_ratio": { "type": "number", "default": 1.0, "min": 0.0 },
                     "use_default_gpu": { "type": "bool", "default": true, "advanced": true },
@@ -198,6 +197,7 @@ mod tests {
             json!(["mono", "stereo"])
         );
         assert_eq!(aec3["params"]["initial_delay_ms"]["min"], json!(0));
+        assert_eq!(aec3["params"]["tail_ms"]["min"], json!(MIN_TAIL_MS));
         assert_eq!(
             aec3["params"]["initial_delay_ms"]["max"],
             json!(MAX_INITIAL_DELAY_MS)
@@ -226,5 +226,11 @@ mod tests {
             manifest["pipeline"]["params"]["output_level"]["curve"],
             json!("power")
         );
+
+        let nvafx = processors
+            .iter()
+            .find(|processor| processor["kind"] == "nvidia_afx_aec")
+            .unwrap();
+        assert!(nvafx["params"].get("runtime_dir").is_none());
     }
 }

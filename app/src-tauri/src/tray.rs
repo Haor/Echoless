@@ -9,8 +9,9 @@ use tauri::State;
 use tauri::{
     menu::{Menu, MenuItem, PredefinedMenuItem},
     tray::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent},
-    AppHandle, Manager,
 };
+#[cfg(desktop)]
+use tauri::{AppHandle, Manager};
 
 #[cfg(target_os = "windows")]
 use crate::proc::{terminate_run, RunState};
@@ -100,8 +101,8 @@ const TRAY_MENU_SHOW: &str = "show";
 #[cfg(target_os = "windows")]
 const TRAY_MENU_QUIT: &str = "quit";
 
-#[cfg(target_os = "windows")]
-fn show_main_window(app: &AppHandle) {
+#[cfg(desktop)]
+pub(crate) fn show_main_window(app: &AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.show();
         let _ = window.unminimize();
@@ -124,7 +125,7 @@ pub(crate) fn register_windows_tray(app: &mut tauri::App) -> tauri::Result<()> {
             TRAY_MENU_SHOW => show_main_window(app),
             TRAY_MENU_QUIT => {
                 let state = app.state::<RunState>();
-                terminate_run(&state);
+                let _ = terminate_run(&state);
                 update_tray_tooltip(app, false);
                 app.exit(0);
             }

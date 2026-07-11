@@ -14,6 +14,77 @@ export const lvqePureAec = (model: unknown): boolean =>
 export const lvqeNoiseTargetFile = (on: boolean): string =>
   on ? LVQE_NS_ON_FILE : LVQE_NS_OFF_FILE;
 
+export function claimEngineKindChange(
+  current: { current: string },
+  next: string,
+): boolean {
+  if (current.current === next) return false;
+  current.current = next;
+  return true;
+}
+
+export type EngineKindSelectionOutcome = "noop" | "setup" | "apply";
+
+export function routeEngineKindSelection(
+  current: { current: string },
+  next: string,
+  ready: boolean,
+  handlers: {
+    setup: (next: string) => void;
+    apply: (previous: string, next: string) => void;
+  },
+): EngineKindSelectionOutcome {
+  if (current.current === next) return "noop";
+  if (!ready) {
+    handlers.setup(next);
+    return "setup";
+  }
+
+  const previous = current.current;
+  if (!claimEngineKindChange(current, next)) return "noop";
+  handlers.apply(previous, next);
+  return "apply";
+}
+
+export function shouldPickLocalvqeModel(
+  selected: unknown,
+  next: string,
+): boolean {
+  return selected !== next;
+}
+
+export function canChangePipeline(
+  kind: string,
+  patch: Partial<PipelineCfg>,
+): boolean {
+  if (kind !== "nvidia_afx_aec") return true;
+  return !(
+    "sample_rate" in patch ||
+    "frame_ms" in patch ||
+    "reference_channels" in patch
+  );
+}
+
+export function pipelineForEngineKind(
+  kind: string,
+  pipeline: PipelineCfg,
+): PipelineCfg {
+  if (kind !== "nvidia_afx_aec") return pipeline;
+  if (
+    pipeline.sample_rate === 48_000 &&
+    pipeline.frame_ms === 10 &&
+    pipeline.reference_channels === "mono"
+  ) {
+    return pipeline;
+  }
+  return {
+    ...pipeline,
+    sample_rate: 48_000,
+    frame_ms: 10,
+    reference_channels: "mono",
+  };
+}
+
 /** 仅改 near_delay_ms 的补丁走热控路径,不需重建 sidecar。 */
 export function isNearDelayOnlyPatch(patch: Partial<PipelineCfg>): boolean {
   const keys = Object.keys(patch);
@@ -75,6 +146,31 @@ export function clearBypassPending(
   if (target != null && state.bypassPending !== target) return state;
   if (state.bypassPending == null) return state;
   return { ...state, bypassPending: null };
+}
+
+export interface RunIntentGuard {
+  /** Generation captured by an async restart transaction. */
+  snapshot(): number;
+  /** Replace the desired terminal state and invalidate older async work. */
+  request(on: boolean): number;
+  wantsRun(): boolean;
+  /** Only the current generation may start a sidecar while ON is still desired. */
+  allowsStart(generation: number): boolean;
+}
+
+export function createRunIntentGuard(initiallyOn: boolean): RunIntentGuard {
+  let generation = 0;
+  let desiredOn = initiallyOn;
+  return {
+    snapshot: () => generation,
+    request(on) {
+      generation += 1;
+      desiredOn = on;
+      return generation;
+    },
+    wantsRun: () => desiredOn,
+    allowsStart: (captured) => desiredOn && captured === generation,
+  };
 }
 
 export interface SerialQueue<T> {

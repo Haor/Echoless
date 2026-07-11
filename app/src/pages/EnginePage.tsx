@@ -1,5 +1,4 @@
 import { useEffect, useState } from "react";
-import { open } from "@tauri-apps/plugin-dialog";
 import type {
   NvafxCheck,
   NvafxDoctor,
@@ -10,11 +9,13 @@ import {
   downloadLocalvqeModel,
   localvqeAssets,
   macSystemInfo,
+  onLocalvqeProgress,
   openPath,
   type LocalvqeAssets,
   type MacSystemInfo,
 } from "../api";
 import { useI18n } from "../i18n";
+import { createAsyncListenerScope } from "../asyncListener";
 
 // macOS 主版本号 → 代号(sw_vers 只给版本号,代号本地映射)。落不到映射时只显版本号。
 function macOsName(version?: string | null): string | null {
@@ -120,20 +121,21 @@ interface Props {
   processors: Processor[];
   platform: Platform;
   kind: string;
-  params: Record<string, unknown>;
   doctor: NvafxDoctor | null;
   dev: boolean;
   onSelect: (kind: string) => void;
-  onParam: (key: string, val: unknown) => void;
   onPickModel: (path: string) => void;
   localvqeModel: string | null;
-  onRecheck: (runtimeDir?: string) => void;
+  onRecheck: () => void;
   onSetup: () => void;
 }
 
+// 本机系统信息整段会话不变:模块级缓存,避免每次进 Engine 页 NvafxCard 重挂载都
+// 异步重取致「空 → 延迟 pop」的闪现。首取后缓存,重进用缓存同步初始化 state。
+let macSysInfoCache: MacSystemInfo | null = null;
+
 function NvafxCard({
   kind,
-  params,
   doctor,
   dev,
   platform,
@@ -141,12 +143,10 @@ function NvafxCard({
   nvReady,
   problems,
   onSelect,
-  onParam,
   onRecheck,
   onSetup,
 }: {
   kind: string;
-  params: Record<string, unknown>;
   doctor: NvafxDoctor | null;
   dev: boolean;
   platform: Platform;
@@ -154,55 +154,52 @@ function NvafxCard({
   nvReady: boolean;
   problems: number;
   onSelect: (kind: string) => void;
-  onParam: (key: string, val: unknown) => void;
-  onRecheck: (runtimeDir?: string) => void;
+  onRecheck: () => void;
   onSetup: () => void;
 }) {
   const { t, lang } = useI18n();
   const nv = doctor?.report;
+  const active = kind === "nvidia_afx_aec";
 
   // 不可用态(仅 macOS)拉本机系统信息填充右栏。dev 模拟给一份样例。
-  const [sysInfo, setSysInfo] = useState<MacSystemInfo | null>(null);
+  const [sysInfo, setSysInfo] = useState<MacSystemInfo | null>(macSysInfoCache);
   useEffect(() => {
     if (nvSupported || platform !== "macos") return;
+    if (sysInfo) return; // 缓存命中,已同步渲染,无需再取
     if (dev) {
-      setSysInfo({
+      const info: MacSystemInfo = {
         model: "MacBook Pro",
         os_version: "26.5.1",
         chip: "Apple M4",
         memory_gb: 24,
         cores: 10,
-      });
+      };
+      macSysInfoCache = info;
+      setSysInfo(info);
       return;
     }
     macSystemInfo()
-      .then(setSysInfo)
+      .then((info) => {
+        macSysInfoCache = info;
+        setSysInfo(info);
+      })
       .catch(() => {});
-  }, [nvSupported, platform, dev]);
-
-  async function pickRuntime() {
-    try {
-      const sel = await open({ directory: true });
-      if (typeof sel === "string") {
-        onParam("runtime_dir", sel);
-        onRecheck(sel);
-      }
-    } catch {
-      /* cancelled */
-    }
-  }
+  }, [nvSupported, platform, dev, sysInfo]);
 
   return (
     <div
-      className={`ecard wide ${kind === "nvidia_afx_aec" ? "active" : ""} ${
-        nvSupported ? "" : "na"
-      }`}
+      className={`ecard wide ${active ? "active" : ""} ${nvSupported ? "" : "na"}`}
       role="button"
-      tabIndex={nvSupported ? 0 : -1}
-      aria-pressed={kind === "nvidia_afx_aec"}
-      onClick={() => nvSupported && onSelect("nvidia_afx_aec")}
+      tabIndex={nvSupported && !active ? 0 : -1}
+      aria-pressed={active}
+      aria-disabled={!nvSupported || active}
+      onClick={() => nvSupported && !active && onSelect("nvidia_afx_aec")}
       onKeyDown={(e) => {
-        if (nvSupported && (e.key === "Enter" || e.key === " ")) {
+        if (
+          nvSupported &&
+          !active &&
+          (e.key === "Enter" || e.key === " ")
+        ) {
           e.preventDefault();
           onSelect("nvidia_afx_aec");
         }
@@ -215,19 +212,19 @@ function NvafxCard({
         <button
           type="button"
           className={`etag plainbtn ${nvReady ? "" : nvSupported ? "warn" : "na"}`}
-          disabled={!nvSupported}
-          aria-pressed={kind === "nvidia_afx_aec"}
+          disabled={!nvSupported || active}
+          aria-pressed={active}
           onClick={() => onSelect("nvidia_afx_aec")}
         >
-          {kind === "nvidia_afx_aec" && <i className="dot" />}{" "}
+          {active && <i className="dot" />}{" "}
           {dev && !doctor?.ok
-            ? kind === "nvidia_afx_aec"
+            ? active
               ? `${t("active")} · DEV`
               : `${t("rdyReady")} · DEV`
             : !nvSupported
               ? t("windowsRtxOnly")
               : doctor?.ok
-                ? kind === "nvidia_afx_aec"
+                ? active
                   ? t("active")
                   : t("rdyReady")
                 : `${problems} ${t("rdyIssues")}`}
@@ -300,28 +297,15 @@ function NvafxCard({
               <div className="echks">{(nv?.checks ?? []).map(checkPill)}</div>
               <div className="drow nvrt">
                 <span className="dk">RUNTIME</span>
-                <button
-                  type="button"
-                  className="dpick plainbtn"
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    pickRuntime();
-                  }}
-                  title={(params.runtime_dir as string) || nv?.runtime_dir}
-                >
-                  {(params.runtime_dir as string) || nv?.runtime_dir || t("auto")}
-                </button>
+                <span className="dpath" title={nv?.runtime_dir}>
+                  {nv?.runtime_dir || t("auto")}
+                </span>
                 <button
                   type="button"
                   className="dopen"
                   onClick={(e) => {
                     e.stopPropagation();
-                    // B8:与左侧 dpick 显示同源 —— 检查的就是展示的那个目录。
-                    onRecheck(
-                      (params.runtime_dir as string) ||
-                        nv?.runtime_dir ||
-                        undefined,
-                    );
+                    onRecheck();
                   }}
                 >
                   {t("engRecheck")} <span className="mk">↻</span>
@@ -351,11 +335,9 @@ export function EnginePage({
   processors,
   platform,
   kind,
-  params,
   doctor,
   dev,
   onSelect,
-  onParam,
   onPickModel,
   localvqeModel,
   onRecheck,
@@ -365,13 +347,28 @@ export function EnginePage({
 
   // Available LocalVQE models/native runtime.
   const [lvAssets, setLvAssets] = useState<LocalvqeAssets | null>(null);
-  const [lvDl, setLvDl] = useState<string | null>(null);
+  // 按文件名跟踪在下载的模型:键存在=下载中,值=百分比(null=还没进度)。
+  // 单槽会串台——点了 B 就把 A 的按钮重新启用,允许对 A 发起第二次并发下载,
+  // 两个下载写同一个 .part 互相踩,导致大小/SHA 不匹配。
+  const [lvDl, setLvDl] = useState<Record<string, number | null>>({});
   const [lvErr, setLvErr] = useState<string | null>(null);
   useEffect(() => {
     localvqeAssets().then(setLvAssets).catch(() => {});
   }, []);
+  // 下载进度事件:只更新仍在下载的文件的百分比。
+  useEffect(() => {
+    const listeners = createAsyncListenerScope();
+    listeners.listen(onLocalvqeProgress, (p) => {
+      setLvDl((cur) =>
+        p.filename in cur ? { ...cur, [p.filename]: p.pct } : cur,
+      );
+    });
+    return () => listeners.dispose();
+  }, []);
   async function downloadModel(file: string) {
-    setLvDl(file);
+    // 同名下载进行中则忽略(按钮已 disabled,这里再兜一层快速双击竞态)。
+    if (file in lvDl) return;
+    setLvDl((cur) => ({ ...cur, [file]: null }));
     setLvErr(null);
     try {
       const path = await downloadLocalvqeModel(file);
@@ -380,7 +377,11 @@ export function EnginePage({
     } catch (e) {
       setLvErr(String(e));
     } finally {
-      setLvDl(null);
+      setLvDl((cur) => {
+        const next = { ...cur };
+        delete next[file];
+        return next;
+      });
     }
   }
   const proc = (k: string) => processors.find((p) => p.kind === k);
@@ -402,16 +403,26 @@ export function EnginePage({
       {LVQE_MODELS.map((m) => {
         const found = lvAssets?.models.find((x) => x.filename === m.file);
         const selected = !!found && localvqeModel === found.path;
-        const downloading = lvDl === m.file;
-        const box = downloading ? "···" : selected ? "✓" : found ? "OK" : t("lvqeGet");
+        const downloading = m.file in lvDl;
+        const pct = lvDl[m.file];
+        const box = downloading
+          ? pct != null
+            ? `${pct}%`
+            : "···"
+          : selected
+            ? "✓"
+            : found
+              ? "OK"
+              : t("lvqeGet");
         return (
           <button
             type="button"
             key={m.file}
             className={`lvmod ${selected ? "on" : found ? "have" : "miss"}`}
-            disabled={downloading}
+            disabled={downloading || selected}
             onClick={(e) => {
               e.stopPropagation();
+              if (selected) return;
               found ? onPickModel(found.path) : downloadModel(m.file);
             }}
             title={`${m.ver} · ${m.params} · ${found ? found.path : `${t("lvqeDownload")} ${m.file}`}`}
@@ -506,11 +517,12 @@ export function EnginePage({
         <div
           className={`ecard ${active ? "active" : ""} ${sup ? "" : "na"} lvwide`}
           role="button"
-          tabIndex={sup ? 0 : -1}
+          tabIndex={sup && !active ? 0 : -1}
           aria-pressed={active}
-          onClick={() => sup && onSelect(p.kind)}
+          aria-disabled={!sup || active}
+          onClick={() => sup && !active && onSelect(p.kind)}
           onKeyDown={(e) => {
-            if (sup && (e.key === "Enter" || e.key === " ")) {
+            if (sup && !active && (e.key === "Enter" || e.key === " ")) {
               e.preventDefault();
               onSelect(p.kind);
             }
@@ -524,7 +536,7 @@ export function EnginePage({
       <button
         type="button"
         aria-pressed={active}
-        disabled={!sup}
+        disabled={!sup || active}
         className={`ecard cardbtn ${active ? "active" : ""} ${sup ? "" : "na"}`}
         onClick={() => onSelect(p.kind)}
       >
@@ -561,7 +573,6 @@ export function EnginePage({
 
       <NvafxCard
         kind={kind}
-        params={params}
         doctor={doctor}
         dev={dev}
         platform={platform}
@@ -569,7 +580,6 @@ export function EnginePage({
         nvReady={nvReady}
         problems={problems}
         onSelect={onSelect}
-        onParam={onParam}
         onRecheck={onRecheck}
         onSetup={onSetup}
       />

@@ -1,9 +1,9 @@
 use std::env;
 use std::fs::{create_dir_all, remove_dir_all};
 use std::io::{BufRead, BufReader, Read};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::mpsc::{channel, Receiver};
+use std::sync::mpsc::{channel, Receiver, RecvTimeoutError};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
@@ -23,97 +23,177 @@ use crate::dsp::rms_dbfs;
 
 #[derive(Args)]
 pub(crate) struct ProbeDelayArgs {
-    /// 近端麦克风设备 selector
+    /// Near-end microphone device selector
     #[arg(long, default_value = "MacBook Pro麦克风")]
     mic: String,
-    /// reference selector;macOS 默认 system(Process Tap),Windows 默认 system(WASAPI loopback)
+    /// Reference selector; macOS defaults to system (Process Tap), Windows defaults to system (WASAPI loopback)
     #[arg(long, default_value = "system")]
     reference: String,
-    /// Echoless 输出设备;建议虚拟音频设备,避免把处理后人声送回外放
+    /// Echoless output device; a virtual audio device is recommended to avoid routing processed voice back to speakers
     #[arg(long, default_value = "BlackHole 2ch")]
     output: String,
-    /// 保留 diagnostics session 的输出目录;不传则使用临时目录并在分析后清理
-    #[arg(long)]
-    out_dir: Option<PathBuf>,
-    /// 即使未指定 --out-dir,也保留本次 diagnostics session
+    /// Keep this diagnostics session in the managed diagnostics directory after analysis
     #[arg(long)]
     keep_session: bool,
-    /// 开始播放蜂鸣前等待实时管线稳定的秒数
+    /// Seconds to wait for the realtime pipeline to stabilize before starting the beep train
     #[arg(long, default_value_t = 4.0)]
     startup_delay: f64,
-    /// 蜂鸣个数
+    /// Number of beeps
     #[arg(long, default_value_t = 12)]
     beeps: u32,
-    /// 蜂鸣音量(0.0-1.0)
+    /// Beep volume (0.0-1.0)
     #[arg(long, default_value_t = 0.35)]
     volume: f32,
-    /// 仅分析已有 diagnostics session
+    /// Only analyze an existing diagnostics session
     #[arg(long)]
     analyze_only: Option<PathBuf>,
-    /// 保留生成的蜂鸣 WAV
+    /// Keep the generated beep WAV
     #[arg(long)]
     keep_beep: Option<PathBuf>,
-    /// 输出机器可读 JSON
+    /// Emit machine-readable JSON
     #[arg(long)]
     json: bool,
 }
 
 pub(crate) fn cmd_probe_delay(a: ProbeDelayArgs) -> Result<()> {
     if !cfg!(feature = "realtime") {
-        bail!("probe-delay 需 realtime 特性(cpal)");
+        bail!("probe-delay requires the realtime feature (cpal)");
     }
     if !(cfg!(target_os = "macos") || cfg!(windows) || cfg!(target_os = "linux")) {
-        bail!("probe-delay 当前只支持 macOS / Windows / Linux");
+        bail!("probe-delay currently supports macOS / Windows / Linux only");
     }
     if !a.startup_delay.is_finite() || a.startup_delay < 0.0 {
-        bail!("--startup-delay 必须是非负有限数");
+        bail!("--startup-delay must be a non-negative finite number");
     }
     if !a.volume.is_finite() || !(0.0..=1.0).contains(&a.volume) {
-        bail!("--volume 必须在 0.0..=1.0");
+        bail!("--volume must be within 0.0..=1.0");
     }
     if a.beeps == 0 {
-        bail!("--beeps 必须大于 0");
+        bail!("--beeps must be greater than 0");
     }
     let cancel = Arc::new(AtomicBool::new(false));
     ctrlc::set_handler({
         let cancel = Arc::clone(&cancel);
         move || cancel.store(true, Ordering::SeqCst)
     })
-    .context("安装 probe-delay 取消处理器失败")?;
+    .context("failed to install probe-delay cancel handler")?;
 
-    let (result, cleanup_dirs, session_retained) = if let Some(session_dir) = &a.analyze_only {
-        (analyze_probe_session(&a, session_dir)?, Vec::new(), true)
-    } else {
-        let (beep_path, temp_dir) = probe_beep_path(&a)?;
-        let (probe_out_dir, probe_temp_dir, retain_session) = probe_output_dir(&a)?;
-        let beep_duration = write_probe_beep_train(&a, &beep_path)?;
-        probe_log(a.json, format!("beep_duration_s: {beep_duration:.2}"));
-        let session_dir =
-            run_native_delay_probe(&a, &probe_out_dir, &beep_path, beep_duration, &cancel)?;
-        let result = analyze_probe_session(&a, &session_dir)?;
-        let mut cleanup_dirs = Vec::new();
-        if let Some(temp_dir) = temp_dir {
-            cleanup_dirs.push(temp_dir);
-        }
-        if !retain_session {
-            if let Some(probe_temp_dir) = probe_temp_dir {
-                cleanup_dirs.push(probe_temp_dir);
-            }
-        }
-        (result, cleanup_dirs, retain_session)
-    };
+    let (result, cleanup_beep_dir, cleanup_session, mut session_retained) =
+        if let Some(session_dir) = &a.analyze_only {
+            (analyze_probe_session(&a, session_dir)?, None, None, true)
+        } else {
+            let (beep_path, temp_dir) = probe_beep_path(&a)?;
+            let beep_duration = write_probe_beep_train(&a, &beep_path)?;
+            probe_log(a.json, format!("beep_duration_s: {beep_duration:.2}"));
+            let session_dir = run_native_delay_probe(&a, &beep_path, beep_duration, &cancel)?;
+            let result = analyze_probe_session(&a, &session_dir)?;
+            let cleanup_session = (!a.keep_session).then_some(session_dir);
+            (result, temp_dir, cleanup_session, a.keep_session)
+        };
 
-    emit_probe_result(&result, a.json, session_retained)?;
-    for dir in cleanup_dirs {
+    if let Some(dir) = cleanup_beep_dir {
         let _ = remove_dir_all(dir);
     }
+    if let Some(session_dir) = cleanup_session {
+        session_retained = cleanup_generated_probe_session(&session_dir, a.json);
+    }
+    emit_probe_result(&result, a.json, session_retained)?;
     if let Some(warning) = result.warnings.first() {
         bail!("near delay probe warning: {warning}");
     }
     Ok(())
 }
 
+fn cleanup_generated_probe_session(session_dir: &Path, json_mode: bool) -> bool {
+    cleanup_probe_session_under(&echoless_paths::diagnostics_dir(), session_dir, json_mode)
+}
+
+fn cleanup_probe_session_under(root: &Path, session_dir: &Path, json_mode: bool) -> bool {
+    match remove_probe_session_under(root, session_dir) {
+        Ok(()) => false,
+        Err(error) => {
+            let retained = session_dir.is_dir();
+            let message = format!(
+                "failed to clean generated probe session {}: {error:#}",
+                session_dir.display()
+            );
+            if json_mode {
+                eprintln!(
+                    "{}",
+                    json!({
+                        "type": "probe_warning",
+                        "stage": "cleanup",
+                        "message": message,
+                        "session_retained": retained,
+                    })
+                );
+            } else {
+                eprintln!("probe-delay warning: {message}");
+            }
+            retained
+        }
+    }
+}
+
+fn remove_probe_session_under(root: &Path, session_dir: &Path) -> Result<()> {
+    if session_dir
+        .components()
+        .any(|component| component == Component::ParentDir)
+    {
+        bail!(
+            "refusing to remove diagnostics session containing `..`: {}",
+            session_dir.display()
+        );
+    }
+    let metadata = std::fs::symlink_metadata(session_dir).with_context(|| {
+        format!(
+            "failed to inspect diagnostics session: {}",
+            session_dir.display()
+        )
+    })?;
+    if metadata.file_type().is_symlink() {
+        bail!(
+            "refusing to remove a symlinked diagnostics session: {}",
+            session_dir.display()
+        );
+    }
+
+    let root = root.canonicalize().with_context(|| {
+        format!(
+            "failed to canonicalize fixed diagnostics root: {}",
+            root.display()
+        )
+    })?;
+    let session = session_dir.canonicalize().with_context(|| {
+        format!(
+            "failed to canonicalize diagnostics session: {}",
+            session_dir.display()
+        )
+    })?;
+    if !root.is_dir() || !session.is_dir() {
+        bail!("refusing to remove diagnostics path that is not a directory");
+    }
+    if session == root || session.parent() != Some(root.as_path()) {
+        bail!(
+            "refusing to remove diagnostics session outside the fixed root: {}",
+            session.display()
+        );
+    }
+    if !session
+        .file_name()
+        .is_some_and(|name| name.to_string_lossy().starts_with("session-"))
+    {
+        bail!(
+            "refusing to remove a non-session diagnostics directory: {}",
+            session.display()
+        );
+    }
+    remove_dir_all(&session)
+        .with_context(|| format!("failed to remove probe session: {}", session.display()))
+}
+
 const PROBE_SAMPLE_RATE: u32 = 48_000;
+const PROBE_PIPELINE_READY_TIMEOUT: Duration = Duration::from_secs(30);
 const PROBE_PRE_ROLL_S: f64 = 0.5;
 const PROBE_POST_ROLL_S: f64 = 0.8;
 const PROBE_BEEP_MS: f64 = 70.0;
@@ -156,26 +236,12 @@ fn probe_beep_path(a: &ProbeDelayArgs) -> Result<(PathBuf, Option<PathBuf>)> {
         std::process::id(),
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .context("系统时间早于 UNIX_EPOCH")?
+            .context("system time is before UNIX_EPOCH")?
             .as_nanos()
     ));
-    create_dir_all(&dir).with_context(|| format!("创建 probe 临时目录失败: {}", dir.display()))?;
+    create_dir_all(&dir)
+        .with_context(|| format!("failed to create probe temp directory: {}", dir.display()))?;
     Ok((dir.join("near-delay-beeps.wav"), Some(dir)))
-}
-
-fn probe_output_dir(a: &ProbeDelayArgs) -> Result<(PathBuf, Option<PathBuf>, bool)> {
-    if let Some(out_dir) = &a.out_dir {
-        return Ok((out_dir.clone(), None, true));
-    }
-    let dir = env::temp_dir().join(format!(
-        "echoless-near-delay-probe-{}-{}",
-        std::process::id(),
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .context("系统时间早于 UNIX_EPOCH")?
-            .as_nanos()
-    ));
-    Ok((dir.clone(), Some(dir), a.keep_session))
 }
 
 fn write_probe_beep_train(a: &ProbeDelayArgs, path: &Path) -> Result<f64> {
@@ -187,8 +253,9 @@ fn write_probe_beep_train(a: &ProbeDelayArgs, path: &Path) -> Result<f64> {
     let freqs = [880.0, 1320.0, 1760.0, 1100.0];
 
     if let Some(parent) = path.parent() {
-        create_dir_all(parent)
-            .with_context(|| format!("创建蜂鸣 WAV 目录失败: {}", parent.display()))?;
+        create_dir_all(parent).with_context(|| {
+            format!("failed to create beep WAV directory: {}", parent.display())
+        })?;
     }
     let spec = hound::WavSpec {
         channels: 1,
@@ -197,7 +264,7 @@ fn write_probe_beep_train(a: &ProbeDelayArgs, path: &Path) -> Result<f64> {
         sample_format: hound::SampleFormat::Int,
     };
     let mut writer = hound::WavWriter::create(path, spec)
-        .with_context(|| format!("创建 {} 失败", path.display()))?;
+        .with_context(|| format!("failed to create {}", path.display()))?;
 
     let mut total_frames = 0usize;
     for _ in 0..pre_frames {
@@ -243,15 +310,12 @@ fn f32_to_i16(sample: f32) -> i16 {
 
 fn run_native_delay_probe(
     a: &ProbeDelayArgs,
-    out_dir: &Path,
     beep_path: &Path,
     beep_duration_s: f64,
     cancel: &AtomicBool,
 ) -> Result<PathBuf> {
-    create_dir_all(out_dir)
-        .with_context(|| format!("创建 diagnostics 输出目录失败: {}", out_dir.display()))?;
     let diagnostic_seconds = (a.startup_delay + beep_duration_s + 1.0).ceil().max(1.0) as u32;
-    let current_exe = env::current_exe().context("定位当前 echoless 可执行文件失败")?;
+    let current_exe = env::current_exe().context("failed to locate current echoless executable")?;
     let mut command = Command::new(current_exe);
     command
         .arg("run")
@@ -271,37 +335,73 @@ fn run_native_delay_probe(
         .arg("mono")
         .arg("--near-delay-ms")
         .arg("0")
-        .arg("--diagnostic-dir")
-        .arg(out_dir)
         .arg("--diagnostic-seconds")
         .arg(diagnostic_seconds.to_string())
+        .arg("--status-json")
         .arg("--verbose")
         .arg("--stats-interval-ms")
         .arg("1000")
         .stdout(Stdio::piped())
-        .stderr(Stdio::inherit());
+        .stderr(Stdio::inherit())
+        // control reader 无条件启动(审计 B-01):stdin EOF = 优雅停机。probe spawn 的 run
+        // 子进程若继承已关闭的 stdin,会一起来就读到 EOF 自杀退出(exit 0),导致 probe 报
+        // 「run 过早退出」。给它一个常开 piped stdin(父持有、不写不关),让 run 正常跑满
+        // diagnostic 录制时长;结束时 stop_probe_child 用 SIGINT 停它。
+        .stdin(Stdio::piped());
     #[cfg(unix)]
     {
         command.process_group(0);
     }
     let mut child = command
         .spawn()
-        .context("启动 echoless run probe 子进程失败")?;
+        .context("failed to spawn echoless run probe child process")?;
 
-    let stdout = child.stdout.take().context("probe 子进程 stdout 未捕获")?;
+    let stdout = child
+        .stdout
+        .take()
+        .context("probe child stdout not captured")?;
+    // 持有 run 的 stdin write end:run 期间保持打开(control reader 阻塞等待、不 EOF,run 正常录);
+    // beep 播完后关闭它 → run 收 stdin EOF 优雅停机(比进程组 SIGINT 可靠,dev/打包都稳)。
+    let mut run_stdin = child.stdin.take();
     let rx = spawn_probe_line_reader(stdout);
+    let mut saw_started = false;
     let mut session_dir: Option<PathBuf> = None;
     let mut saw_done = false;
 
+    let ready_deadline = Instant::now() + PROBE_PIPELINE_READY_TIMEOUT;
+    while !probe_pipeline_ready(saw_started, &session_dir) {
+        if cancel.load(Ordering::SeqCst) {
+            stop_probe_child(&mut child)?;
+            bail!("probe-delay cancelled");
+        }
+        drain_probe_output(&rx, &mut saw_started, &mut session_dir, &mut saw_done);
+        if let Some(status) = child.try_wait()? {
+            bail!("echoless run probe exited before the pipeline became ready: {status}");
+        }
+        if probe_pipeline_ready(saw_started, &session_dir) {
+            break;
+        }
+        if Instant::now() >= ready_deadline {
+            stop_probe_child(&mut child)?;
+            bail!(
+                "echoless run probe did not emit started and diagnostics_started within {} seconds",
+                PROBE_PIPELINE_READY_TIMEOUT.as_secs()
+            );
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    // startup_delay is a stabilization period for live streams, not a substitute
+    // for readiness. Start it only after both the run and diagnostics writer exist.
     let startup_deadline = Instant::now() + Duration::from_secs_f64(a.startup_delay);
     while Instant::now() < startup_deadline {
         if cancel.load(Ordering::SeqCst) {
             stop_probe_child(&mut child)?;
             bail!("probe-delay cancelled");
         }
-        drain_probe_output(&rx, a.json, &mut session_dir, &mut saw_done);
+        drain_probe_output(&rx, &mut saw_started, &mut session_dir, &mut saw_done);
         if let Some(status) = child.try_wait()? {
-            bail!("echoless run probe 过早退出: {status}");
+            bail!("echoless run probe exited prematurely: {status}");
         }
         thread::sleep(Duration::from_millis(50));
     }
@@ -327,19 +427,24 @@ fn run_native_delay_probe(
     }
     play_probe_beep(a, beep_path)?;
 
+    // beep 播完 = run 已录够诊断。关闭 stdin 触发 run 优雅停机(flush diagnostic、输出
+    // 「诊断录制完成」后退出),不再靠 finish loop 空等 deadline + SIGINT —— dev sidecar 下
+    // 进程组 SIGINT 停不干净,run 会常驻 R 态、把 probe 拖到外层超时(前端一直 PROBING)。
+    drop(run_stdin.take());
+
     let finish_deadline = Instant::now() + Duration::from_secs(u64::from(diagnostic_seconds) + 2);
     while Instant::now() < finish_deadline {
         if cancel.load(Ordering::SeqCst) {
             stop_probe_child(&mut child)?;
             bail!("probe-delay cancelled");
         }
-        drain_probe_output(&rx, a.json, &mut session_dir, &mut saw_done);
+        drain_probe_output(&rx, &mut saw_started, &mut session_dir, &mut saw_done);
         if saw_done {
             break;
         }
         if let Some(status) = child.try_wait()? {
             if !status.success() {
-                bail!("echoless run probe 失败: {status}");
+                bail!("echoless run probe failed: {status}");
             }
             break;
         }
@@ -347,12 +452,18 @@ fn run_native_delay_probe(
     }
 
     stop_probe_child(&mut child)?;
-    drain_probe_output(&rx, a.json, &mut session_dir, &mut saw_done);
+    drain_probe_output(&rx, &mut saw_started, &mut session_dir, &mut saw_done);
+    drain_probe_output_until_closed(
+        &rx,
+        &mut saw_started,
+        &mut session_dir,
+        &mut saw_done,
+        Duration::from_secs(1),
+    );
 
     session_dir
         .filter(|path| path.is_dir())
-        .or_else(|| newest_probe_session(out_dir).ok())
-        .with_context(|| format!("未找到 diagnostics session: {}", out_dir.display()))
+        .context("diagnostics_started did not return an accessible session directory")
 }
 
 #[cfg(all(feature = "realtime", target_os = "macos"))]
@@ -360,9 +471,9 @@ fn play_probe_beep(_a: &ProbeDelayArgs, beep_path: &Path) -> Result<()> {
     let status = Command::new("afplay")
         .arg(beep_path)
         .status()
-        .context("播放蜂鸣 WAV 失败(需要 macOS afplay)")?;
+        .context("failed to play beep WAV (requires macOS afplay)")?;
     if !status.success() {
-        bail!("播放蜂鸣 WAV 失败: {status}");
+        bail!("failed to play beep WAV: {status}");
     }
     Ok(())
 }
@@ -391,7 +502,7 @@ fn play_probe_beep(a: &ProbeDelayArgs, beep_path: &Path) -> Result<()> {
         ) {
             Ok(()) => return Ok(()),
             Err(err) => {
-                eprintln!("probe-delay: monitor→sink 映射播放失败({stem}): {err};回退默认输出")
+                eprintln!("probe-delay: monitor->sink mapping playback failed ({stem}): {err}; falling back to default output")
             }
         }
     }
@@ -405,7 +516,7 @@ fn monitor_reference_output_stem(reference: &str) -> Result<Option<String>> {
     let reference = reference.trim();
     match reference {
         "" | "default" | "system" => Ok(None),
-        "none" => bail!("probe-delay 需要可播放的 reference;当前 reference=none"),
+        "none" => bail!("probe-delay requires a playable reference; current reference=none"),
         value => {
             let name = value.strip_prefix("input:").unwrap_or(value).trim();
             let stem = name
@@ -423,12 +534,12 @@ fn monitor_reference_output_stem(reference: &str) -> Result<Option<String>> {
     not(any(target_os = "macos", windows, target_os = "linux"))
 ))]
 fn play_probe_beep(_a: &ProbeDelayArgs, _beep_path: &Path) -> Result<()> {
-    bail!("当前平台没有 probe-delay 蜂鸣播放实现");
+    bail!("no probe-delay beep playback implementation for the current platform");
 }
 
 #[cfg(not(feature = "realtime"))]
 fn play_probe_beep(_a: &ProbeDelayArgs, _beep_path: &Path) -> Result<()> {
-    bail!("probe-delay 蜂鸣播放需 realtime 特性(cpal)");
+    bail!("probe-delay beep playback requires the realtime feature (cpal)");
 }
 
 #[cfg(any(windows, test))]
@@ -436,9 +547,9 @@ fn reference_playback_output_selector(reference: &str) -> Result<Option<&str>> {
     let reference = reference.trim();
     match reference {
         "" | "system" | "default" => Ok(None),
-        "none" => bail!("probe-delay 需要可播放的 reference;当前 reference=none"),
+        "none" => bail!("probe-delay requires a playable reference; current reference=none"),
         value if value.starts_with("input:") => {
-            bail!("probe-delay 无法向 input reference 播放蜂鸣: {value}")
+            bail!("probe-delay cannot play beeps into an input reference: {value}")
         }
         value => {
             if let Some(output) = value.strip_prefix("output:") {
@@ -452,7 +563,7 @@ fn reference_playback_output_selector(reference: &str) -> Result<Option<&str>> {
 #[cfg(any(windows, target_os = "linux"))]
 fn read_probe_beep_samples(beep_path: &Path) -> Result<Vec<f32>> {
     let mut reader = hound::WavReader::open(beep_path)
-        .with_context(|| format!("读取蜂鸣 WAV 失败: {}", beep_path.display()))?;
+        .with_context(|| format!("failed to read beep WAV: {}", beep_path.display()))?;
     let spec = reader.spec();
     if spec.channels != 1
         || spec.sample_rate != PROBE_SAMPLE_RATE
@@ -460,7 +571,7 @@ fn read_probe_beep_samples(beep_path: &Path) -> Result<Vec<f32>> {
         || spec.sample_format != hound::SampleFormat::Int
     {
         bail!(
-            "蜂鸣 WAV 格式不支持: channels={}, rate={}, bits={}, format={:?}",
+            "unsupported beep WAV format: channels={}, rate={}, bits={}, format={:?}",
             spec.channels,
             spec.sample_rate,
             spec.bits_per_sample,
@@ -471,7 +582,7 @@ fn read_probe_beep_samples(beep_path: &Path) -> Result<Vec<f32>> {
         .samples::<i16>()
         .map(|s| {
             s.map(|v| f32::from(v) / f32::from(i16::MAX))
-                .context("读取蜂鸣 WAV sample 失败")
+                .context("failed to read beep WAV sample")
         })
         .collect()
 }
@@ -493,7 +604,7 @@ where
                     }
                 }
                 Err(err) => {
-                    eprintln!("probe-delay: 读取子进程输出失败,停止读取: {err}");
+                    eprintln!("probe-delay: failed to read child output, stopping: {err}");
                     break;
                 }
             }
@@ -504,24 +615,56 @@ where
 
 fn drain_probe_output(
     rx: &Receiver<String>,
-    json_mode: bool,
+    saw_started: &mut bool,
     session_dir: &mut Option<PathBuf>,
     saw_done: &mut bool,
 ) {
     while let Ok(line) = rx.try_recv() {
-        if !json_mode {
-            println!("{line}");
-        }
-        if let Some((_, dir)) = line.split_once("诊断录制目录:") {
-            *session_dir = Some(PathBuf::from(dir.trim()));
-        }
-        if let Some((_, dir)) = line.split_once("诊断录制完成") {
-            if let Some((_, path)) = dir.rsplit_once(": ") {
-                *session_dir = Some(PathBuf::from(path.trim()));
-            }
-            *saw_done = true;
+        handle_probe_output_line(&line, saw_started, session_dir, saw_done);
+    }
+}
+
+fn drain_probe_output_until_closed(
+    rx: &Receiver<String>,
+    saw_started: &mut bool,
+    session_dir: &mut Option<PathBuf>,
+    saw_done: &mut bool,
+    timeout: Duration,
+) {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match rx.recv_timeout(Duration::from_millis(25)) {
+            Ok(line) => handle_probe_output_line(&line, saw_started, session_dir, saw_done),
+            Err(RecvTimeoutError::Disconnected) => break,
+            Err(RecvTimeoutError::Timeout) if Instant::now() < deadline => continue,
+            Err(RecvTimeoutError::Timeout) => break,
         }
     }
+}
+
+fn handle_probe_output_line(
+    line: &str,
+    saw_started: &mut bool,
+    session_dir: &mut Option<PathBuf>,
+    saw_done: &mut bool,
+) {
+    let Ok(event) = serde_json::from_str::<serde_json::Value>(line) else {
+        return;
+    };
+    match event.get("type").and_then(serde_json::Value::as_str) {
+        Some("started") => *saw_started = true,
+        Some("diagnostics_started") => {
+            if let Some(path) = event.get("session_dir").and_then(serde_json::Value::as_str) {
+                *session_dir = Some(PathBuf::from(path));
+            }
+        }
+        Some("diagnostics_done") => *saw_done = true,
+        _ => {}
+    }
+}
+
+fn probe_pipeline_ready(saw_started: bool, session_dir: &Option<PathBuf>) -> bool {
+    saw_started && session_dir.is_some()
 }
 
 fn stop_probe_child(child: &mut std::process::Child) -> Result<()> {
@@ -548,7 +691,7 @@ fn stop_probe_child(child: &mut std::process::Child) -> Result<()> {
             .status();
     }
     #[cfg(not(unix))]
-    child.kill().context("停止 probe 子进程失败")?;
+    child.kill().context("failed to stop probe child process")?;
     let _ = child.wait();
     Ok(())
 }
@@ -564,32 +707,6 @@ fn probe_child_signal_target(child: &std::process::Child) -> String {
     }
 }
 
-fn newest_probe_session(out_dir: &Path) -> Result<PathBuf> {
-    let mut sessions = std::fs::read_dir(out_dir)?
-        .filter_map(Result::ok)
-        .filter_map(|entry| {
-            let path = entry.path();
-            let is_session = path
-                .file_name()
-                .map(|name| name.to_string_lossy().starts_with("session-"))
-                .unwrap_or(false);
-            if !path.is_dir() || !is_session {
-                return None;
-            }
-            entry
-                .metadata()
-                .ok()
-                .and_then(|m| m.modified().ok())
-                .map(|modified| (modified, path))
-        })
-        .collect::<Vec<_>>();
-    sessions.sort_by_key(|(modified, _)| *modified);
-    sessions
-        .pop()
-        .map(|(_, path)| path)
-        .with_context(|| format!("{} 下没有 session-*", out_dir.display()))
-}
-
 fn analyze_probe_session(a: &ProbeDelayArgs, session_dir: &Path) -> Result<ProbeResult> {
     let ref_path = session_dir.join("ref.wav");
     let mic_path = session_dir.join("mic.wav");
@@ -597,7 +714,7 @@ fn analyze_probe_session(a: &ProbeDelayArgs, session_dir: &Path) -> Result<Probe
     let (mic_rate, mic) = read_wav_mono(&mic_path)?;
     if ref_rate != PROBE_SAMPLE_RATE || mic_rate != PROBE_SAMPLE_RATE {
         bail!(
-            "probe 只支持 48k diagnostics,实际 ref={} mic={}",
+            "probe only supports 48k diagnostics; got ref={} mic={}",
             ref_rate,
             mic_rate
         );
@@ -665,7 +782,7 @@ fn analyze_probe_session(a: &ProbeDelayArgs, session_dir: &Path) -> Result<Probe
 
 fn read_wav_mono(path: &Path) -> Result<(u32, Vec<f32>)> {
     let mut reader = hound::WavReader::open(path)
-        .with_context(|| format!("读取 WAV 失败: {}", path.display()))?;
+        .with_context(|| format!("failed to read WAV: {}", path.display()))?;
     let spec = reader.spec();
     let channels = usize::from(spec.channels.max(1));
     let values = match spec.sample_format {
@@ -684,7 +801,7 @@ fn read_wav_mono(path: &Path) -> Result<(u32, Vec<f32>)> {
                 .collect::<std::result::Result<Vec<_>, _>>()?
         }
         _ => bail!(
-            "{} 不支持的 WAV 格式: {:?} {}bit",
+            "{}: unsupported WAV format: {:?} {}bit",
             path.display(),
             spec.sample_format,
             spec.bits_per_sample
@@ -909,55 +1026,160 @@ fn probe_log(json_mode: bool, message: impl AsRef<str>) {
 mod tests {
     use super::*;
 
-    fn probe_delay_args() -> ProbeDelayArgs {
-        ProbeDelayArgs {
-            mic: "MacBook Pro麦克风".to_string(),
-            reference: "system".to_string(),
-            output: "BlackHole 2ch".to_string(),
-            out_dir: None,
-            keep_session: false,
-            startup_delay: 4.0,
-            beeps: 12,
-            volume: 0.35,
-            analyze_only: None,
-            keep_beep: None,
-            json: true,
-        }
+    fn temp_probe_test_dir(name: &str) -> PathBuf {
+        let dir = env::temp_dir().join(format!(
+            "echoless-probe-{name}-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
     }
 
     #[test]
     fn probe_recommendation_preserves_default_bias() {
-        let default_bias_ms = default_near_delay_ms();
-
+        // 大负 lag(-18.5 → -(-18.5)+8=26.5,round 到 5 = 25)超过任何平台默认 → 按实测。
         assert_eq!(recommended_near_delay_ms(-18.5, 8.0), 25);
-        assert_eq!(recommended_near_delay_ms(-2.0, 8.0), default_bias_ms);
-        assert_eq!(recommended_near_delay_ms(12.0, 8.0), default_bias_ms);
+        // 小负 lag / 正 lag → 回落平台默认:mac 25(负方向窗)、win/linux 0(不设近端延迟)。
+        if cfg!(target_os = "macos") {
+            assert_eq!(recommended_near_delay_ms(-2.0, 8.0), 25);
+            assert_eq!(recommended_near_delay_ms(12.0, 8.0), 25);
+        } else {
+            assert_eq!(recommended_near_delay_ms(-2.0, 8.0), 10); // max(10, 0)=10
+            assert_eq!(recommended_near_delay_ms(12.0, 8.0), 0); // max(-4, 0)=0
+        }
     }
 
     #[test]
-    fn probe_output_dir_is_temporary_by_default() {
-        let args = probe_delay_args();
-        let (out_dir, temp_dir, retained) = probe_output_dir(&args).unwrap();
-        assert!(!retained);
-        assert_eq!(temp_dir.as_ref(), Some(&out_dir));
-        assert!(out_dir
-            .file_name()
-            .unwrap()
-            .to_string_lossy()
-            .starts_with("echoless-near-delay-probe-"));
+    fn probe_cleanup_removes_only_a_direct_child_session() {
+        let root = temp_probe_test_dir("cleanup-direct");
+        let session = root.join("session-1");
+        std::fs::create_dir_all(&session).unwrap();
+        std::fs::write(session.join("mic.wav"), b"data").unwrap();
 
-        let mut keep_args = probe_delay_args();
-        keep_args.keep_session = true;
-        let (out_dir, temp_dir, retained) = probe_output_dir(&keep_args).unwrap();
-        assert!(retained);
-        assert_eq!(temp_dir.as_ref(), Some(&out_dir));
+        remove_probe_session_under(&root, &session).unwrap();
 
-        let mut explicit_args = probe_delay_args();
-        explicit_args.out_dir = Some(PathBuf::from("/tmp/echoless-probe-explicit"));
-        let (out_dir, temp_dir, retained) = probe_output_dir(&explicit_args).unwrap();
-        assert!(retained);
-        assert!(temp_dir.is_none());
-        assert_eq!(out_dir, PathBuf::from("/tmp/echoless-probe-explicit"));
+        assert!(!session.exists());
+        assert!(root.is_dir());
+        let _ = remove_dir_all(root);
+    }
+
+    #[test]
+    fn probe_cleanup_failure_keeps_the_result_and_reports_actual_retention() {
+        let root = temp_probe_test_dir("cleanup-best-effort-root");
+        let external = temp_probe_test_dir("cleanup-best-effort-external");
+        std::fs::write(external.join("sentinel"), b"external").unwrap();
+
+        assert!(cleanup_probe_session_under(&root, &external, true));
+        assert_eq!(
+            std::fs::read(external.join("sentinel")).unwrap(),
+            b"external"
+        );
+
+        let missing = root.join("session-missing");
+        assert!(!cleanup_probe_session_under(&root, &missing, true));
+
+        let _ = remove_dir_all(root);
+        let _ = remove_dir_all(external);
+    }
+
+    #[test]
+    fn probe_cleanup_rejects_root_nested_parent_external_and_missing_paths() {
+        let root = temp_probe_test_dir("cleanup-reject");
+        let direct = root.join("session-direct");
+        let nested = root.join("session-parent").join("nested");
+        let placeholder = root.join("placeholder");
+        let external = temp_probe_test_dir("cleanup-external");
+        std::fs::create_dir_all(&direct).unwrap();
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::create_dir_all(&placeholder).unwrap();
+        std::fs::write(root.join("root-sentinel"), b"root").unwrap();
+        std::fs::write(direct.join("sentinel"), b"direct").unwrap();
+        std::fs::write(nested.join("sentinel"), b"nested").unwrap();
+        std::fs::write(external.join("sentinel"), b"external").unwrap();
+
+        assert!(remove_probe_session_under(&root, &root).is_err());
+        assert!(remove_probe_session_under(&root, &nested).is_err());
+        assert!(
+            remove_probe_session_under(&root, &placeholder.join("..").join("session-direct"))
+                .is_err()
+        );
+        assert!(remove_probe_session_under(&root, &external).is_err());
+        assert!(remove_probe_session_under(&root, &root.join("missing")).is_err());
+        assert!(
+            remove_probe_session_under(&root.with_extension("missing-root"), &external).is_err()
+        );
+
+        assert_eq!(std::fs::read(root.join("root-sentinel")).unwrap(), b"root");
+        assert_eq!(std::fs::read(direct.join("sentinel")).unwrap(), b"direct");
+        assert_eq!(std::fs::read(nested.join("sentinel")).unwrap(), b"nested");
+        assert_eq!(
+            std::fs::read(external.join("sentinel")).unwrap(),
+            b"external"
+        );
+        let _ = remove_dir_all(root);
+        let _ = remove_dir_all(external);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn probe_cleanup_rejects_an_external_directory_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let root = temp_probe_test_dir("cleanup-symlink-root");
+        let external = temp_probe_test_dir("cleanup-symlink-external");
+        std::fs::write(external.join("sentinel"), b"external").unwrap();
+        let link = root.join("session-link");
+        symlink(&external, &link).unwrap();
+
+        assert!(remove_probe_session_under(&root, &link).is_err());
+        assert_eq!(
+            std::fs::read(external.join("sentinel")).unwrap(),
+            b"external"
+        );
+        assert!(link.exists());
+        let _ = remove_dir_all(root);
+        let _ = remove_dir_all(external);
+    }
+
+    #[test]
+    fn probe_waits_for_run_and_diagnostics_readiness_before_playback() {
+        let (sender, receiver) = channel();
+        sender
+            .send("diagnostics recording directory: /tmp/human-fallback".to_string())
+            .unwrap();
+        sender
+            .send(
+                r#"{"type":"started","diagnostics_session_dir":"/tmp/started-field"}"#.to_string(),
+            )
+            .unwrap();
+        let mut started = false;
+        let mut session = None;
+        let mut done = false;
+
+        drain_probe_output(&receiver, &mut started, &mut session, &mut done);
+
+        assert!(started);
+        assert_eq!(session, None);
+        assert!(!probe_pipeline_ready(started, &session));
+
+        sender
+            .send(
+                r#"{"type":"diagnostics_started","session_dir":"/tmp/exact-session"}"#.to_string(),
+            )
+            .unwrap();
+        sender
+            .send(r#"{"type":"diagnostics_done","session_dir":"/tmp/done-session"}"#.to_string())
+            .unwrap();
+
+        drain_probe_output(&receiver, &mut started, &mut session, &mut done);
+
+        assert_eq!(session, Some(PathBuf::from("/tmp/exact-session")));
+        assert!(probe_pipeline_ready(started, &session));
+        assert!(done);
     }
 
     #[test]

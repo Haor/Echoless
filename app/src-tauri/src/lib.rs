@@ -4,6 +4,7 @@
 //   - run 的 --status-json 以 JSONL 流式解析,经事件推给前端
 //
 // 契约真理源:docs/CLI.md + CLI `--json` 实测。
+#[cfg(target_os = "windows")]
 use std::sync::Mutex;
 
 use tauri::{Manager, WebviewUrl, WebviewWindowBuilder, WindowEvent};
@@ -15,10 +16,13 @@ mod commands;
 #[cfg(target_os = "macos")]
 mod device_watch;
 mod localvqe;
+mod logging;
 mod nvafx;
 mod platform;
 mod proc;
 mod sidecar;
+#[cfg(test)]
+mod single_instance_contract;
 #[cfg(test)]
 mod tests;
 mod tray;
@@ -29,7 +33,7 @@ use commands::{
 };
 use localvqe::{download_localvqe_model, localvqe_assets};
 use nvafx::{nvafx_doctor, nvafx_download_install, nvafx_install};
-use platform::{default_diag_dir, open_path, open_url};
+use platform::{default_diag_dir, open_diagnostics_dir, open_path, open_url};
 use proc::{terminate_run, RunState};
 use sidecar::{probe_delay, send_run_control, set_bypass, start_run, stop_run, validate_config};
 use tray::{close_to_tray_enabled, set_tray_prefs, TrayPrefs};
@@ -38,10 +42,17 @@ use tray::{register_windows_tray, TrayIconState};
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let builder = tauri::Builder::default()
+    let builder = tauri::Builder::default();
+    // Must be the first plugin: later instances notify this process and exit
+    // before any other plugin can initialize competing application state.
+    #[cfg(desktop)]
+    let builder = builder.plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+        tray::show_main_window(app)
+    }));
+    let builder = builder
         .plugin(tauri_plugin_decorum::init())
         .plugin(tauri_plugin_dialog::init())
-        .manage(RunState(Mutex::new(None)))
+        .manage(RunState::default())
         .manage(TrayPrefs::default());
 
     #[cfg(target_os = "windows")]
@@ -65,7 +76,9 @@ pub fn run() {
             nvafx_download_install,
             open_url,
             default_diag_dir,
+            open_diagnostics_dir,
             open_path,
+            logging::frontend_log,
             validate_config,
             start_run,
             send_run_control,
@@ -74,6 +87,10 @@ pub fn run() {
             set_tray_prefs
         ])
         .setup(|app| {
+            // 在 single-instance setup 成功后才打开/清理共享日志目录。第二实例会在
+            // single-instance plugin 中退出，不再与主实例竞争日志文件。
+            logging::init(env!("CARGO_PKG_VERSION"));
+
             // 默认打开基线 1040×640(v17 设计稿画布,布局按此定稿);
             // B1:min 锁到默认尺寸 —— plate 分格在更小窗口必然破版。
             // B3:builder 背景色 = 新色板 --bg #1d1d1b,resize 瞬间不露白边。
@@ -142,7 +159,7 @@ pub fn run() {
                     let _ = window.hide();
                 } else {
                     let state = window.state::<RunState>();
-                    terminate_run(&state);
+                    let _ = terminate_run(&state);
                 }
             }
         })
@@ -152,7 +169,7 @@ pub fn run() {
             // Cmd+Q / 菜单退出 / Dock Quit 不产生 CloseRequested(审计 B-01):
             // 统一在 ExitRequested 回收 sidecar,避免孤儿 CLI 占用麦克风/虚拟麦。
             if let tauri::RunEvent::ExitRequested { .. } = event {
-                terminate_run(&app_handle.state::<RunState>());
+                let _ = terminate_run(&app_handle.state::<RunState>());
                 #[cfg(target_os = "macos")]
                 device_watch::stop(&app_handle.state::<device_watch::DeviceWatchState>());
             }

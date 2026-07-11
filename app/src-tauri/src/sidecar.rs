@@ -1,4 +1,5 @@
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader};
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -10,9 +11,11 @@ use tauri::{Emitter, Manager, State};
 use crate::bin_resolve::{echoless_command, suppress_child_console};
 use crate::platform::{cleanup_run_config, transient_config_dir, write_transient_config_toml};
 use crate::proc::{
-    mark_run_exited, parse_jsonl_line_event, push_tail_line, run_json_async, run_state_guard,
-    shutdown_child_gracefully, terminate_run, JsonlLineEvent, RunChild, RunState,
-    PROBE_DELAY_TIMEOUT, STREAM_TAIL_LIMIT_BYTES, VALIDATE_COMMAND_TIMEOUT,
+    cancel_run_start, commit_run_finalization, commit_run_start, is_active_run,
+    parse_jsonl_line_event, push_tail_line, reserve_run_start, run_control_sender, run_json_async,
+    shutdown_child_gracefully, terminate_run, JsonlLineEvent, RunChild, RunControlWriter,
+    RunFinalization, RunId, RunState, PROBE_DELAY_TIMEOUT, RUN_CONTROL_ACK_TIMEOUT,
+    STREAM_TAIL_LIMIT_BYTES, VALIDATE_COMMAND_TIMEOUT,
 };
 use crate::tray::update_tray_tooltip;
 
@@ -95,8 +98,9 @@ fn run_probe_streaming(
 }
 
 /// 同时录 ref/mic、分析两路相对到达时差,返回 NearDelayProbeResult(含 recommended_near_delay_ms)。
-/// 约 15 秒、会外放蜂鸣 —— 故必须先停掉主 run(probe 内部自起子进程占用设备),由前端 gating。
-/// 当前后端只支持 macOS Process Tap;其它平台 CLI 会非 0 退出,错误经 stderr 透传给前端。
+/// 通常约 15 秒(首次 macOS 权限/Process Tap 启动可能更久)、会外放蜂鸣 —— 故必须先停掉
+/// 主 run(probe 内部自起子进程占用设备),由前端 gating。
+/// 支持 macOS / Windows / Linux(见 probe_delay.rs);不支持的平台 CLI 会非 0 退出,错误经 stderr 透传给前端。
 #[tauri::command]
 pub(crate) async fn probe_delay(
     app: tauri::AppHandle,
@@ -148,23 +152,102 @@ pub(crate) async fn validate_config(
     result
 }
 
+/// 仅由 `schedule_run_finalization` 投递到 Tauri 主线程。状态提交后再在锁外
+/// 回收 child/配置并更新 tray/event，保证下一次主线程生命周期动作不会插队。
+fn finalize_run_on_main_thread(
+    app: &tauri::AppHandle,
+    run_id: RunId,
+    config_path: &Path,
+    intentional: bool,
+) {
+    let outcome = commit_run_finalization(&app.state::<RunState>(), run_id);
+    let child = match outcome {
+        RunFinalization::Stale => {
+            cleanup_run_config(config_path);
+            return;
+        }
+        RunFinalization::ActiveWithoutChild => None,
+        RunFinalization::ActiveWithChild(child) => Some(child),
+        RunFinalization::ActiveChildMismatch { child } => {
+            crate::logging::log(
+                "error",
+                "sidecar",
+                &format!(
+                    "run state mismatch while finalizing {run_id}: child belongs to {}; reaping it",
+                    child.run_id
+                ),
+            );
+            Some(child)
+        }
+    };
+
+    drop(child);
+    cleanup_run_config(config_path);
+    update_tray_tooltip(app, false);
+    let _ = app.emit(
+        "echoless://exit",
+        serde_json::json!({ "run_id": run_id, "intentional": intentional }),
+    );
+}
+
+/// stdout reader 的唯一 finalization 入口：fire-and-forget 投递整个代际提交和
+/// GUI/event 收尾。调度失败时事件循环已不可用，仍诊断并幂等清理 reader 配置。
+fn schedule_run_finalization(
+    app: &tauri::AppHandle,
+    run_id: RunId,
+    config_path: PathBuf,
+    intentional: bool,
+) {
+    let finalizer_app = app.clone();
+    let fallback_config_path = config_path.clone();
+    if let Err(err) = app.run_on_main_thread(move || {
+        finalize_run_on_main_thread(&finalizer_app, run_id, &config_path, intentional);
+    }) {
+        crate::logging::log(
+            "error",
+            "sidecar",
+            &format!("failed to schedule run {run_id} finalization on main thread: {err}"),
+        );
+        cleanup_run_config(&fallback_config_path);
+    }
+}
+
 #[tauri::command]
 pub(crate) fn start_run(
     app: tauri::AppHandle,
     state: State<RunState>,
     toml_text: String,
     stats_interval_ms: Option<u32>,
-) -> Result<(), String> {
-    let mut guard = run_state_guard(&state);
-    // 幂等启动:若有残留子进程(并发重启 / 上次崩溃遗留),经 RunChild::Drop
-    // 优雅停机(stopping 标记使其 reader 判定为 intentional,不报崩溃)。
-    drop(guard.take());
-    let dir = transient_config_dir(&app)?;
-    let path = write_transient_config_toml(&dir, "run", &toml_text)?;
+) -> Result<RunId, String> {
+    // 锁内只摘状态并预留代际；旧 child 的优雅停机和所有启动准备都在锁外。
+    let (run_id, old_child) = reserve_run_start(&state)?;
+    drop(old_child);
+
+    let dir = match transient_config_dir(&app) {
+        Ok(dir) => dir,
+        Err(err) => {
+            cancel_run_start(&state, run_id);
+            return Err(err);
+        }
+    };
+    let path = match write_transient_config_toml(&dir, "run", &toml_text) {
+        Ok(path) => path,
+        Err(err) => {
+            cancel_run_start(&state, run_id);
+            return Err(err);
+        }
+    };
     let config_arg = path.to_string_lossy().to_string();
     let interval = stats_interval_ms.unwrap_or(80).to_string();
 
-    let mut command = echoless_command(Some(&app))?;
+    let mut command = match echoless_command(Some(&app)) {
+        Ok(command) => command,
+        Err(err) => {
+            cancel_run_start(&state, run_id);
+            cleanup_run_config(&path);
+            return Err(err);
+        }
+    };
     suppress_child_console(&mut command);
     let child_result = command
         .args([
@@ -182,7 +265,13 @@ pub(crate) fn start_run(
     let mut child = match child_result {
         Ok(child) => child,
         Err(err) => {
+            cancel_run_start(&state, run_id);
             cleanup_run_config(&path);
+            crate::logging::log(
+                "error",
+                "sidecar",
+                &format!("spawn echoless run failed: {err}"),
+            );
             return Err(format!("spawn echoless run failed: {err}"));
         }
     };
@@ -190,10 +279,31 @@ pub(crate) fn start_run(
     // 本子进程专属的 stopping flag:被主动停/重启时置 true。
     let stopping = Arc::new(AtomicBool::new(false));
 
+    let stdin = match child.stdin.take() {
+        Some(stdin) => stdin,
+        None => {
+            cancel_run_start(&state, run_id);
+            shutdown_child_gracefully(&mut child);
+            cleanup_run_config(&path);
+            return Err("no stdin".to_string());
+        }
+    };
+    let control_writer = match RunControlWriter::spawn(stdin) {
+        Ok(writer) => writer,
+        Err(err) => {
+            cancel_run_start(&state, run_id);
+            shutdown_child_gracefully(&mut child);
+            cleanup_run_config(&path);
+            return Err(err);
+        }
+    };
+
     // stdout = JSONL status events
     let stdout = match child.stdout.take() {
         Some(stdout) => stdout,
         None => {
+            cancel_run_start(&state, run_id);
+            drop(control_writer);
             shutdown_child_gracefully(&mut child);
             cleanup_run_config(&path);
             return Err("no stdout".to_string());
@@ -202,128 +312,177 @@ pub(crate) fn start_run(
     let stderr = match child.stderr.take() {
         Some(stderr) => stderr,
         None => {
+            cancel_run_start(&state, run_id);
+            drop(control_writer);
             shutdown_child_gracefully(&mut child);
             cleanup_run_config(&path);
             return Err("no stderr".to_string());
         }
     };
+
+    let reader_config_path = path.clone();
+    if !commit_run_start(
+        &state,
+        run_id,
+        RunChild {
+            run_id,
+            child,
+            stopping: stopping.clone(),
+            config_path: path,
+            control_writer: Some(control_writer),
+        },
+    ) {
+        crate::logging::log(
+            "info",
+            "sidecar",
+            &format!("discarded superseded run start {run_id}"),
+        );
+        return Err(format!("run start {run_id} was superseded or canceled"));
+    }
+
+    // readers 必须在 child/active generation 原子安装之后启动，避免首批
+    // started/status 被 generation 判定误丢。
     let app_out = app.clone();
     let stop_reader = stopping.clone();
-    let reader_config_path = path.clone();
     std::thread::spawn(move || {
         // CLI stdout 契约:只输出完整 JSONL status/control 行;坏行降级为日志保留证据。
         for line in BufReader::new(stdout).lines() {
             match line {
                 Ok(line) => match parse_jsonl_line_event(&line) {
                     JsonlLineEvent::Empty => {}
-                    JsonlLineEvent::Json(v) => {
-                        let _ = app_out.emit("echoless://status", v);
-                    }
+                    JsonlLineEvent::Json(value) => match attach_run_id(value, run_id) {
+                        Ok(value) => {
+                            let run_state = app_out.state::<RunState>();
+                            if is_active_run(&run_state, run_id) {
+                                let _ = app_out.emit("echoless://status", value);
+                            }
+                        }
+                        Err(value) => {
+                            let run_state = app_out.state::<RunState>();
+                            if is_active_run(&run_state, run_id) {
+                                crate::logging::log(
+                                    "warn",
+                                    "sidecar",
+                                    &format!("non-object status JSON ignored: {value}"),
+                                );
+                                let _ = app_out.emit(
+                                    "echoless://log",
+                                    format!("non-object status JSON ignored: {value}"),
+                                );
+                            }
+                        }
+                    },
                     JsonlLineEvent::Unparsed(line) => {
-                        let _ =
-                            app_out.emit("echoless://log", format!("unparsed status line: {line}"));
+                        let run_state = app_out.state::<RunState>();
+                        if is_active_run(&run_state, run_id) {
+                            crate::logging::log(
+                                "warn",
+                                "sidecar",
+                                &format!("unparsed status line: {line}"),
+                            );
+                            let _ = app_out
+                                .emit("echoless://log", format!("unparsed status line: {line}"));
+                        }
                     }
                 },
                 Err(err) => {
-                    let _ = app_out.emit(
-                        "echoless://log",
-                        format!("failed to read echoless stdout: {err}"),
-                    );
+                    let run_state = app_out.state::<RunState>();
+                    if is_active_run(&run_state, run_id) {
+                        crate::logging::log(
+                            "error",
+                            "sidecar",
+                            &format!("failed to read echoless stdout: {err}"),
+                        );
+                        let _ = app_out.emit(
+                            "echoless://log",
+                            format!("failed to read echoless stdout: {err}"),
+                        );
+                    }
                     break;
                 }
             }
         }
         // 退出归因:intentional=主动停/重启(本 flag 已被置 true);否则=子进程自己退出(崩溃)。
         let intentional = stop_reader.load(Ordering::SeqCst);
-        let run_state = app_out.state::<RunState>();
-        mark_run_exited(&run_state, &reader_config_path);
-        update_tray_tooltip(&app_out, false);
-        let _ = app_out.emit(
-            "echoless://exit",
-            serde_json::json!({ "intentional": intentional }),
+        crate::logging::log(
+            if intentional { "info" } else { "error" },
+            "sidecar",
+            &format!("echoless run {run_id} exited (intentional={intentional})"),
         );
+        schedule_run_finalization(&app_out, run_id, reader_config_path, intentional);
     });
 
-    // stderr = 人类日志
+    // stderr = 人类日志(转发事件 + 落盘取证)
     let app_err = app.clone();
     std::thread::spawn(move || {
         for line in BufReader::new(stderr).lines() {
             match line {
                 Ok(line) => {
                     if !line.trim().is_empty() {
-                        let _ = app_err.emit("echoless://log", line);
+                        let run_state = app_err.state::<RunState>();
+                        if is_active_run(&run_state, run_id) {
+                            crate::logging::log("info", "cli", &line);
+                            let _ = app_err.emit("echoless://log", line);
+                        }
                     }
                 }
                 Err(err) => {
-                    let _ = app_err.emit(
-                        "echoless://log",
-                        format!("failed to read echoless stderr: {err}"),
-                    );
+                    let run_state = app_err.state::<RunState>();
+                    if is_active_run(&run_state, run_id) {
+                        let _ = app_err.emit(
+                            "echoless://log",
+                            format!("failed to read echoless stderr: {err}"),
+                        );
+                    }
                     break;
                 }
             }
         }
     });
 
-    *guard = Some(RunChild {
-        child,
-        stopping,
-        config_path: path,
-    });
-    update_tray_tooltip(&app, true);
-    Ok(())
+    crate::logging::log("info", "sidecar", "echoless run started");
+    if is_active_run(&state, run_id) {
+        update_tray_tooltip(&app, true);
+    }
+    Ok(run_id)
+}
+
+pub(crate) fn attach_run_id(mut value: Value, run_id: RunId) -> Result<Value, Value> {
+    let Some(object) = value.as_object_mut() else {
+        return Err(value);
+    };
+    object.insert("run_id".to_string(), json!(run_id));
+    Ok(value)
 }
 
 /// 向运行中的 echoless run 子进程 stdin 写一行 JSON 控制命令。
 /// 具体能力由 CLI started.supported_controls 上报。
 #[tauri::command]
-pub(crate) fn send_run_control(state: State<RunState>, line: String) -> Result<(), String> {
-    write_run_control_line(&state, &line)
+pub(crate) async fn send_run_control(
+    state: State<'_, RunState>,
+    line: String,
+) -> Result<(), String> {
+    enqueue_run_control(&state, line).await
 }
 
+#[cfg(test)]
 pub(crate) fn write_run_control_line(state: &RunState, line: &str) -> Result<(), String> {
-    let mut guard = run_state_guard(state);
-    let write_result = {
-        let rc = guard.as_mut().ok_or("not running")?;
-        let stdin = rc.child.stdin.as_mut().ok_or("no stdin")?;
-        stdin
-            .write_all(line.as_bytes())
-            .and_then(|_| stdin.write_all(b"\n"))
-            .and_then(|_| stdin.flush())
-            .map_err(|e| e.to_string())
-    };
-    if let Err(err) = write_result {
-        let status = guard
-            .as_mut()
-            .and_then(|rc| rc.child.try_wait().ok().flatten());
-        if let Some(status) = status {
-            drop(guard.take());
-            return Err(format!(
-                "run process exited before control command was applied: {status}"
-            ));
-        }
-        return Err(err);
-    }
+    run_control_sender(state)?.send_line_with_timeout(line, RUN_CONTROL_ACK_TIMEOUT)
+}
 
-    let status = {
-        let rc = guard.as_mut().ok_or("not running")?;
-        rc.child
-            .try_wait()
-            .map_err(|e| format!("failed to check run process after control command: {e}"))?
-    };
-    if let Some(status) = status {
-        drop(guard.take());
-        return Err(format!(
-            "run process exited before control command was applied: {status}"
-        ));
-    }
-    Ok(())
+async fn enqueue_run_control(state: &RunState, line: String) -> Result<(), String> {
+    let sender = run_control_sender(state)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        sender.send_line_with_timeout(&line, RUN_CONTROL_ACK_TIMEOUT)
+    })
+    .await
+    .map_err(|err| format!("run control task join failed: {err}"))?
 }
 
 #[tauri::command]
-pub(crate) fn set_bypass(state: State<RunState>, enabled: bool) -> Result<(), String> {
+pub(crate) async fn set_bypass(state: State<'_, RunState>, enabled: bool) -> Result<(), String> {
     let line = bypass_control_line(enabled);
-    write_run_control_line(&state, &line)
+    enqueue_run_control(&state, line).await
 }
 
 pub(crate) fn bypass_control_line(enabled: bool) -> String {
@@ -335,8 +494,17 @@ pub(crate) fn bypass_control_line(enabled: bool) -> String {
 }
 
 #[tauri::command]
-pub(crate) fn stop_run(app: tauri::AppHandle, state: State<RunState>) -> Result<(), String> {
-    terminate_run(&state);
-    update_tray_tooltip(&app, false);
-    Ok(())
+pub(crate) fn stop_run(
+    app: tauri::AppHandle,
+    state: State<RunState>,
+) -> Result<Option<RunId>, String> {
+    let run_id = terminate_run(&state);
+    if let Some(run_id) = run_id {
+        update_tray_tooltip(&app, false);
+        let _ = app.emit(
+            "echoless://exit",
+            serde_json::json!({ "run_id": run_id, "intentional": true }),
+        );
+    }
+    Ok(run_id)
 }

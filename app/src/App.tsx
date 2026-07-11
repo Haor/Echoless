@@ -9,7 +9,6 @@ import {
 } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { getVersion } from "@tauri-apps/api/app";
-import type { UnlistenFn } from "@tauri-apps/api/event";
 import {
   buildConfigToml,
   defaultDiagDir,
@@ -22,6 +21,7 @@ import {
   nvafxDownloadInstall,
   nvafxInstall,
   onDevicesChanged,
+  onNvafxProgress,
   onRunEvent,
   onRunExit,
   onRunLog,
@@ -69,6 +69,16 @@ import { VolumeWheel } from "./components/VolumeWheel";
 import { RuntimeDiagnosticsPage } from "./components/RuntimeDiagnosticsPage";
 import { RuntimeFooterBars } from "./components/RuntimeFooterBars";
 import { RuntimeSignalPanel } from "./components/RuntimeSignalPanel";
+import { ErrorBoundary } from "./components/ErrorBoundary";
+import { Hint } from "./components/Hint";
+import {
+  acceptRunEvent,
+  acceptRunExit,
+  INITIAL_RUN_GENERATION,
+  observeRunStart,
+  type RunGeneration,
+} from "./runGeneration";
+import { controlErrorMessage, streamErrorMessage } from "./runEventDisplay";
 import {
   RuntimeStatusStrip,
   RuntimeSubline,
@@ -87,10 +97,15 @@ import {
   hotInitialDelayValue,
   hotLocalvqeNoiseGateValue,
   platformNearDelayDefault,
+  createRunIntentGuard,
   createSerialQueue,
   bypassToggleTarget,
   settleBypassObservation,
   clearBypassPending,
+  routeEngineKindSelection,
+  shouldPickLocalvqeModel,
+  canChangePipeline,
+  pipelineForEngineKind,
 } from "./engineLogic";
 import {
   publishRuntimeStatus,
@@ -99,6 +114,8 @@ import {
   setDiagnosticsSessionDir,
 } from "./runtimeTelemetry";
 import { REQUIRED_RUN_CONTROLS } from "./runtimeControls";
+import { createAsyncListenerScope } from "./asyncListener";
+import { settleBootGate } from "./bootGate";
 
 const appWindow = getCurrentWindow();
 
@@ -266,6 +283,9 @@ type AppState = {
   doctor: DoctorAudio | null;
   nvafx: NvafxDoctor | null;
   nvafxBusy: boolean;
+  nvafxPct: number | null;
+  nvafxStage: "runtime" | "model" | null;
+  nvafxRecv: number | null;
   dev: boolean;
   devRtxState: RtxState;
   devMicState: MicState;
@@ -323,6 +343,9 @@ const INITIAL_APP_STATE: AppState = {
   doctor: null,
   nvafx: null,
   nvafxBusy: false,
+  nvafxPct: null,
+  nvafxStage: null,
+  nvafxRecv: null,
   dev: false,
   devRtxState: "runtime_not_installed",
   devMicState: "missing",
@@ -376,23 +399,24 @@ const SAVED_ENGINE = readSavedEngineState();
 function initEngineState(): EngineState {
   const pl = SAVED_ENGINE.pipeline ?? {};
   const kind = SAVED_ENGINE.kind ?? INITIAL_ENGINE_STATE.kind;
+  const savedPipeline: PipelineCfg = {
+    sample_rate:
+      typeof pl.sample_rate === "number"
+        ? pl.sample_rate
+        : INITIAL_PIPELINE.sample_rate,
+    frame_ms:
+      typeof pl.frame_ms === "number"
+        ? pl.frame_ms
+        : INITIAL_PIPELINE.frame_ms,
+    reference_channels: pl.reference_channels === "stereo" ? "stereo" : "mono",
+    near_delay_ms:
+      typeof pl.near_delay_ms === "number" ? pl.near_delay_ms : undefined,
+    output_level:
+      typeof pl.output_level === "number" ? pl.output_level : undefined,
+  };
   return {
     kind,
-    pipeline: {
-      sample_rate:
-        typeof pl.sample_rate === "number"
-          ? pl.sample_rate
-          : INITIAL_PIPELINE.sample_rate,
-      frame_ms:
-        typeof pl.frame_ms === "number"
-          ? pl.frame_ms
-          : INITIAL_PIPELINE.frame_ms,
-      reference_channels: pl.reference_channels === "stereo" ? "stereo" : "mono",
-      near_delay_ms:
-        typeof pl.near_delay_ms === "number" ? pl.near_delay_ms : undefined,
-      output_level:
-        typeof pl.output_level === "number" ? pl.output_level : undefined,
-    },
+    pipeline: pipelineForEngineKind(kind, savedPipeline),
     params: SAVED_ENGINE.paramsByKind?.[kind] ?? {},
   };
 }
@@ -531,6 +555,7 @@ type EngineConfigDeps = {
   nvafx: NvafxDoctor | null;
   powerOnRef: MutableRefObject<boolean>;
   applyChangeRef: MutableRefObject<(next: Override) => void>;
+  stopForEngineSetupRef: MutableRefObject<() => void>;
   noteError: (err: string | null) => void;
   gotoView: (view: View) => void;
   hasRunControl: (cmd: string) => boolean;
@@ -544,6 +569,7 @@ function useEngineConfig({
   nvafx,
   powerOnRef,
   applyChangeRef,
+  stopForEngineSetupRef,
   noteError,
   gotoView,
   hasRunControl,
@@ -575,7 +601,9 @@ function useEngineConfig({
     // 否则在 AEC3 激活时点 LocalVQE 会因 params.model 为空而误判未就绪、每次跳引擎页。
     if (k === "localvqe")
       return Boolean(
-        k === kind ? params.model : paramsByKind.current["localvqe"]?.model,
+        k === kindRef.current
+          ? paramsRef.current.model
+          : paramsByKind.current["localvqe"]?.model,
       );
     if (k === "nvidia_afx_aec") return dev || Boolean(nvafx?.ok);
     return true;
@@ -583,12 +611,35 @@ function useEngineConfig({
 
   // 切 backend:优先恢复该引擎上次的参数(保住 LocalVQE 选过的模型),否则用 manifest 默认。
   function changeKind(k: string) {
-    paramsByKind.current[kind] = paramsRef.current; // 存下当前引擎的参数
-    const np =
-      paramsByKind.current[k] ??
-      defaultParams(processors.find((p) => p.kind === k));
-    updateEngine({ kind: k, params: np });
-    applyChangeRef.current({ kind: k, params: np });
+    routeEngineKindSelection(kindRef, k, engineReady(k), {
+      setup: (target) => {
+        stopForEngineSetupRef.current();
+        gotoView(target === "nvidia_afx_aec" ? "rtxsetup" : "engine");
+      },
+      apply: (previous, target) => {
+        paramsByKind.current[previous] = paramsRef.current;
+        const np =
+          paramsByKind.current[target] ??
+          defaultParams(processors.find((p) => p.kind === target));
+        paramsByKind.current[target] = np;
+        paramsRef.current = np;
+        const nextPipeline = pipelineForEngineKind(
+          target,
+          pipelineRef.current,
+        );
+        pipelineRef.current = nextPipeline;
+        updateEngine({
+          kind: target,
+          params: np,
+          pipeline: nextPipeline,
+        });
+        applyChangeRef.current({
+          kind: target,
+          params: np,
+          pipeline: nextPipeline,
+        });
+      },
+    });
   }
 
   // 改单个 chain 参数(NOISE / Advanced)。
@@ -674,12 +725,20 @@ function useEngineConfig({
 
   // 选 LocalVQE 模型(清单常驻):原子地切到 localvqe 引擎并设 model,避免把 model 写到当前引擎上。
   function pickLocalvqeModel(path: string) {
+    const selectedModel =
+      kindRef.current === "localvqe"
+        ? paramsRef.current.model
+        : paramsByKind.current["localvqe"]?.model;
+    if (!shouldPickLocalvqeModel(selectedModel, path)) return;
+
     const base =
       paramsByKind.current["localvqe"] ??
       defaultParams(processors.find((p) => p.kind === "localvqe"));
     const np = { ...base, model: path };
-    paramsByKind.current[kind] = paramsRef.current; // 存下当前引擎
+    paramsByKind.current[kindRef.current] = paramsRef.current;
     paramsByKind.current["localvqe"] = np;
+    kindRef.current = "localvqe";
+    paramsRef.current = np;
     updateEngine({ kind: "localvqe", params: np });
     applyChangeRef.current({ kind: "localvqe", params: np });
   }
@@ -690,6 +749,7 @@ function useEngineConfig({
 
   // 改管线项。near_delay_ms 可运行中热控;采样率/帧长/参考声道仍需重启。
   function changePipeline(patch: Partial<PipelineCfg>) {
+    if (!canChangePipeline(kindRef.current, patch)) return;
     const npl = { ...pipelineRef.current, ...patch };
     pipelineRef.current = npl; // 同步更新 ref:探测后自动恢复引擎时能立刻读到新 near_delay
     updateEngine({ pipeline: npl });
@@ -761,7 +821,6 @@ type RunLifecycleDeps = {
   bypassPending: boolean | null;
   rec: boolean;
   diagSeconds: number | null;
-  diagDir: string;
   selInput: string;
   selOutput: string;
   reference: string;
@@ -774,6 +833,7 @@ type RunLifecycleDeps = {
   runControlsRef: MutableRefObject<Set<string> | null>;
   powerOnRef: MutableRefObject<boolean>;
   applyChangeRef: MutableRefObject<(next: Override) => void>;
+  stopForEngineSetupRef: MutableRefObject<() => void>;
   updateApp: Dispatch<Patch<AppState>>;
   noteError: (err: string | null) => void;
   gotoView: (view: View) => void;
@@ -788,7 +848,6 @@ function useRunLifecycle({
   bypassPending,
   rec,
   diagSeconds,
-  diagDir,
   selInput,
   selOutput,
   reference,
@@ -801,6 +860,7 @@ function useRunLifecycle({
   runControlsRef,
   powerOnRef,
   applyChangeRef,
+  stopForEngineSetupRef,
   updateApp,
   noteError,
   gotoView,
@@ -809,15 +869,17 @@ function useRunLifecycle({
 }: RunLifecycleDeps) {
   // 当前 run 实际生效的参考源(由 started 给出),供 status 判断是否 Process Tap。
   const refSourceRef = useRef<string | null>(null);
+  const runGenerationRef = useRef<RunGeneration>(INITIAL_RUN_GENERATION);
   // 子进程最近一条 stderr 日志(用于在非预期退出时报错)。
   const lastLogRef = useRef<string>("");
   const probeBorrowedRunRef = useRef(false);
+  const engineSetupStopPendingRef = useRef(false);
+  const runIntentRef = useRef(createRunIntentGuard(powerOn));
+  if (!powerOn) engineSetupStopPendingRef.current = false;
   const recRef = useRef(rec);
   recRef.current = rec;
   const diagSecondsRef = useRef(diagSeconds);
   diagSecondsRef.current = diagSeconds;
-  const diagDirRef = useRef(diagDir);
-  diagDirRef.current = diagDir;
 
   // 录制就地起停命令(运行中改录制态用 stdin,不重启 run)。
   const startDiag = useCallback(() => {
@@ -825,20 +887,17 @@ function useRunLifecycle({
       reportMissingRunControl("start_diagnostics");
       return;
     }
-    if (diagDirRef.current) {
-      startDiagnostics(diagDirRef.current, diagSecondsRef.current).catch((e) =>
-        noteError(String(e)),
-      );
-    }
+    startDiagnostics(diagSecondsRef.current).catch((e) => noteError(String(e)));
   }, [hasRunControl, noteError, reportMissingRunControl]);
 
   useEffect(() => {
     // 清理可能残留的 sidecar(前端 reload 后 Rust 子进程可能还活着 → 状态脱同步)。
     stopRun().catch(() => {});
-    const uns: UnlistenFn[] = [];
-    (async () => {
-      uns.push(
-        await onRunEvent((ev) => {
+    const listeners = createAsyncListenerScope();
+    listeners.listen(onRunEvent, (ev) => {
+          const decision = acceptRunEvent(runGenerationRef.current, ev);
+          runGenerationRef.current = decision.generation;
+          if (!decision.accepted) return;
           if (ev.type === "started") {
             telRef.current.on = true;
             cliVersionRef.current = ev.cli_version ?? null;
@@ -862,7 +921,7 @@ function useRunLifecycle({
             });
             // run 已起;若录制开关为开,就地下发 start_diagnostics(power-on-with-rec /
             // 改设置重启 后的统一入口)。session 目录随后由 diagnostics_started 给出。
-            if (recRef.current && diagDirRef.current) startDiag();
+            if (recRef.current) startDiag();
             return;
           }
           // 录制已就地启动:拿到 session 目录。
@@ -880,7 +939,27 @@ function useRunLifecycle({
                 ...clearBypassPending(state),
               }));
             }
-            noteError(`${ev.cmd}: ${ev.message}`);
+            noteError(controlErrorMessage(ev));
+            return;
+          }
+          if (ev.type === "stream_error") {
+            const message = streamErrorMessage(ev);
+            lastLogRef.current = message;
+            if (!ev.fatal) {
+              noteError(message);
+              return;
+            }
+            runIntentRef.current.request(false);
+            powerOnRef.current = false;
+            telRef.current.on = false;
+            resetRuntimeLive();
+            updateApp({
+              powerOn: false,
+              bypassed: false,
+              bypassPending: null,
+              io: null,
+              err: message,
+            });
             return;
           }
           // 实时音量变更回执:值由前端驱动,无需处理(否则会被当成 status 读到一堆 undefined,
@@ -925,7 +1004,11 @@ function useRunLifecycle({
             }
             return;
           }
-          // status
+          // status —— 白名单判定,绝不兜底。此前这里是「黑名单排除已知事件、
+          // 剩余全当 status」:后端每加一种新事件(实锤案例:clock_skew_warning
+          // 走同一条 echoless://status 通道)就会掉进兜底、被当 status 读出一堆
+          // undefined,灌进遥测后在 dash 的 toFixed 上炸掉整棵 React 树(黑屏)。
+          if (ev.type !== "status") return;
           const s = ev;
           // Process Tap 参考收到真实信号 = 系统音频录制权限确已授予 →
           // 把 doctor 的 system_audio_permission 修正为 granted,清掉「请求权限」提示。
@@ -962,10 +1045,11 @@ function useRunLifecycle({
           tel.refWave = s.ref_wave;
           tel.outWave = s.out_wave;
           publishRuntimeStatus(s);
-        }),
-      );
-      uns.push(
-        await onRunExit((ev) => {
+    });
+    listeners.listen(onRunExit, (ev) => {
+          const decision = acceptRunExit(runGenerationRef.current, ev);
+          runGenerationRef.current = decision.generation;
+          if (!decision.accepted) return;
           telRef.current.on = false;
           resetRuntimeLive(); // 清掉停机后残留的 dBFS / 延迟读数
           updateApp({ io: null, bypassed: false, bypassPending: null });
@@ -976,26 +1060,22 @@ function useRunLifecycle({
           if (ev.intentional) return;
           // 非预期退出(子进程自己挂了,如设备不支持采样率)→ 如实反映失败 + 报错。
           // 稍等让 stderr 末行(真正的错误原因)到达,再显示。
-          if (powerOnRef.current) {
+          if (runIntentRef.current.wantsRun()) {
+            const exitIntent = runIntentRef.current.request(false);
+            powerOnRef.current = false;
             window.setTimeout(() => {
-              if (!powerOnRef.current) return;
+              if (runIntentRef.current.snapshot() !== exitIntent) return;
               updateApp({
                 powerOn: false,
                 err: lastLogRef.current || "运行已停止:子进程意外退出",
               });
             }, 150);
           }
-        }),
-      );
-      uns.push(
-        await onRunLog((line) => {
-          if (line.trim()) lastLogRef.current = line;
-        }),
-      );
-    })();
-    return () => {
-      uns.forEach((u) => u());
-    };
+    });
+    listeners.listen(onRunLog, (line) => {
+      if (line.trim()) lastLogRef.current = line;
+    });
+    return () => listeners.dispose();
   }, [hasRunControl, noteError, startDiag, updateApp]);
 
   function currentToml(over?: Override) {
@@ -1012,6 +1092,8 @@ function useRunLifecycle({
   }
 
   async function start() {
+    const startIntent = runIntentRef.current.request(true);
+    powerOnRef.current = true;
     updateApp({ busy: true, err: null });
     resetRuntimeHealth();
     resetRuntimeLive();
@@ -1020,26 +1102,48 @@ function useRunLifecycle({
       const toml = currentToml();
       const v = await validateConfig(toml);
       if (!v.ok) {
+        if (runIntentRef.current.allowsStart(startIntent)) {
+          runIntentRef.current.request(false);
+          powerOnRef.current = false;
+        }
         updateApp({
           err: v.errors.map((e) => `${e.path}: ${e.message}`).join("; "),
+          powerOn: false,
           busy: false,
         });
         return;
       }
+      if (!runIntentRef.current.allowsStart(startIntent)) return;
       telRef.current.on = true;
-      await startRun(toml, 80);
+      const runId = await startRun(toml, 80);
+      if (!runIntentRef.current.allowsStart(startIntent)) {
+        telRef.current.on = false;
+        await stopRun().catch(() => {});
+        return;
+      }
+      runGenerationRef.current = observeRunStart(
+        runGenerationRef.current,
+        runId,
+      );
       probeBorrowedRunRef.current = false;
       // 启动即 AEC on(toml 不写 bypass,后端默认 false)。
       updateApp({ powerOn: true, bypassed: false, bypassPending: null });
     } catch (e) {
-      noteError(String(e));
-      telRef.current.on = false;
+      if (runIntentRef.current.allowsStart(startIntent)) {
+        runIntentRef.current.request(false);
+        powerOnRef.current = false;
+        noteError(String(e));
+        telRef.current.on = false;
+        updateApp({ powerOn: false });
+      }
     } finally {
       updateApp({ busy: false });
     }
   }
 
   async function stop() {
+    runIntentRef.current.request(false);
+    powerOnRef.current = false;
     updateApp({ busy: true });
     try {
       await stopRun();
@@ -1055,6 +1159,13 @@ function useRunLifecycle({
       });
     }
   }
+
+  stopForEngineSetupRef.current = () => {
+    if (!runIntentRef.current.wantsRun() || engineSetupStopPendingRef.current)
+      return;
+    engineSetupStopPendingRef.current = true;
+    void stop();
+  };
 
   // 延迟侦测专用:probe 需独占麦克风/输出 → AdvancedPage 在探测前后调这个停/起引擎。
   // 恢复时走 start(),会用上探测刚写入的 near_delay/initial_delay(refs 已同步)。
@@ -1113,7 +1224,7 @@ function useRunLifecycle({
   doApplyRef.current = doApplyChange;
   const applyQueueRef = useRef(
     createSerialQueue<Override>((merged) => {
-      if (!powerOnRef.current) return Promise.resolve();
+      if (!runIntentRef.current.wantsRun()) return Promise.resolve();
       return doApplyRef.current(merged);
     }),
   );
@@ -1125,12 +1236,19 @@ function useRunLifecycle({
   applyChangeRef.current = applyChange;
 
   async function doApplyChange(next: Override) {
+    const applyIntent = runIntentRef.current.snapshot();
+    if (!runIntentRef.current.allowsStart(applyIntent)) return;
     updateApp({ busy: true });
     try {
       await stopRun();
+      if (!runIntentRef.current.allowsStart(applyIntent)) return;
       const toml = currentToml(next);
       const v = await validateConfig(toml);
       if (!v.ok) {
+        if (runIntentRef.current.allowsStart(applyIntent)) {
+          runIntentRef.current.request(false);
+          powerOnRef.current = false;
+        }
         updateApp({
           err: v.errors.map((e) => `${e.path}: ${e.message}`).join("; "),
           powerOn: false,
@@ -1140,11 +1258,24 @@ function useRunLifecycle({
         telRef.current.on = false;
         return;
       }
+      if (!runIntentRef.current.allowsStart(applyIntent)) return;
       telRef.current.on = true;
-      await startRun(toml, 80);
+      const runId = await startRun(toml, 80);
+      if (!runIntentRef.current.allowsStart(applyIntent)) {
+        telRef.current.on = false;
+        await stopRun().catch(() => {});
+        return;
+      }
+      runGenerationRef.current = observeRunStart(
+        runGenerationRef.current,
+        runId,
+      );
       updateApp({ powerOn: true, bypassed: false, bypassPending: null });
       noteError(null);
     } catch (e) {
+      if (!runIntentRef.current.allowsStart(applyIntent)) return;
+      runIntentRef.current.request(false);
+      powerOnRef.current = false;
       noteError(String(e));
       telRef.current.on = false;
       updateApp({ powerOn: false, bypassed: false, bypassPending: null });
@@ -1169,26 +1300,19 @@ function useRunLifecycle({
     }
   }, [hasRunControl, noteError, reportMissingRunControl, startDiag, updateApp]);
 
-  // 时长 / 目录:仅更新状态。录制中改动 → 重发 start_diagnostics 让新参数立即生效
+  // 时长:仅更新状态。录制中改动 → 重发 start_diagnostics 让新参数立即生效
   // (后端先收尾旧 session 再开新的)。
   const setRecSeconds = useCallback((v: number | null) => {
     updateApp({ diagSeconds: v });
     diagSecondsRef.current = v;
     if (powerOnRef.current && recRef.current) startDiag();
   }, [startDiag, updateApp]);
-  const setRecDir = useCallback((v: string) => {
-    updateApp({ diagDir: v });
-    diagDirRef.current = v;
-    if (powerOnRef.current && recRef.current) startDiag();
-  }, [startDiag, updateApp]);
-
   return {
     applyChange,
     setRunForProbe,
     togglePower,
     setRecording,
     setRecSeconds,
-    setRecDir,
   };
 }
 
@@ -1209,10 +1333,11 @@ function AppShell() {
     const lift = () => {
       if (!cancelled) setBooted(true);
     };
-    Promise.race([
-      document.fonts?.ready ?? Promise.resolve(),
-      new Promise((r) => setTimeout(r, 1200)),
-    ]).then(lift);
+    void settleBootGate(
+      document.fonts?.ready,
+      new Promise((resolve) => setTimeout(resolve, 1200)),
+      lift,
+    );
     return () => {
       cancelled = true;
     };
@@ -1237,6 +1362,9 @@ function AppShell() {
     doctor,
     nvafx,
     nvafxBusy,
+    nvafxPct,
+    nvafxStage,
+    nvafxRecv,
     dev,
     devRtxState,
     devMicState,
@@ -1253,8 +1381,13 @@ function AppShell() {
   const cliVersionRef = useRef<string | null>(null);
   const runControlsRef = useRef<Set<string> | null>(null);
   const powerOnRef = useRef(powerOn);
-  powerOnRef.current = powerOn;
+  const renderedPowerOnRef = useRef(powerOn);
+  if (renderedPowerOnRef.current !== powerOn) {
+    renderedPowerOnRef.current = powerOn;
+    powerOnRef.current = powerOn;
+  }
   const applyChangeRef = useRef<(next: Override) => void>(() => {});
+  const stopForEngineSetupRef = useRef<() => void>(() => {});
   const doctorRef = useRef(doctor);
   doctorRef.current = doctor;
   const { t } = useI18n();
@@ -1316,6 +1449,7 @@ function AppShell() {
     nvafx,
     powerOnRef,
     applyChangeRef,
+    stopForEngineSetupRef,
     noteError,
     gotoView,
     hasRunControl,
@@ -1329,7 +1463,6 @@ function AppShell() {
     togglePower,
     setRecording,
     setRecSeconds,
-    setRecDir,
   } = useRunLifecycle({
     busy,
     powerOn,
@@ -1337,7 +1470,6 @@ function AppShell() {
     bypassPending,
     rec,
     diagSeconds,
-    diagDir,
     selInput,
     selOutput,
     reference,
@@ -1350,6 +1482,7 @@ function AppShell() {
     runControlsRef,
     powerOnRef,
     applyChangeRef,
+    stopForEngineSetupRef,
     updateApp,
     noteError,
     gotoView,
@@ -1410,10 +1543,8 @@ function AppShell() {
     );
     window.addEventListener("focus", refreshDevicesSoon);
 
-    const uns: UnlistenFn[] = [];
-    (async () => {
-      uns.push(await onDevicesChanged(refreshDevicesSoon));
-    })();
+    const listeners = createAsyncListenerScope();
+    listeners.listen(onDevicesChanged, refreshDevicesSoon);
     return () => {
       window.clearTimeout(devChangeTimer);
       navigator.mediaDevices?.removeEventListener?.(
@@ -1421,9 +1552,25 @@ function AppShell() {
         refreshDevicesSoon,
       );
       window.removeEventListener("focus", refreshDevicesSoon);
-      uns.forEach((u) => u());
+      listeners.dispose();
     };
   }, [noteError, refreshDevices]);
+
+  // NVAFX 下载进度:CLI download-install 在 stderr 打的 JSONL,后端转成事件。
+  // label 是「common runtime」/「model」两段,归一成 stage 让 UI 分别标注。
+  // 默认固定资产使用内置大小显示百分比;自定义 tag 无大小时显示已接收字节。
+  useEffect(() => {
+    let alive = true;
+    const un = onNvafxProgress((p) => {
+      if (!alive) return;
+      const stage = /model/i.test(p.label) ? "model" : "runtime";
+      updateApp({ nvafxPct: p.pct, nvafxStage: stage, nvafxRecv: p.received });
+    });
+    return () => {
+      alive = false;
+      un.then((f) => f());
+    };
+  }, [updateApp]);
 
   // Esc 始终有意义:在次级页按 Esc 返回 Overview。
   useEffect(() => {
@@ -1442,6 +1589,19 @@ function AppShell() {
     };
     window.addEventListener("keydown", onTab);
     return () => window.removeEventListener("keydown", onTab);
+  }, []);
+
+  // 桌面 app:禁用 WebView 默认右键菜单(重新加载/检查元素等网页项)。
+  // 输入框/文本域放行,保留右键粘贴;dev 构建放行,保留调试菜单。
+  useEffect(() => {
+    const onContextMenu = (e: MouseEvent) => {
+      if (import.meta.env.DEV) return;
+      const el = e.target as HTMLElement | null;
+      if (el && /^(INPUT|TEXTAREA)$/.test(el.tagName)) return;
+      e.preventDefault();
+    };
+    window.addEventListener("contextmenu", onContextMenu);
+    return () => window.removeEventListener("contextmenu", onContextMenu);
   }, []);
 
   // 开发态快捷键:按 ~ 切换(在输入框里则正常输入,不触发)。
@@ -1478,9 +1638,9 @@ function AppShell() {
     return () => window.removeEventListener("keydown", onBacktick);
   }, [dev]);
 
-  function recheckNvafx(runtimeDir?: string) {
+  function recheckNvafx() {
     if (dev) return; // dev 模拟:状态由 dev 切换条控制
-    nvafxDoctor(runtimeDir)
+    nvafxDoctor()
       .then((nvafx) => updateApp({ nvafx }))
       .catch(() => {});
   }
@@ -1517,9 +1677,8 @@ function AppShell() {
       }, 900);
       return;
     }
-    const runtimeDir = (paramsRef.current.runtime_dir as string) || undefined;
     updateApp({ nvafxBusy: true, err: null });
-    nvafxInstall({ commonZip, modelZip, runtimeDir })
+    nvafxInstall({ commonZip, modelZip })
       .then((nvafx) => updateApp({ nvafx }))
       .catch((e) => noteError(String(e)))
       .finally(() => updateApp({ nvafxBusy: false }));
@@ -1528,18 +1687,70 @@ function AppShell() {
   // 从公共 GitHub release 下载并安装(按 GPU 架构自动选模型)。dev 下模拟。
   function downloadInstallNvafx() {
     if (dev) {
-      updateApp({ nvafxBusy: true });
-      window.setTimeout(() => {
-        updateApp({ devRtxState: "ready", nvafxBusy: false });
-      }, 1200);
+      // 模拟真实下载的两段(runtime → model),预览百分比与字节读数。
+      const RUNTIME_TOTAL = 955 * 1024 * 1024;
+      const MODEL_TOTAL = 46 * 1024 * 1024;
+      updateApp({
+        nvafxBusy: true,
+        nvafxStage: "runtime",
+        nvafxPct: 0,
+        nvafxRecv: 0,
+        err: null,
+      });
+      let phase = 0;
+      let pct = 0;
+      const timer = window.setInterval(() => {
+        pct += 6;
+        if (pct >= 100) {
+          phase += 1;
+          if (phase >= 2) {
+            window.clearInterval(timer);
+            updateApp({
+              devRtxState: "ready",
+              nvafxBusy: false,
+              nvafxPct: null,
+              nvafxStage: null,
+              nvafxRecv: null,
+            });
+            return;
+          }
+          pct = 0; // 下一个 asset 从头开始
+        }
+        if (phase === 0) {
+          const p = Math.min(pct, 99);
+          updateApp({
+            nvafxStage: "runtime",
+            nvafxPct: p,
+            nvafxRecv: Math.round((p / 100) * RUNTIME_TOTAL),
+          });
+        } else {
+          updateApp({
+            nvafxStage: "model",
+            nvafxPct: Math.min(pct, 99),
+            nvafxRecv: Math.round((Math.min(pct, 99) / 100) * MODEL_TOTAL),
+          });
+        }
+      }, 150);
       return;
     }
-    const runtimeDir = (paramsRef.current.runtime_dir as string) || undefined;
-    updateApp({ nvafxBusy: true, err: null });
-    nvafxDownloadInstall({ runtimeDir })
+    updateApp({
+      nvafxBusy: true,
+      nvafxPct: null,
+      nvafxStage: null,
+      nvafxRecv: null,
+      err: null,
+    });
+    nvafxDownloadInstall()
       .then((nvafx) => updateApp({ nvafx }))
       .catch((e) => noteError(String(e)))
-      .finally(() => updateApp({ nvafxBusy: false }));
+      .finally(() =>
+        updateApp({
+          nvafxBusy: false,
+          nvafxPct: null,
+          nvafxStage: null,
+          nvafxRecv: null,
+        }),
+      );
   }
 
   const platformView: Platform = dev && devPlatform ? devPlatform : platform;
@@ -1823,23 +2034,16 @@ function AppShell() {
                 const supported =
                   !proc || proc.platforms.includes(platform) || dev;
                 const rdy = engineReady(m.kind);
+                const active = kind === m.kind;
                 return (
                   <button
                     type="button"
                     key={m.kind}
-                    className={`b ${kind === m.kind ? "active" : ""} ${
+                    className={`b ${active ? "active" : ""} ${
                       supported && !rdy ? "unready" : ""
                     }`}
-                    disabled={!supported}
-                    onClick={() => {
-                      // 未就绪(LocalVQE 无模型 / NVAFX doctor 未过):跳 Engine 配置,不生成非法配置。
-                      if (!rdy) {
-                        updateEngine({ kind: m.kind });
-                        gotoView("engine");
-                      } else {
-                        changeKind(m.kind);
-                      }
-                    }}
+                    disabled={busy || !supported || active}
+                    onClick={() => changeKind(m.kind)}
                   >
                     {m.label}
                   </button>
@@ -1942,11 +2146,18 @@ function AppShell() {
 
         {/* ---- D 仪器区 ---- */}
         <section className="zone zd">
-          <RuntimeSignalPanel
-            telRef={telRef}
-            powerOn={powerOn}
-            statusKind={statusKind}
-          />
+          {/* 局部隔离墙:遥测面板是高频刷新、最易受后端异常数据影响的地方。
+              包一层边界 → 即便它渲染出错,也只降级本面板,主控制/引擎照常可用。 */}
+          <ErrorBoundary
+            label="signal-panel"
+            fallback={<div className="sig" style={{ opacity: 0.35 }} />}
+          >
+            <RuntimeSignalPanel
+              telRef={telRef}
+              powerOn={powerOn}
+              statusKind={statusKind}
+            />
+          </ErrorBoundary>
         </section>
         </div>
         )}
@@ -1955,11 +2166,9 @@ function AppShell() {
             processors={processors}
             platform={platformView}
             kind={kind}
-            params={params}
             doctor={nvafxView}
             dev={dev}
             onSelect={changeKind}
-            onParam={setParam}
             onPickModel={pickLocalvqeModel}
             localvqeModel={
               (kind === "localvqe"
@@ -1976,6 +2185,9 @@ function AppShell() {
           <RtxSetupPage
             doctor={nvafxView}
             busy={nvafxBusy}
+            pct={nvafxPct}
+            stage={nvafxStage}
+            recv={nvafxRecv}
             dev={dev}
             devState={devRtxState}
             onDevState={chooseDevRtxState}
@@ -2021,7 +2233,6 @@ function AppShell() {
             onRecheck={recheckAudio}
             onRec={setRecording}
             onSeconds={setRecSeconds}
-            onDir={setRecDir}
           />
         )}
         {view === "micsetup" && (
@@ -2092,15 +2303,16 @@ function AppShell() {
             invertWheel={isMac}
           />
           {err ? (
-            <button
-              type="button"
-              className="stamp err plainbtn"
-              title={`${err} · 点击关闭`}
-              onClick={() => noteError(null)}
-            >
-              {err.length > 44 ? err.slice(0, 44) + "…" : err}{" "}
-              <span className="mk">✕</span>
-            </button>
+            <Hint text={`${err} · 点击关闭`} pos="top" attach>
+              <button
+                type="button"
+                className="stamp err plainbtn"
+                onClick={() => noteError(null)}
+              >
+                {err.length > 44 ? err.slice(0, 44) + "…" : err}{" "}
+                <span className="mk">✕</span>
+              </button>
+            </Hint>
           ) : (
             <>
               <span className="fdot">·</span>
@@ -2114,9 +2326,8 @@ function AppShell() {
         <RuntimeFooterBars telRef={telRef} powerOn={powerOn} />
       </footer>
 
-      {/* v10 动态底噪(WebGL shader,见 TvNoise 注释);OFF 时随 sysoff 渐隐停走。
-          Windows 侧冻结为静帧(freeze):WebView2 上逐帧重绘拖累合成、观感抖动。 */}
-      <TvNoise active={uiOn} freeze={platformView === "windows"} />
+      {/* v10 动态底噪(WebGL shader,见 TvNoise 注释);OFF 时随 sysoff 渐隐停走 */}
+      <TvNoise active={uiOn} />
       {/* v6 VHS 亮带(transform 合成器动画);OFF 时随 sysoff 渐隐暂停 */}
       <div className="vhs" aria-hidden="true">
         <i className="band" />
@@ -2164,17 +2375,15 @@ void main() {
 const NOISE_VS = `attribute vec2 a;
 void main() { gl_Position = vec4(a, 0.0, 1.0); }`;
 
-function TvNoise({ active, freeze = false }: { active: boolean; freeze?: boolean }) {
+function TvNoise({ active }: { active: boolean }) {
   const ref = useRef<HTMLCanvasElement>(null);
+  const wrapRef = useRef<HTMLDivElement>(null);
   const activeRef = useRef(active);
   activeRef.current = active;
-  // freeze:静帧模式(Windows)—— 只画一帧,不进 rAF 循环。用 ref 传入,
-  // 避免因 platform 异步就绪重建 WebGL context(见下方 cleanup 注释)。
-  const freezeRef = useRef(freeze);
-  freezeRef.current = freeze;
   const scheduleRef = useRef<() => void>(() => {});
   useEffect(() => {
     const canvas = ref.current;
+    const wrap = wrapRef.current;
     if (!canvas) return;
     const gl = canvas.getContext("webgl", {
       alpha: false, // 输出全不透明(alpha 已折进颜色),跨引擎合成零歧义
@@ -2182,35 +2391,47 @@ function TvNoise({ active, freeze = false }: { active: boolean; freeze?: boolean
       depth: false,
       stencil: false,
       powerPreference: "low-power",
-      preserveDrawingBuffer: true, // 截图/快照可读回;全屏重画场景无性能代价
+      // 不设 preserveDrawingBuffer:不读回像素,省驱动保留后缓冲的开销,
+      // 也减轻 GPU 压力下 WebView2/WKWebView 主动丢弃 context 的概率。
     });
     if (!gl) return; // 无 WebGL:静默无噪点(氛围件,不值得再养 fallback)
 
-    const compile = (type: number, src: string) => {
-      const s = gl.createShader(type)!;
-      gl.shaderSource(s, src);
-      gl.compileShader(s);
-      return s;
+    let tLoc: WebGLUniformLocation | null = null;
+    let pxLoc: WebGLUniformLocation | null = null;
+    let ready = false;
+    let forceFit = false;
+
+    // GL 资源建立:首次挂载 + context 恢复后都走这里重建 program/buffer。
+    const initGL = (): boolean => {
+      const compile = (type: number, src: string) => {
+        const s = gl.createShader(type)!;
+        gl.shaderSource(s, src);
+        gl.compileShader(s);
+        return s;
+      };
+      const prog = gl.createProgram()!;
+      gl.attachShader(prog, compile(gl.VERTEX_SHADER, NOISE_VS));
+      gl.attachShader(prog, compile(gl.FRAGMENT_SHADER, NOISE_FS));
+      gl.linkProgram(prog);
+      if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) return false;
+      gl.useProgram(prog);
+      // 全屏三角形
+      const buf = gl.createBuffer();
+      gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+      gl.bufferData(
+        gl.ARRAY_BUFFER,
+        new Float32Array([-1, -1, 3, -1, -1, 3]),
+        gl.STATIC_DRAW,
+      );
+      const loc = gl.getAttribLocation(prog, "a");
+      gl.enableVertexAttribArray(loc);
+      gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
+      tLoc = gl.getUniformLocation(prog, "t");
+      pxLoc = gl.getUniformLocation(prog, "px");
+      forceFit = true; // 恢复后 viewport 需重设,即便画布尺寸未变
+      return true;
     };
-    const prog = gl.createProgram()!;
-    gl.attachShader(prog, compile(gl.VERTEX_SHADER, NOISE_VS));
-    gl.attachShader(prog, compile(gl.FRAGMENT_SHADER, NOISE_FS));
-    gl.linkProgram(prog);
-    if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) return;
-    gl.useProgram(prog);
-    // 全屏三角形
-    const buf = gl.createBuffer();
-    gl.bindBuffer(gl.ARRAY_BUFFER, buf);
-    gl.bufferData(
-      gl.ARRAY_BUFFER,
-      new Float32Array([-1, -1, 3, -1, -1, 3]),
-      gl.STATIC_DRAW,
-    );
-    const loc = gl.getAttribLocation(prog, "a");
-    gl.enableVertexAttribArray(loc);
-    gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
-    const tLoc = gl.getUniformLocation(prog, "t");
-    const pxLoc = gl.getUniformLocation(prog, "px");
+    ready = initGL();
 
     // 画布按设备物理像素渲染(retina 不糊),噪声晶格按 CSS 像素网格
     // (px = baseFrequency / dpr)—— 两者同 feTurbulence 的栅格化行为。
@@ -2218,18 +2439,19 @@ function TvNoise({ active, freeze = false }: { active: boolean; freeze?: boolean
       const dpr = window.devicePixelRatio || 1;
       const w = Math.max(1, Math.round(canvas.clientWidth * dpr));
       const h = Math.max(1, Math.round(canvas.clientHeight * dpr));
-      if (canvas.width !== w || canvas.height !== h) {
+      if (forceFit || canvas.width !== w || canvas.height !== h) {
         canvas.width = w;
         canvas.height = h;
         gl.viewport(0, 0, w, h);
+        forceFit = false;
       }
       // 1.35:较设计稿 baseFrequency 1.15 晶格更密 → 颗粒更细(用户定档)
       gl.uniform1f(pxLoc, 1.35 / dpr);
     };
-    const reduce = matchMedia("(prefers-reduced-motion: reduce)").matches;
     let raf = 0;
     let seed = 2;
     const draw = () => {
+      if (!ready) return;
       fit();
       gl.uniform1f(tLoc, seed);
       gl.drawArrays(gl.TRIANGLES, 0, 3);
@@ -2239,17 +2461,13 @@ function TvNoise({ active, freeze = false }: { active: boolean; freeze?: boolean
       // t 保持小数值域(hash 的 sin 精度),循环推进
       seed = (seed + 0.618) % 61.0;
       draw();
-      // OFF(穿透/停机)/ freeze(Windows 静帧)时停走:动效只属于活着的系统
-      if (!reduce && !freezeRef.current && !document.hidden && activeRef.current)
+      // OFF(穿透/停机)/ 后台隐藏时停走:动效只属于活着的系统。
+      // 注意:不再读 prefers-reduced-motion —— 氛围噪点恒动,不随系统减弱动效停帧。
+      if (!document.hidden && activeRef.current)
         raf = requestAnimationFrame(frame);
     };
     const schedule = () => {
-      // reduce / freeze:画一帧静态噪点即可,不启动逐帧循环
-      if (reduce || freezeRef.current) {
-        draw();
-        return;
-      }
-      if (!raf) raf = requestAnimationFrame(frame);
+      if (ready && !raf) raf = requestAnimationFrame(frame);
     };
     scheduleRef.current = schedule;
     const onVisibility = () => {
@@ -2258,28 +2476,47 @@ function TvNoise({ active, freeze = false }: { active: boolean; freeze?: boolean
         raf = 0;
       } else schedule();
     };
+    // WebView2/WKWebView 在 GPU 压力 / 驱动 TDR / 休眠唤醒时会主动丢弃 context。
+    // 不处理则画布内容变未定义(常为黑),经 multiply 把整窗 UI 乘成黑屏且不自愈。
+    const onLost = (e: Event) => {
+      e.preventDefault(); // 必须:否则浏览器永不派发 webglcontextrestored
+      ready = false;
+      if (raf) cancelAnimationFrame(raf);
+      raf = 0;
+      // 立即隐藏噪声层:宁可几秒没噪点,也不让黑画布 multiply 乘黑整窗 UI
+      if (wrap) wrap.classList.add("ctxlost");
+    };
+    const onRestored = () => {
+      ready = initGL();
+      if (wrap) wrap.classList.remove("ctxlost");
+      schedule();
+    };
+    canvas.addEventListener("webglcontextlost", onLost, false);
+    canvas.addEventListener("webglcontextrestored", onRestored, false);
     const ro = new ResizeObserver(() => {
       draw(); // resize 立即补一帧,避免拉伸残影
     });
     ro.observe(canvas);
     document.addEventListener("visibilitychange", onVisibility);
-    schedule(); // reduce / freeze 时 schedule() 内部只画一帧
+    schedule();
     return () => {
-      // 不 loseContext:StrictMode 双挂载下同一 canvas 的 context 丢失后
-      // 无法复活(getContext 返回同一个已死实例),会让噪声永久空白。
-      // 组件与 App 同生命周期,context 随窗口销毁即可。
+      // 不主动 loseContext:StrictMode 双挂载下我们若主动丢弃,同一 canvas 的
+      // context 无法复活(getContext 返回已死实例)。浏览器主动丢失走上面的
+      // lost/restored 监听恢复;组件与 App 同生命周期,context 随窗口销毁即可。
       if (raf) cancelAnimationFrame(raf);
       ro.disconnect();
       document.removeEventListener("visibilitychange", onVisibility);
+      canvas.removeEventListener("webglcontextlost", onLost, false);
+      canvas.removeEventListener("webglcontextrestored", onRestored, false);
       scheduleRef.current = () => {};
     };
   }, []);
   useEffect(() => {
-    // 重新上电 → 恢复走噪;freeze 变化 → 重画一帧或恢复循环(schedule 内部判定)
+    // 重新上电 → 恢复走噪
     if (active) scheduleRef.current();
-  }, [active, freeze]);
+  }, [active]);
   return (
-    <div className="tvnoise" aria-hidden="true">
+    <div className="tvnoise" aria-hidden="true" ref={wrapRef}>
       <canvas ref={ref} />
     </div>
   );

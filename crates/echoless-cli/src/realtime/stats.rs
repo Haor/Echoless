@@ -95,6 +95,15 @@ pub(super) fn estimate_user_latency_ms(
 }
 
 const STATUS_WAVE_BUCKETS: usize = 64;
+const CLOCK_SKEW_WINDOW_SECS: u64 = 5;
+const CLOCK_SKEW_ENTER_RATIO: f64 = 0.02;
+const CLOCK_SKEW_EXIT_RATIO: f64 = 0.01;
+const CLOCK_SKEW_REF_TOLERANCE_RATIO: f64 = 0.5;
+// 窗口级 EMA:新满窗占 50%。配合 ENTER_WINDOWS 滤掉单窗瞬时尖峰
+// (切窗/调度抖动把一次 underrun 突发挤进一个窗口,raw 比率可冲到 8%+)。
+const CLOCK_SKEW_EMA_ALPHA: f64 = 0.5;
+// 连续满窗超阈值(且参考侧佐证)才进入告警:单窗尖峰不告警。
+const CLOCK_SKEW_ENTER_WINDOWS: u32 = 2;
 
 struct WaveBuckets {
     peaks: Vec<f32>,
@@ -149,6 +158,221 @@ impl WaveBuckets {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum ClockSkewDirection {
+    OutputFaster,
+    CaptureFaster,
+}
+
+impl ClockSkewDirection {
+    pub(super) fn as_str(self) -> &'static str {
+        match self {
+            Self::OutputFaster => "output_faster_than_capture",
+            Self::CaptureFaster => "capture_faster_than_output",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) struct ClockSkewSnapshot {
+    pub(super) output_skew_pct: f64,
+    pub(super) ref_skew_pct: f64,
+    pub(super) ref_correlated: bool,
+    pub(super) direction: Option<ClockSkewDirection>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ClockSkewEventKind {
+    Warning,
+    Resolved,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ClockSkewEvent {
+    kind: ClockSkewEventKind,
+    snapshot: ClockSkewSnapshot,
+}
+
+#[derive(Clone, Debug)]
+struct ClockSkewDetector {
+    min_window_frames: u64,
+    window_frames: u64,
+    window_output_underruns: u64,
+    window_output_overruns: u64,
+    window_ref_overruns: u64,
+    window_ref_underruns: u64,
+    snapshot: ClockSkewSnapshot,
+    warning: bool,
+    // 平滑 + 消抖(2026-07-09,黑屏 RCA 遗留项):raw 单窗比率对调度抖动极敏感
+    // (mac cmd+tab 切窗瞬间可从 0% 冲到 8%+ 再回落),导致 warning/resolved
+    // 高频翻转刷事件、面板读数乱跳。两道闸:
+    //   1. EMA 平滑比率(snapshot 对外报的也是平滑值,面板不再跳变);
+    //   2. 连续 CLOCK_SKEW_ENTER_WINDOWS 个满窗超阈值才进入告警。
+    // 解除侧保持单窗即出(EXIT 阈值本身已是滞回下沿,快恢复体验更好)。
+    ema_output_ratio: Option<f64>,
+    ema_ref_ratio: Option<f64>,
+    enter_streak: u32,
+}
+
+impl ClockSkewDetector {
+    fn new(sample_rate: u32) -> Self {
+        Self {
+            min_window_frames: u64::from(sample_rate).saturating_mul(CLOCK_SKEW_WINDOW_SECS),
+            window_frames: 0,
+            window_output_underruns: 0,
+            window_output_overruns: 0,
+            window_ref_overruns: 0,
+            window_ref_underruns: 0,
+            snapshot: ClockSkewSnapshot::default(),
+            warning: false,
+            ema_output_ratio: None,
+            ema_ref_ratio: None,
+            enter_streak: 0,
+        }
+    }
+
+    fn observe(
+        &mut self,
+        frames: u64,
+        output_underruns: u64,
+        output_overruns: u64,
+        ref_overruns: u64,
+        ref_underruns: u64,
+    ) -> Option<ClockSkewEvent> {
+        self.window_frames = self.window_frames.saturating_add(frames);
+        self.window_output_underruns = self
+            .window_output_underruns
+            .saturating_add(output_underruns);
+        self.window_output_overruns = self.window_output_overruns.saturating_add(output_overruns);
+        self.window_ref_overruns = self.window_ref_overruns.saturating_add(ref_overruns);
+        self.window_ref_underruns = self.window_ref_underruns.saturating_add(ref_underruns);
+
+        if self.min_window_frames == 0 || self.window_frames < self.min_window_frames {
+            // 满窗前 snapshot 用 raw 累计值(EMA 尚无本窗贡献);对外读数在
+            // 首个满窗后即切换为平滑值。
+            self.snapshot = ClockSkewSnapshot::from_frame_counts(
+                self.window_frames,
+                self.window_output_underruns,
+                self.window_output_overruns,
+                self.window_ref_overruns,
+                self.window_ref_underruns,
+            );
+            return None;
+        }
+
+        let raw = ClockSkewSnapshot::from_frame_counts(
+            self.window_frames,
+            self.window_output_underruns,
+            self.window_output_overruns,
+            self.window_ref_overruns,
+            self.window_ref_underruns,
+        );
+        let raw_output = raw.output_skew_pct / 100.0;
+        let raw_ref = raw.ref_skew_pct / 100.0;
+        // 窗口级 EMA:首窗直取,此后按 α 混入 —— 对外读数(snapshot)与解除判定
+        // 走平滑值,面板不跳、告警态不抖;进入判定走 raw(见下),否则尖峰的
+        // EMA 余温会让 streak 在错配已消失的窗口里继续累积、造成误告警。
+        let ema = |prev: Option<f64>, raw: f64| match prev {
+            Some(p) => p + CLOCK_SKEW_EMA_ALPHA * (raw - p),
+            None => raw,
+        };
+        let output_ratio = ema(self.ema_output_ratio, raw_output);
+        let ref_ratio = ema(self.ema_ref_ratio, raw_ref);
+        self.ema_output_ratio = Some(output_ratio);
+        self.ema_ref_ratio = Some(ref_ratio);
+        self.snapshot = ClockSkewSnapshot::from_ratios(output_ratio, ref_ratio);
+
+        // 进入侧按 raw 单窗判定:本窗真实超阈值且参考侧佐证,streak 才累积;
+        // 任一平静窗立即断裂 → 孤立尖峰(切窗/调度抖动)永远凑不齐连续窗。
+        let raw_win = ClockSkewSnapshot::from_ratios(raw_output, raw_ref);
+        let over = raw_output.abs() > CLOCK_SKEW_ENTER_RATIO && raw_win.ref_correlated;
+        self.enter_streak = if over {
+            self.enter_streak.saturating_add(1)
+        } else {
+            0
+        };
+
+        let event = if !self.warning && self.enter_streak >= CLOCK_SKEW_ENTER_WINDOWS {
+            self.warning = true;
+            Some(ClockSkewEvent {
+                kind: ClockSkewEventKind::Warning,
+                snapshot: self.snapshot,
+            })
+        } else if self.warning
+            && (output_ratio.abs() < CLOCK_SKEW_EXIT_RATIO || !self.snapshot.ref_correlated)
+        {
+            self.warning = false;
+            Some(ClockSkewEvent {
+                kind: ClockSkewEventKind::Resolved,
+                snapshot: self.snapshot,
+            })
+        } else {
+            None
+        };
+
+        self.window_frames = 0;
+        self.window_output_underruns = 0;
+        self.window_output_overruns = 0;
+        self.window_ref_overruns = 0;
+        self.window_ref_underruns = 0;
+        event
+    }
+}
+
+impl ClockSkewSnapshot {
+    pub(super) fn from_frame_counts(
+        frames: u64,
+        output_underruns: u64,
+        output_overruns: u64,
+        ref_overruns: u64,
+        ref_underruns: u64,
+    ) -> Self {
+        Self::from_ratios(
+            signed_ratio(output_underruns, output_overruns, frames),
+            signed_ratio(ref_overruns, ref_underruns, frames),
+        )
+    }
+
+    fn from_ratios(output_ratio: f64, ref_ratio: f64) -> Self {
+        let tolerance = output_ratio.abs() * CLOCK_SKEW_REF_TOLERANCE_RATIO;
+        Self {
+            output_skew_pct: output_ratio * 100.0,
+            ref_skew_pct: ref_ratio * 100.0,
+            ref_correlated: output_ratio != 0.0
+                && output_ratio.signum() == ref_ratio.signum()
+                && (output_ratio - ref_ratio).abs() <= tolerance,
+            direction: if output_ratio > 0.0 {
+                Some(ClockSkewDirection::OutputFaster)
+            } else if output_ratio < 0.0 {
+                Some(ClockSkewDirection::CaptureFaster)
+            } else {
+                None
+            },
+        }
+    }
+}
+
+fn signed_ratio(positive: u64, negative: u64, denominator: u64) -> f64 {
+    if denominator == 0 {
+        0.0
+    } else {
+        (positive as f64 - negative as f64) / denominator as f64
+    }
+}
+
+/// 参考侧「跟不上生产/消费节奏」的合并信号,供时钟错配检测用作与 output_underruns 同源的佐证。
+///
+/// - pre-T3(output_rate_match=off):ref 侧 `skip_stale` 硬丢帧 → 信号在 `ref_stale_drops`,
+///   参考 ring 被 skip_stale 约束住基本不溢出,`ref_input_drops≈0`。
+/// - T3(output_rate_match=on):ref 侧改连续重采样,`ref_stale_drops` 恒 0;大错配(超 ±3%
+///   权限)时参考 ring 溢出 → 信号迁移到 `ref_input_drops`。
+///
+/// 两者相加使 [`ClockSkewDetector`] 在 T3 开关两种模式下都能拿到参考侧佐证(各模式恰有一路≈0),
+/// 从而保住 T1 的告警能力(否则 T3 会让 `ref_stale_drops` 恒 0、`ref_correlated` 永假、告警失效)。
+pub(super) fn ref_pace_loss(ref_stale_drops: u64, ref_input_drops: u64) -> u64 {
+    ref_stale_drops.saturating_add(ref_input_drops)
+}
+
 pub(super) struct RealtimeStats {
     interval: Duration,
     started: Instant,
@@ -185,6 +409,8 @@ pub(super) struct RealtimeStats {
     ref_underruns: u64,
     output_overruns: u64,
     output_underruns: u64,
+    clock_frames: u64,
+    clock_skew: ClockSkewDetector,
     node_process_time_ms: f32,
     node_runtime_errors: u64,
     aec_estimated_delay_ms: i32,
@@ -246,6 +472,8 @@ impl RealtimeStats {
             ref_underruns: 0,
             output_overruns: 0,
             output_underruns: 0,
+            clock_frames: 0,
+            clock_skew: ClockSkewDetector::new(config.sample_rate),
             node_process_time_ms: 0.0,
             node_runtime_errors: 0,
             aec_estimated_delay_ms: 0,
@@ -300,6 +528,7 @@ impl RealtimeStats {
         self.ref_underruns += sample.ref_underruns;
         self.output_overruns += sample.output_overruns;
         self.output_underruns += sample.output_underruns;
+        self.clock_frames = self.clock_frames.saturating_add(sample.frame_size as u64);
         self.node_process_time_ms = self
             .node_process_time_ms
             .max(aggregate_process_time_ms(sample.node_stats));
@@ -316,12 +545,27 @@ impl RealtimeStats {
         if now.duration_since(self.last_print) < self.interval {
             return;
         }
+        // 参考侧「跟不上」信号:pre-T3 = skip_stale 硬丢帧(ref_stale_drops);
+        // T3 开启后 ref 侧改连续重采样,ref_stale_drops 恒 0,大错配时体现为参考 ring 溢出
+        // (ref_input_drops)。两者相加 → 无论 T3 开关,都能提供与 output_underruns 同源的
+        // 时钟错配佐证(pre-T3 时 ref_input_drops≈0,T3 时 ref_stale_drops≈0,各取其一)。
+        let ref_pace_loss = ref_pace_loss(self.ref_stale_drops, self.ref_input_drops);
+        let clock_skew_event = self.clock_skew.observe(
+            self.clock_frames,
+            self.output_underruns,
+            self.output_overruns,
+            ref_pace_loss,
+            self.ref_underruns,
+        );
         // 审计 B-02:本方法在音频处理线程上执行,写出必须走异步发射器,
         // 不许同步碰 stdout(管道满会阻塞处理循环 → 爆音)。
         if self.status_json {
             emit_stdout_line(self.status_json_line(now));
         } else {
             emit_stdout_line(self.text_line(now));
+        }
+        if let Some(event) = clock_skew_event {
+            emit_stdout_line(self.clock_skew_event_line(event));
         }
         self.last_print = now;
         self.near_samples = 0;
@@ -340,6 +584,7 @@ impl RealtimeStats {
         self.ref_underruns = 0;
         self.output_overruns = 0;
         self.output_underruns = 0;
+        self.clock_frames = 0;
         self.node_process_time_ms = 0.0;
         self.node_diverged = false;
         self.node_last_error = None;
@@ -377,6 +622,48 @@ impl RealtimeStats {
             self.node_runtime_errors,
             self.node_diverged,
         )
+    }
+
+    fn clock_skew_event_line(&self, event: ClockSkewEvent) -> String {
+        if self.status_json {
+            let event_type = match event.kind {
+                ClockSkewEventKind::Warning => "clock_skew_warning",
+                ClockSkewEventKind::Resolved => "clock_skew_resolved",
+            };
+            serde_json::to_string(&json!({
+                "type": event_type,
+                "output_skew_pct": event.snapshot.output_skew_pct,
+                "ref_skew_pct": event.snapshot.ref_skew_pct,
+                "ref_correlated": event.snapshot.ref_correlated,
+                "direction": event.snapshot.direction.map(ClockSkewDirection::as_str),
+                "hint": clock_skew_hint(event.snapshot),
+            }))
+            .unwrap_or_else(|err| {
+                json!({ "type": "error", "message": err.to_string() }).to_string()
+            })
+        } else {
+            match event.kind {
+                ClockSkewEventKind::Warning => {
+                    format!(
+                    "clock_skew_warning direction={} output_skew_pct={:.1} ref_skew_pct={:.1}: {}",
+                    event.snapshot.direction.map(ClockSkewDirection::as_str).unwrap_or("unknown"),
+                    event.snapshot.output_skew_pct,
+                    event.snapshot.ref_skew_pct,
+                    clock_skew_hint(event.snapshot)
+                )
+                }
+                ClockSkewEventKind::Resolved => format!(
+                    "clock_skew_resolved direction={} output_skew_pct={:.1} ref_skew_pct={:.1}",
+                    event
+                        .snapshot
+                        .direction
+                        .map(ClockSkewDirection::as_str)
+                        .unwrap_or("unknown"),
+                    event.snapshot.output_skew_pct,
+                    event.snapshot.ref_skew_pct
+                ),
+            }
+        }
     }
 
     fn status_json_line(&self, now: Instant) -> String {
@@ -444,6 +731,11 @@ impl RealtimeStats {
             "ref_underruns": self.ref_underruns,
             "output_underruns": self.output_underruns,
             "output_overruns": self.output_overruns,
+            "output_skew_pct": self.clock_skew.snapshot.output_skew_pct,
+            "ref_skew_pct": self.clock_skew.snapshot.ref_skew_pct,
+            "clock_skew_warning": self.clock_skew.warning,
+            "clock_skew_ref_correlated": self.clock_skew.snapshot.ref_correlated,
+            "clock_skew_direction": self.clock_skew.snapshot.direction.map(ClockSkewDirection::as_str),
             "node_process_time_ms": self.node_process_time_ms,
             "runtime_errors": self.node_runtime_errors,
             "diverged": self.node_diverged,
@@ -454,6 +746,20 @@ impl RealtimeStats {
             "diagnostics_elapsed_s": diagnostics_elapsed_s,
             "diagnostics_drops": diagnostics_drops,
         })
+    }
+}
+
+fn clock_skew_hint(snapshot: ClockSkewSnapshot) -> String {
+    match snapshot.direction {
+        Some(ClockSkewDirection::OutputFaster) => format!(
+            "the output device clock is {:.1}% faster than the microphone; a virtual audio device's sample rate is likely mismatched — set all virtual endpoints and hardware outputs to 48000 Hz",
+            snapshot.output_skew_pct.abs()
+        ),
+        Some(ClockSkewDirection::CaptureFaster) => format!(
+            "the microphone clock is {:.1}% faster than the output/reference path; a virtual audio device's sample rate is likely mismatched — set all virtual endpoints and hardware outputs to 48000 Hz",
+            snapshot.output_skew_pct.abs()
+        ),
+        None => "audio clock skew is no longer measurable".to_string(),
     }
 }
 
@@ -513,6 +819,13 @@ mod tests {
         stats.ref_input_drops = 2;
         stats.mic_stale_drops = 3;
         stats.ref_stale_drops = 5;
+        stats.clock_skew.snapshot = ClockSkewSnapshot {
+            output_skew_pct: 22.4,
+            ref_skew_pct: 22.1,
+            ref_correlated: true,
+            direction: Some(ClockSkewDirection::OutputFaster),
+        };
+        stats.clock_skew.warning = true;
         stats.aec_estimated_delay_ms = 48;
         stats.aec3_delay_blocks = Some(12);
 
@@ -533,6 +846,11 @@ mod tests {
         assert_eq!(value["estimated_user_latency_ms"], 106.0);
         assert_eq!(value["aec_estimated_delay_ms"], 48);
         assert_eq!(value["aec3_delay_blocks"], 12);
+        assert_eq!(value["output_skew_pct"], 22.4);
+        assert_eq!(value["ref_skew_pct"], 22.1);
+        assert_eq!(value["clock_skew_warning"], true);
+        assert_eq!(value["clock_skew_ref_correlated"], true);
+        assert_eq!(value["clock_skew_direction"], "output_faster_than_capture");
         assert_eq!(value["diagnostics_session_dir"], "diagnostics/session-1");
         assert_eq!(value["recording"], false);
         assert_eq!(value["diagnostics_frames"], 0);
@@ -562,5 +880,133 @@ mod tests {
         stats.set_bypassed(false);
         let value = stats.status_value(stats.started + Duration::from_secs(4));
         assert_eq!(value["bypassed"], false);
+    }
+
+    #[test]
+    fn clock_skew_detector_warns_after_correlated_five_second_window() {
+        let mut detector = ClockSkewDetector::new(48_000);
+
+        // 第 1 个满窗(5 次 observe):超阈值但 streak=1 < ENTER_WINDOWS,不告警
+        // (单窗尖峰豁免 —— 切窗/调度抖动的瞬时 underrun 突发不算时钟错配)。
+        for _ in 0..5 {
+            assert!(detector.observe(48_000, 10_752, 0, 10_752, 0).is_none());
+        }
+        // 第 2 个连续满窗:streak=2 → 告警。恒定错配下 EMA 收敛于 raw,读数不失真。
+        for _ in 0..4 {
+            assert!(detector.observe(48_000, 10_752, 0, 10_752, 0).is_none());
+        }
+        let event = detector.observe(48_000, 10_752, 0, 10_752, 0).unwrap();
+
+        assert_eq!(event.kind, ClockSkewEventKind::Warning);
+        assert!(detector.warning);
+        assert!((event.snapshot.output_skew_pct - 22.4).abs() < 0.001);
+        assert!((event.snapshot.ref_skew_pct - 22.4).abs() < 0.001);
+        assert!(event.snapshot.ref_correlated);
+        assert_eq!(
+            event.snapshot.direction,
+            Some(ClockSkewDirection::OutputFaster)
+        );
+    }
+
+    #[test]
+    fn clock_skew_detector_warns_when_capture_is_faster() {
+        let mut detector = ClockSkewDetector::new(48_000);
+
+        for _ in 0..9 {
+            assert!(detector.observe(48_000, 0, 10_752, 0, 10_752).is_none());
+        }
+        let event = detector.observe(48_000, 0, 10_752, 0, 10_752).unwrap();
+
+        assert_eq!(event.kind, ClockSkewEventKind::Warning);
+        assert!((event.snapshot.output_skew_pct + 22.4).abs() < 0.001);
+        assert!((event.snapshot.ref_skew_pct + 22.4).abs() < 0.001);
+        assert!(event.snapshot.ref_correlated);
+        assert_eq!(
+            event.snapshot.direction,
+            Some(ClockSkewDirection::CaptureFaster)
+        );
+    }
+
+    #[test]
+    fn clock_skew_detector_uses_hysteresis_for_resolution() {
+        let mut detector = ClockSkewDetector::new(48_000);
+        for _ in 0..10 {
+            let _ = detector.observe(48_000, 10_752, 0, 10_752, 0);
+        }
+        assert!(detector.warning);
+
+        // 错配消失(计数归零):EMA 每满窗衰减一半,22.4% → …… → 跌破 EXIT(1%)
+        // 才解除。平滑让恢复比 raw 慢几个窗口 —— 换来的是告警态不抖。
+        let mut resolved = None;
+        for _ in 0..40 {
+            if let Some(event) = detector.observe(48_000, 0, 0, 0, 0) {
+                resolved = Some(event);
+                break;
+            }
+        }
+        let event = resolved.expect("Resolved should fire after EMA decay");
+        assert_eq!(event.kind, ClockSkewEventKind::Resolved);
+        assert!(!detector.warning);
+        assert!(event.snapshot.output_skew_pct.abs() < 1.0);
+    }
+
+    #[test]
+    fn clock_skew_detector_ignores_transient_single_window_spike() {
+        // 回归(2026-07-09 黑屏 RCA 遗留项):单个满窗的瞬时尖峰(如 cmd+tab 切窗
+        // 挤出的 underrun 突发)不得触发告警 —— 尖峰过后回零,streak 断裂。
+        let mut detector = ClockSkewDetector::new(48_000);
+        for _ in 0..5 {
+            assert!(detector.observe(48_000, 10_752, 0, 10_752, 0).is_none());
+        }
+        // 下一个满窗回零:streak 归零,始终无告警。
+        for _ in 0..5 {
+            assert!(detector.observe(48_000, 0, 0, 0, 0).is_none());
+        }
+        assert!(!detector.warning);
+    }
+
+    #[test]
+    fn clock_skew_detector_ignores_uncorrelated_ref_counts() {
+        let mut detector = ClockSkewDetector::new(48_000);
+
+        for _ in 0..4 {
+            assert!(detector.observe(48_000, 10_752, 0, 0, 0).is_none());
+        }
+
+        assert!(detector.observe(48_000, 10_752, 0, 0, 0).is_none());
+        assert!(!detector.warning);
+    }
+
+    #[test]
+    fn ref_pace_loss_bridges_t3_signal_migration() {
+        // pre-T3:信号在 stale_drops,input_drops≈0。
+        assert_eq!(ref_pace_loss(10_752, 0), 10_752);
+        // T3:ref 连续重采样,stale_drops=0,信号迁移到 input_drops(参考 ring 溢出)。
+        assert_eq!(ref_pace_loss(0, 10_752), 10_752);
+        // 两路都有时相加(过渡态),saturating 不溢出。
+        assert_eq!(ref_pace_loss(u64::MAX, 1), u64::MAX);
+
+        let pre_t3 =
+            ClockSkewSnapshot::from_frame_counts(48_000, 10_752, 0, ref_pace_loss(10_752, 0), 0);
+        let t3 =
+            ClockSkewSnapshot::from_frame_counts(48_000, 10_752, 0, ref_pace_loss(0, 10_752), 0);
+        assert_eq!(pre_t3.output_skew_pct, t3.output_skew_pct);
+        assert_eq!(pre_t3.ref_skew_pct, t3.ref_skew_pct);
+        assert_eq!(pre_t3.ref_correlated, t3.ref_correlated);
+    }
+
+    #[test]
+    fn clock_skew_still_warns_when_ref_signal_is_input_drops() {
+        // T3 场景:ref_stale_drops 恒 0,参考侧佐证经 ref_input_drops 传入。检测器仍应告警
+        // (回归护栏:T3 不得让 T1 的时钟错配告警失效)。
+        let mut detector = ClockSkewDetector::new(48_000);
+        // T3: stale=0, input=10_752;两个连续满窗(enter_streak 消抖)后告警。
+        let ref_signal = ref_pace_loss(0, 10_752);
+        for _ in 0..9 {
+            assert!(detector.observe(48_000, 10_752, 0, ref_signal, 0).is_none());
+        }
+        let event = detector.observe(48_000, 10_752, 0, ref_signal, 0).unwrap();
+        assert_eq!(event.kind, ClockSkewEventKind::Warning);
+        assert!(event.snapshot.ref_correlated);
     }
 }

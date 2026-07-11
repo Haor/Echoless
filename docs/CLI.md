@@ -44,7 +44,10 @@ Key flags (all override the config file): `--mic`, `--reference`,
 `--near-delay-ms`, `--output-level 0..100` (50 = unity),
 `--processor aec3|localvqe|nvidia_afx_aec|…`, `--ns/--no-ns`, `--ns-level`,
 `--tail-ms`, `--verbose`, `--status-json`,
-`--diagnostic-dir <DIR> [--diagnostic-seconds N]`.
+`--diagnostics` (records until stopped), and `--diagnostic-seconds N` (records
+for a bounded duration). Diagnostics always use the managed Echoless directory.
+The config equivalents are `diagnostics.enabled = true` and the optional
+`diagnostics.max_seconds = N`.
 
 With `--status-json`, stdout is JSONL: first a `started` event (negotiated
 devices, `supported_controls`, resampling info), then periodic status frames
@@ -58,13 +61,13 @@ While `run` is active, write one JSON object per line to stdin:
 | Command | Payload | Effect |
 |---|---|---|
 | `set_output_level` | `{"cmd":"set_output_level","level":50}` | live output gain (0 mute · 50 unity · 100 ≈ 3×) |
-| `set_near_delay_ms` | `{"cmd":"set_near_delay_ms","ms":25}` | live near/far alignment |
-| `set_bypass` | `{"cmd":"set_bypass","bypass":true}` | skip the engine, keep it warm (15 ms crossfade) |
-| `set_initial_delay_ms` | `{"cmd":"set_initial_delay_ms","ms":8}` | AEC3 initial delay hint |
+| `set_near_delay_ms` | `{"cmd":"set_near_delay_ms","near_delay_ms":25}` | live near/far alignment |
+| `set_bypass` | `{"cmd":"set_bypass","enabled":true}` | skip the engine, keep it warm (15 ms crossfade) |
+| `set_initial_delay_ms` | `{"cmd":"set_initial_delay_ms","initial_delay_ms":8}` | AEC3 initial delay hint |
 | `set_aec3_ns` | `{"cmd":"set_aec3_ns","ns":true,"ns_level":"high"}` | AEC3 noise suppression |
 | `set_aec3_agc` | `{"cmd":"set_aec3_agc","agc":false}` | AEC3 AGC |
-| `set_localvqe_noise_gate` | `{"cmd":"set_localvqe_noise_gate","enabled":true,"threshold_dbfs":-45}` | LocalVQE output gate |
-| `start_diagnostics` | `{"cmd":"start_diagnostics","dir":"...","max_seconds":30}` | record mic/ref/out WAVs |
+| `set_localvqe_noise_gate` | `{"cmd":"set_localvqe_noise_gate","noise_gate":true,"noise_gate_threshold_dbfs":-45}` | LocalVQE output gate |
+| `start_diagnostics` | `{"cmd":"start_diagnostics","max_seconds":30}` | record mic/ref/out WAVs in the managed diagnostics directory |
 | `stop_diagnostics` | `{"cmd":"stop_diagnostics"}` | finalize the recording session |
 
 The `started` event's `supported_controls` array is authoritative for what a
@@ -87,7 +90,8 @@ calibration rig. Portable scripts should pass `--mic`, `--reference`, and
 
 Stops nothing by itself — don't run it while another `run` holds the devices.
 Flags: `--beeps N` (12), `--startup-delay S` (4), `--volume 0..1` (0.35),
-`--out-dir/--keep-session/--keep-beep`, `--analyze-only <session>`.
+`--keep-session` (retain this run's fixed-directory session), `--keep-beep`,
+`--analyze-only <session>`.
 
 JSON result includes `recommended_near_delay_ms` (measured lag + 8 ms
 safety), per-beep lags, stddev/drift and warnings. In `--json` mode progress
@@ -142,4 +146,4 @@ parameters.
 | `ECHOLESS_LOCALVQE_LIBRARY` | path to `liblocalvqe` (otherwise: app bundle resources, then the brand data dir) |
 
 Model/data directory: `~/Library/Application Support/Echoless` (macOS),
-`%LOCALAPPDATA%\Echoless` (Windows), `~/.local/share/echoless` (Linux).
+`%LOCALAPPDATA%\Echoless` (Windows), `~/.local/share/Echoless` (Linux).

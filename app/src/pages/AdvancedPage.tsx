@@ -39,12 +39,10 @@ const SELECT_LABELS: Record<string, string> = {
 
 // C3/C5 减参:专家级/与引擎页重复的字段不在高级页暴露 ——
 //   LocalVQE:model(引擎页模型清单管理)、library/backend/device(auto 即可);
-//   NVAFX:runtime_dir(引擎页 RUNTIME 行已有完整 UI)、model_path/
-//          use_default_gpu/disable_cuda_graph(专家字段,走配置文件)。
+//   NVAFX:model_path/use_default_gpu/disable_cuda_graph(专家字段,走配置文件)。
 const HIDDEN_PARAMS: Record<string, Set<string>> = {
   localvqe: new Set(["model", "library", "backend", "device"]),
   nvidia_afx_aec: new Set([
-    "runtime_dir",
     "model_path",
     "use_default_gpu",
     "disable_cuda_graph",
@@ -65,68 +63,67 @@ const PROBE_INIT_DELAY_MS = 8;
 // 参数说明(悬浮 label 时提示)。缺省键无提示。
 const DESC: Record<string, { en: string; zh: string }> = {
   sample_rate: {
-    en: "Pipeline sample rate (must divide by 100). Restarts runtime.",
-    zh: "管线采样率(须能被 100 整除)。改动会重启运行时。",
+    en: "Audio processing sample rate. 48000 = full band, 16000 = narrowband/lighter. Restarts the engine.",
+    zh: "音频处理采样率。48000 全带宽,16000 窄带更省资源。改动会重启引擎。",
   },
-  frame_ms: { en: "Realtime frame size. Restarts runtime.", zh: "实时帧长。改动会重启运行时。" },
+  frame_ms: {
+    en: "Audio block size per processing step; sets the processing latency. Restarts the engine.",
+    zh: "单次处理的音频块时长,决定处理延迟。改动会重启引擎。",
+  },
   reference_channels: {
-    en: "Far-end reference channel mode (mono is the stable baseline).",
-    zh: "远端参考声道模式(mono 为稳定基线)。",
+    en: "Whether the system-audio reference enters the AEC as mono or stereo. Mono is the stable baseline.",
+    zh: "系统声音(参考)送入 AEC 时按 mono 还是 stereo。Mono 为稳定基线。",
   },
   ns_level: {
-    en: "Only effective when NS is on; NS is off by default.",
-    zh: "仅在降噪开启时有效;降噪默认关闭。",
+    en: "Noise-suppression strength. Higher suppresses more background noise.",
+    zh: "降噪强度。越高压掉的背景噪声越多。",
   },
   agc: {
-    en: "Off by default; avoids volume pumping (loud/quiet swings).",
-    zh: "默认关闭,避免音量泵动(忽大忽小)。",
+    en: "Automatic Gain Control — auto-levels mic volume. Off by default (it can cause volume pumping).",
+    zh: "自动增益控制(AGC):自动调平麦克风音量。默认关(会致音量泵动)。",
   },
   near_delay_ms: {
-    en: "Top-level near/mic alignment delay. Empty = backend default (macOS 25, others 0). Applies live while running.",
-    zh: "顶层近端对齐延迟。留空走后端默认(macOS 25 / 其它 0)。运行中可实时生效。",
+    en: "Delays the mic to align echoes that arrive before the reference; the value is the negative-direction search depth. macOS default 25ms (probe may override), Windows default 0. Applies live.",
+    zh: "延后麦克风,对齐「比系统声音先到」的回声;数值即负方向搜索深度。macOS 默认 25ms(侦测可覆盖),Windows 默认 0。运行中生效。",
   },
   initial_delay_ms: {
-    en: "Initial stream delay hint; runtime still estimates dynamically. On macOS the probe writes it: 8ms when a near delay is applied, else the measured echo delay.",
-    zh: "初始延迟提示;运行时仍会动态估计。macOS 上侦测会写入:设了近端延迟时写 8ms,否则写实测 echo 延迟。",
+    en: "Initial echo-delay value for AEC cold-start alignment; the engine self-estimates after. The probe fills the measured value.",
+    zh: "AEC 启动时的回声延迟初值,仅用于冷启动对齐,之后引擎自估。侦测会填入实测值。",
   },
   tail_ms: {
-    en: "Echo tail length. Auto ≈ AEC3 default (~52ms).",
-    zh: "回声拖尾长度。自动时走 AEC3 默认(约 52ms)。",
+    en: "Echo length the canceller models (tail). Default ~52ms.",
+    zh: "AEC 建模的回声长度(拖尾)。默认约 52ms。",
   },
   delay_num_filters: {
-    en: "Delay search window size. Auto ≈ 5 (~608ms).",
-    zh: "延迟搜索窗大小。自动约为 5(约 608ms)。",
+    en: "Delay-estimation search range (parallel matched filters). Default 5 ≈ 608ms.",
+    zh: "延迟估计的搜索范围(并行滤波器数)。默认 5 ≈ 608ms。",
   },
   linear_stable_echo_path: {
-    en: "Assume a more linear/stable echo path (pure loopback). Off by default.",
-    zh: "假设 echo path 更线性稳定(偏纯 loopback)。默认关闭。",
+    en: "Assume a linear, stable echo path (closer to pure loopback). Off by default.",
+    zh: "假设回声路径线性稳定(偏纯回环)。默认关。",
   },
-  model: { en: "GGUF model path (required).", zh: "GGUF 模型路径(必填)。" },
-  library: { en: "LocalVQE dynamic library path (auto if empty).", zh: "LocalVQE 动态库路径(留空自动)。" },
+  model: { en: "Path to the LocalVQE model file (.gguf). Required.", zh: "LocalVQE 模型文件(.gguf)路径。必填。" },
+  library: { en: "LocalVQE runtime library path. Auto-detected if empty.", zh: "LocalVQE 运行库路径。留空自动。" },
   threads: {
-    en: "CPU threads (auto if empty). 2-4 is plenty for realtime.",
-    zh: "CPU 线程数(留空自动)。实时推理 2-4 已足够。",
+    en: "CPU threads for model inference. Auto if empty.",
+    zh: "模型推理的 CPU 线程数。留空自动。",
   },
   noise_gate: {
-    en: "LocalVQE noise gate: mutes output below the threshold. Off by default.",
-    zh: "LocalVQE 噪声门:低于阈值时静音输出。默认关闭。",
+    en: "Mutes output below the threshold. Off by default.",
+    zh: "输出低于阈值时静音。默认关。",
   },
   noise_gate_threshold_dbfs: {
-    en: "Gate threshold (dBFS). Default -45; raise toward -35 to cut more room noise.",
-    zh: "噪声门阈值(dBFS)。默认 -45;想压掉更多环境声可向 -35 提高。",
+    en: "Noise-gate threshold (dBFS). Default -45; higher is more aggressive.",
+    zh: "噪声门阈值(dBFS)。默认 -45,越高越激进。",
   },
   intensity_ratio: {
-    en: "RTX AEC strength (0-1). Default 1.0; lower it if voice sounds over-suppressed.",
-    zh: "RTX AEC 强度(0-1)。默认 1.0;人声被压过头时调低。",
+    en: "RTX echo-removal strength (0–1). Default 1.0; lower is gentler.",
+    zh: "RTX 回声消除强度(0–1)。默认 1.0,越低越保守。",
   },
-  runtime_dir: { en: "NVIDIA AFX runtime dir (auto if empty).", zh: "NVIDIA AFX runtime 目录(留空自动)。" },
-  model_path: { en: "RTX AEC model path (auto if empty).", zh: "RTX AEC 模型路径(留空自动)。" },
   on_runtime_error: {
-    en: "On backend runtime error: silence (safe, no echo leak) or bypass (keeps mic alive but echo passes).",
-    zh: "运行时出错时:silence 安全不漏回声;bypass 保住麦克风但回声直通。",
+    en: "Fallback when the RTX backend errors: silence (no echo leak) or bypass (mic stays live, echo passes).",
+    zh: "RTX 后端出错时:silence 静音不漏回声,bypass 直通保麦克风但漏回声。",
   },
-  use_default_gpu: { en: "Use the default GPU.", zh: "使用默认 GPU。" },
-  disable_cuda_graph: { en: "Disable CUDA graph.", zh: "关闭 CUDA graph。" },
 };
 
 function backendLabel(kind: string, proc?: Processor): string {
@@ -164,8 +161,10 @@ function probeInitialDelay(
   platform: Platform,
   kind: string,
 ): number | null {
-  if (platform !== "macos" || kind !== "aec3") return null;
-  if (r.recommended_near_delay_ms > 0) return PROBE_INIT_DELAY_MS;
+  if (kind !== "aec3") return null;
+  // mac:近端延迟已做负方向偏置对齐 → init 只需一个小的安全余量。
+  if (platform === "macos") return PROBE_INIT_DELAY_MS;
+  // win/其它:不设近端延迟 → init = 实测回声延迟(冷启动对齐起点),需稳定。
   const stable =
     r.warnings.length === 0 &&
     Math.abs(r.event_lag_stddev_ms) < 5 &&
@@ -204,13 +203,17 @@ function ProbeSection({
   const timer = useRef<number | null>(null);
   const mounted = useRef(true);
 
-  useEffect(
-    () => () => {
+  useEffect(() => {
+    // setup 必须把 mounted 设回 true:StrictMode(dev)会 mount→cleanup→再 mount,
+    // 首次 cleanup 已把 mounted 翻 false;若 setup 不重置,mounted 永久 false,
+    // 之后 runProbe 里所有 updateProbeIfMounted 全 no-op —— 进度灯不亮、结果不填、
+    // PROBING 永不清除(表现为「有声音但前端卡死」)。
+    mounted.current = true;
+    return () => {
       mounted.current = false;
       if (timer.current != null) window.clearInterval(timer.current);
-    },
-    [],
-  );
+    };
+  }, []);
   const updateProbeIfMounted = (patch: ProbePatch) => {
     if (mounted.current) updateProbe(patch);
   };
@@ -261,9 +264,11 @@ function ProbeSection({
       }
       if (!mounted.current) return;
       updateProbeIfMounted({ probe: r });
-      // 自动把实测推荐值填进 near_delay_ms(含 8ms AEC 安全余量,后端已算好)。
-      onPipeline({ near_delay_ms: r.recommended_near_delay_ms });
-      // mac + AEC3 → 顺带写 AEC3 initial_delay_ms(负 lag 写 8ms 安全值,正常正 lag 写实测延迟)。
+      // mac:近端延迟做负方向偏置(后端已含安全余量);win/其它:正 lag 无需近端延迟,不动。
+      if (platform === "macos") {
+        onPipeline({ near_delay_ms: r.recommended_near_delay_ms });
+      }
+      // AEC3 初始延迟:mac 写 8ms 余量(near_delay 已对齐),win/其它写实测回声延迟(冷启动起点)。
       const init = probeInitialDelay(r, platform, kind);
       if (init != null) onParam("initial_delay_ms", init);
     } catch (e) {
@@ -321,15 +326,17 @@ function ProbeSection({
         </div>
         <div className="apright">
           <div className="prow">
-            <button
-              type="button"
-              className="dopen pbtn"
-              disabled={probing}
-              onClick={runProbe}
-            >
-              {probing ? t("probing") : t("probeRun")}{" "}
-              <span className="mk">{probing ? "•••" : "↻"}</span>
-            </button>
+            <Hint text={t("probeRunHint")} pos="top">
+              <button
+                type="button"
+                className="dopen pbtn"
+                disabled={probing}
+                onClick={runProbe}
+              >
+                {probing ? t("probing") : t("probeRun")}{" "}
+                <span className="mk">{probing ? "•••" : "↻"}</span>
+              </button>
+            </Hint>
             <span className="pnote">
               {phase === "pausing"
                 ? t("probePausing")
@@ -374,7 +381,8 @@ function ProbeSection({
                 </span>
               </span>
               <span className="pline sub">
-                {probe.recommended_near_delay_ms > 0 ? (
+                {/* 显示随平台分流,与填充逻辑一致:mac 填近端延迟,win/其它只填初始延迟。 */}
+                {platform === "macos" ? (
                   <span className="ok">
                     {t("probeRec")} {probe.recommended_near_delay_ms}ms · {t("probeFilled")}
                     {initWritten != null && ` · ${t("probeInit")} ${initWritten}ms`}
@@ -420,6 +428,7 @@ export function AdvancedPage({
   const { t, lang, setLang } = useI18n();
   const proc = processors.find((p) => p.kind === kind);
   const desc = (k: string) => DESC[k]?.[lang];
+  const pipelineDisabled = kind === "nvidia_afx_aec";
 
   const reqMet = (spec: ParamSpec) =>
     !spec.requires ||
@@ -502,6 +511,7 @@ export function AdvancedPage({
           <span className="aval">
             <SegButtons
               value={String(pipeline.sample_rate)}
+              disabled={pipelineDisabled}
               options={[16000, 48000].map((n) => ({
                 value: String(n),
                 label: String(n),
@@ -517,6 +527,7 @@ export function AdvancedPage({
           <span className="aval">
             <SegButtons
               value={String(pipeline.frame_ms)}
+              disabled={pipelineDisabled}
               options={[10, 20].map((n) => ({
                 value: String(n),
                 label: `${n} MS`,
@@ -532,6 +543,7 @@ export function AdvancedPage({
           <span className="aval">
             <SegButtons
               value={pipeline.reference_channels}
+              disabled={pipelineDisabled}
               options={[
                 { value: "mono", label: "MONO" },
                 { value: "stereo", label: "STEREO" },

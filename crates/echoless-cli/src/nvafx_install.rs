@@ -4,7 +4,9 @@ use std::fs::{create_dir_all, remove_dir_all, rename, File};
 use std::io::{copy, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, ensure, Context, Result};
 use clap::{Args, Subcommand};
@@ -21,11 +23,14 @@ use echoless_processors::NodeConfig;
 const DEFAULT_NVAFX_RELEASE_TAG: &str = "rtx-aec-runtime-win64-2.1.0-aec48-preview.1";
 const NVAFX_RELEASE_DOWNLOAD_BASE: &str = "https://github.com/Haor/echoless/releases/download";
 const NVAFX_COMMON_RUNTIME_ASSET: &str = "echoless-rtx-aec-common-runtime-win64-2.1.0.zip";
+const DOWNLOAD_PROGRESS_INTERVAL: Duration = Duration::from_millis(250);
+const DOWNLOAD_PROGRESS_STOP_TIMEOUT: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Copy)]
 struct NvafxReleasePin {
     asset: &'static str,
     sha256: &'static str,
+    size: u64,
 }
 
 // Trust anchor for DEFAULT_NVAFX_RELEASE_TAG. Release SHA256SUMS.txt is only a cross-check
@@ -34,22 +39,27 @@ const NVAFX_DEFAULT_RELEASE_PINS: &[NvafxReleasePin] = &[
     NvafxReleasePin {
         asset: NVAFX_COMMON_RUNTIME_ASSET,
         sha256: "dcacac954b7973ae18369b252d13f24b973b10114d00e5293eab0713601c7bcb",
+        size: 1_001_010_819,
     },
     NvafxReleasePin {
         asset: "echoless-rtx-aec-model-win64-2.1.0-turing-aec48.zip",
         sha256: "951e03bb144156f4b27cbf2caa6930f9dabc3f1cb26a0afd9d9523f4d286dae9",
+        size: 48_104_228,
     },
     NvafxReleasePin {
         asset: "echoless-rtx-aec-model-win64-2.1.0-ampere-aec48.zip",
         sha256: "066e06ec18a7d4509675411a1e050e11b0cfc4fee30d69d783871333018c9ab9",
+        size: 48_049_936,
     },
     NvafxReleasePin {
         asset: "echoless-rtx-aec-model-win64-2.1.0-ada-aec48.zip",
         sha256: "92170e6a259f9093397b93cf4385759c36697ecb9e308322405bce1abcb8e3df",
+        size: 48_374_718,
     },
     NvafxReleasePin {
         asset: "echoless-rtx-aec-model-win64-2.1.0-blackwell-aec48.zip",
         sha256: "0e75bb7442d317990ef0d5a6477105f86b9bbae1c2c5e4a6bdfb8d4e9f42df5b",
+        size: 48_927_764,
     },
 ];
 
@@ -61,44 +71,38 @@ pub(crate) struct NvafxArgs {
 
 #[derive(Subcommand)]
 enum NvafxCmd {
-    /// 检查 RTX AEC runtime、GPU、driver、VC++ runtime 是否可用
+    /// Check RTX AEC runtime, GPU, driver, and VC++ runtime availability
     Doctor(NvafxDoctorArgs),
-    /// 离线运行 RTX AEC:mic.wav + ref.wav → out.wav
+    /// Run RTX AEC offline: mic.wav + ref.wav -> out.wav
     Offline(NvafxOfflineArgs),
-    /// 从本地 zip 安装 Echoless RTX AEC runtime 与模型
+    /// Install Echoless RTX AEC runtime and model from a local zip
     Install(NvafxInstallArgs),
-    /// 从 Echoless GitHub public release 下载并安装 RTX AEC runtime 与当前 GPU 模型
+    /// Download and install RTX AEC runtime and current GPU model from the Echoless GitHub public release
     DownloadInstall(NvafxDownloadInstallArgs),
 }
 
 #[derive(Args)]
 struct NvafxDoctorArgs {
-    /// 覆盖 runtime 根目录;Windows 默认读 ECHOLESS_NVAFX_RUNTIME_DIR,再退到 %LOCALAPPDATA%\Echoless\nvafx\2.1.0
-    #[arg(long)]
-    runtime_dir: Option<PathBuf>,
-    /// 输出 JSON,供 GUI/installer 消费
+    /// Emit JSON for GUI/installer consumers
     #[arg(long)]
     json: bool,
 }
 
 #[derive(Args)]
 struct NvafxOfflineArgs {
-    /// 近端麦克风 WAV
+    /// Near-end microphone WAV
     #[arg(long)]
     mic: String,
-    /// far-end 参考 WAV
+    /// Far-end reference WAV
     #[arg(long)]
     reference: String,
-    /// 输出 WAV
+    /// Output WAV
     #[arg(long)]
     out: String,
-    /// 覆盖 runtime 根目录
-    #[arg(long)]
-    runtime_dir: Option<PathBuf>,
-    /// 覆盖模型路径;默认按 GPU 架构自动选择
+    /// Override model path; defaults are chosen automatically by GPU architecture
     #[arg(long)]
     model_path: Option<PathBuf>,
-    /// AFX AEC 强度
+    /// AFX AEC intensity
     #[arg(long, default_value_t = 1.0)]
     intensity_ratio: f32,
 }
@@ -108,29 +112,23 @@ struct NvafxInstallArgs {
     /// common runtime zip
     #[arg(long)]
     common_zip: PathBuf,
-    /// 当前 GPU 架构对应的 model zip
+    /// Model zip for the current GPU architecture
     #[arg(long)]
     model_zip: PathBuf,
-    /// 覆盖安装根目录;Windows 默认 %LOCALAPPDATA%\Echoless\nvafx\2.1.0
-    #[arg(long)]
-    runtime_dir: Option<PathBuf>,
-    /// 覆盖 common zip 期望 SHA256;不填则按官方 asset 名称自动匹配
+    /// Override expected SHA256 for common zip; falls back to matching the official asset name when unset
     #[arg(long)]
     common_sha256: Option<String>,
-    /// 覆盖 model zip 期望 SHA256;不填则按官方 asset 名称自动匹配
+    /// Override expected SHA256 for model zip; falls back to matching the official asset name when unset
     #[arg(long)]
     model_sha256: Option<String>,
 }
 
 #[derive(Args)]
 struct NvafxDownloadInstallArgs {
-    /// 覆盖安装根目录;Windows 默认 %LOCALAPPDATA%\Echoless\nvafx\2.1.0
-    #[arg(long)]
-    runtime_dir: Option<PathBuf>,
-    /// GitHub release tag;默认使用 Echoless RTX AEC public preview release
+    /// GitHub release tag; defaults to the Echoless RTX AEC public preview release
     #[arg(long, default_value = DEFAULT_NVAFX_RELEASE_TAG)]
     tag: String,
-    /// 输出 { ok, report } JSON,供 GUI installer 消费
+    /// Emit { ok, report } JSON for GUI installer consumers
     #[arg(long)]
     json: bool,
 }
@@ -145,7 +143,7 @@ pub(crate) fn cmd_nvafx(args: NvafxArgs) -> Result<()> {
 }
 
 fn cmd_nvafx_doctor(args: NvafxDoctorArgs) -> Result<()> {
-    let report = echoless_processors::nvafx::doctor_report(args.runtime_dir.as_deref())?;
+    let report = echoless_processors::nvafx::doctor_report()?;
     if args.json {
         println!(
             "{}",
@@ -159,7 +157,7 @@ fn cmd_nvafx_doctor(args: NvafxDoctorArgs) -> Result<()> {
 
     println!("NVIDIA AFX / RTX AEC doctor");
     println!(
-        "SDK {} · runtime file {} · 最低 driver {}",
+        "SDK {} · runtime file {} · minimum driver {}",
         echoless_processors::nvafx::SDK_VERSION,
         echoless_processors::nvafx::RUNTIME_FILE_VERSION,
         echoless_processors::nvafx::MIN_DRIVER_VERSION,
@@ -170,7 +168,7 @@ fn cmd_nvafx_doctor(args: NvafxDoctorArgs) -> Result<()> {
         report.runtime_dir_source
     );
     if report.gpus.is_empty() {
-        println!("GPU:     未检测到 NVIDIA GPU");
+        println!("GPU:     no NVIDIA GPU detected");
     } else {
         println!("GPU:");
         for (index, gpu) in report.gpus.iter().enumerate() {
@@ -201,14 +199,14 @@ fn cmd_nvafx_doctor(args: NvafxDoctorArgs) -> Result<()> {
             check.detail
         );
         if let Some(action) = &check.action {
-            println!("      处理: {action}");
+            println!("      action: {action}");
         }
     }
 
     if problems == 0 {
-        println!("\nRTX AEC runtime 预检通过。");
+        println!("\nRTX AEC runtime preflight passed.");
     } else {
-        println!("\nRTX AEC runtime 预检未通过: {problems} 个问题需要处理。");
+        println!("\nRTX AEC runtime preflight failed: {problems} issues to resolve.");
     }
     Ok(())
 }
@@ -216,15 +214,9 @@ fn cmd_nvafx_doctor(args: NvafxDoctorArgs) -> Result<()> {
 fn cmd_nvafx_offline(a: NvafxOfflineArgs) -> Result<()> {
     ensure_nvafx_windows_command("nvafx offline")?;
     if !a.intensity_ratio.is_finite() || a.intensity_ratio < 0.0 {
-        bail!("--intensity-ratio 必须是非负有限数");
+        bail!("--intensity-ratio must be a non-negative finite number");
     }
     let mut params = toml::Table::new();
-    if let Some(runtime_dir) = &a.runtime_dir {
-        params.insert(
-            "runtime_dir".into(),
-            toml::Value::String(runtime_dir.display().to_string()),
-        );
-    }
     if let Some(model_path) = &a.model_path {
         params.insert(
             "model_path".into(),
@@ -246,6 +238,7 @@ fn cmd_nvafx_offline(a: NvafxOfflineArgs) -> Result<()> {
         near_delay_ms: 0,
         output_level: default_output_level(),
         bypass: false,
+        output_rate_match: echoless_core::default_output_rate_match(),
         diagnostics: DiagnosticsConfig::default(),
         chain: vec![NodeConfig {
             kind: "nvidia_afx_aec".into(),
@@ -258,10 +251,13 @@ fn cmd_nvafx_offline(a: NvafxOfflineArgs) -> Result<()> {
     let mic = WavFileSource::new(&a.mic, frame)?;
     let reference = WavFileSource::new(&a.reference, frame)?;
     let sink = WavFileSink::new(&a.out);
-    println!("RTX AEC 离线运行: {} + {} → {}", a.mic, a.reference, a.out);
+    println!(
+        "RTX AEC offline run: {} + {} -> {}",
+        a.mic, a.reference, a.out
+    );
     let rep = run_offline(&cfg, mic, reference, sink)?;
     println!(
-        "完成: {} 帧 (~{:.2}s) · process 链 [{}]",
+        "done: {} frames (~{:.2}s) · process chain [{}]",
         rep.frames,
         rep.seconds,
         rep.chain.join(", ")
@@ -289,7 +285,6 @@ fn cmd_nvafx_install(a: NvafxInstallArgs) -> Result<()> {
     let report = install_nvafx_runtime(NvafxInstallRequest {
         common_zip: &a.common_zip,
         model_zip: &a.model_zip,
-        runtime_dir: a.runtime_dir.as_deref(),
         common_sha256: a.common_sha256.as_deref(),
         model_sha256: a.model_sha256.as_deref(),
         install_source: json!({ "kind": "local-zip" }),
@@ -297,7 +292,7 @@ fn cmd_nvafx_install(a: NvafxInstallArgs) -> Result<()> {
     })?;
     print_nvafx_doctor_report(&report);
     if !report.ok() {
-        bail!("runtime 已解压,但 doctor 仍未通过");
+        bail!("runtime extracted, but doctor still did not pass");
     }
     Ok(())
 }
@@ -306,22 +301,26 @@ fn cmd_nvafx_download_install(a: NvafxDownloadInstallArgs) -> Result<()> {
     ensure_nvafx_windows_command("nvafx download-install")?;
     let tag = a.tag.trim();
     if tag.is_empty() {
-        bail!("--tag 不能为空");
+        bail!("--tag must not be empty");
     }
 
-    let preflight = echoless_processors::nvafx::doctor_report(a.runtime_dir.as_deref())?;
+    let preflight = echoless_processors::nvafx::doctor_report()?;
     let arch = preflight.selected_arch.with_context(|| {
-        "无法从 nvafx doctor 判断 GPU 架构;请先确认 nvidia-smi、driver 和 RTX GPU 可用"
+        "unable to determine GPU architecture from nvafx doctor; verify nvidia-smi, driver, and RTX GPU availability first"
     })?;
     let model_asset = arch.model_asset_name();
     let download_dir = nvafx_download_cache_dir(tag);
-    create_dir_all(&download_dir)
-        .with_context(|| format!("创建下载缓存目录失败: {}", download_dir.display()))?;
+    create_dir_all(&download_dir).with_context(|| {
+        format!(
+            "failed to create download cache directory: {}",
+            download_dir.display()
+        )
+    })?;
 
     install_log(
         a.json,
         format!(
-            "RTX AEC 下载源: GitHub release {tag} · arch={}",
+            "RTX AEC download source: GitHub release {tag} · arch={}",
             arch.as_str()
         ),
     );
@@ -331,7 +330,7 @@ fn cmd_nvafx_download_install(a: NvafxDownloadInstallArgs) -> Result<()> {
         Err(err) => {
             install_log(
                 a.json,
-                format!("读取 SHA256SUMS.txt 失败: {err:#}; 将使用内置哈希或仅记录实际哈希"),
+                format!("failed to read SHA256SUMS.txt: {err:#}; will fall back to built-in hashes or only record actual hashes"),
             );
             HashMap::new()
         }
@@ -344,11 +343,14 @@ fn cmd_nvafx_download_install(a: NvafxDownloadInstallArgs) -> Result<()> {
     let common_expected =
         expected_sha256_for_release_asset(tag, &release_sha256sums, NVAFX_COMMON_RUNTIME_ASSET)?;
     let model_expected = expected_sha256_for_release_asset(tag, &release_sha256sums, &model_asset)?;
+    let common_size = expected_size_for_release_asset(tag, NVAFX_COMMON_RUNTIME_ASSET);
+    let model_size = expected_size_for_release_asset(tag, &model_asset);
 
     download_release_asset(
         &common_url,
         &common_zip,
         common_expected.as_deref(),
+        common_size,
         "common runtime",
         a.json,
     )?;
@@ -356,6 +358,7 @@ fn cmd_nvafx_download_install(a: NvafxDownloadInstallArgs) -> Result<()> {
         &model_url,
         &model_zip,
         model_expected.as_deref(),
+        model_size,
         "model",
         a.json,
     )?;
@@ -363,7 +366,6 @@ fn cmd_nvafx_download_install(a: NvafxDownloadInstallArgs) -> Result<()> {
     let report = install_nvafx_runtime(NvafxInstallRequest {
         common_zip: &common_zip,
         model_zip: &model_zip,
-        runtime_dir: a.runtime_dir.as_deref(),
         common_sha256: common_expected.as_deref(),
         model_sha256: model_expected.as_deref(),
         install_source: json!({
@@ -388,7 +390,23 @@ fn cmd_nvafx_download_install(a: NvafxDownloadInstallArgs) -> Result<()> {
         print_nvafx_doctor_report(&report);
     }
     if !report.ok() {
-        bail!("runtime 已下载并解压,但 doctor 仍未通过");
+        // doctor 未过:保留下载缓存,便于用户排查后重装而无需重下 ~1 GB。
+        bail!("runtime downloaded and extracted, but doctor still did not pass");
+    }
+    // 安装成功且 doctor 通过 —— common runtime + model 已完全解压到固定 runtime 目录,
+    // TMP 里的下载缓存(~1 GB)不再需要,自动清掉。清理失败不影响安装结果,仅记日志。
+    match remove_dir_all(&download_dir) {
+        Ok(()) => install_log(
+            a.json,
+            format!("cleaned up download cache: {}", download_dir.display()),
+        ),
+        Err(err) => install_log(
+            a.json,
+            format!(
+                "failed to clean up download cache (ignorable, remove manually): {}: {err:#}",
+                download_dir.display()
+            ),
+        ),
     }
     Ok(())
 }
@@ -396,7 +414,6 @@ fn cmd_nvafx_download_install(a: NvafxDownloadInstallArgs) -> Result<()> {
 struct NvafxInstallRequest<'a> {
     common_zip: &'a Path,
     model_zip: &'a Path,
-    runtime_dir: Option<&'a Path>,
     common_sha256: Option<&'a str>,
     model_sha256: Option<&'a str>,
     install_source: serde_json::Value,
@@ -406,11 +423,14 @@ struct NvafxInstallRequest<'a> {
 fn install_nvafx_runtime(
     request: NvafxInstallRequest<'_>,
 ) -> Result<echoless_processors::nvafx::DoctorReport> {
-    let (runtime_dir, runtime_dir_source) =
-        echoless_processors::nvafx::resolve_runtime_dir(request.runtime_dir);
+    let (runtime_dir, runtime_dir_source) = echoless_processors::nvafx::resolve_runtime_dir();
     if let Some(parent) = runtime_dir.parent() {
-        create_dir_all(parent)
-            .with_context(|| format!("创建 runtime 父目录失败: {}", parent.display()))?;
+        create_dir_all(parent).with_context(|| {
+            format!(
+                "failed to create runtime parent directory: {}",
+                parent.display()
+            )
+        })?;
     }
 
     let common_expected = request
@@ -435,7 +455,7 @@ fn install_nvafx_runtime(
     install_log(
         request.log_to_stderr,
         format!(
-            "解压 common runtime 到 staging 后切换 {}",
+            "extracting common runtime to staging, then switching to {}",
             runtime_dir.display()
         ),
     );
@@ -443,13 +463,13 @@ fn install_nvafx_runtime(
     extract_zip(request.common_zip, &staging_dir)?;
     install_log(
         request.log_to_stderr,
-        format!("解压 model 到 staging: {}", staging_dir.display()),
+        format!("extracting model to staging: {}", staging_dir.display()),
     );
     extract_zip(request.model_zip, &staging_dir)?;
 
     let installed_at = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .context("系统时间早于 UNIX_EPOCH")?
+        .context("system time is before UNIX_EPOCH")?
         .as_secs();
     let manifest = json!({
         "sdk_version": echoless_processors::nvafx::SDK_VERSION,
@@ -463,8 +483,12 @@ fn install_nvafx_runtime(
         "install_source": request.install_source,
     });
     let manifest_path = staging_dir.join("echoless-runtime-install-manifest.json");
-    let mut file = File::create(&manifest_path)
-        .with_context(|| format!("写入安装 manifest 失败: {}", manifest_path.display()))?;
+    let mut file = File::create(&manifest_path).with_context(|| {
+        format!(
+            "failed to write install manifest: {}",
+            manifest_path.display()
+        )
+    })?;
     file.write_all(serde_json::to_string_pretty(&manifest)?.as_bytes())?;
     file.write_all(b"\n")?;
     drop(file);
@@ -474,18 +498,18 @@ fn install_nvafx_runtime(
     install_log(
         request.log_to_stderr,
         format!(
-            "安装 manifest: {}",
+            "install manifest: {}",
             runtime_dir
                 .join("echoless-runtime-install-manifest.json")
                 .display()
         ),
     );
-    echoless_processors::nvafx::doctor_report(Some(&runtime_dir))
+    echoless_processors::nvafx::doctor_report()
 }
 
 fn ensure_nvafx_windows_command(command: &str) -> Result<()> {
     if !cfg!(windows) {
-        bail!("{command} 目前只支持 Windows x64; macOS artifact 只能用于 AEC3/LocalVQE 路径");
+        bail!("{command} currently supports Windows x64 only; macOS artifacts can only use the AEC3/LocalVQE path");
     }
     Ok(())
 }
@@ -550,9 +574,9 @@ fn fetch_release_sha256sums(
 ) -> Result<HashMap<String, String>> {
     let path = download_dir.join("SHA256SUMS.txt");
     let url = nvafx_release_asset_url(tag, "SHA256SUMS.txt");
-    download_file(&url, &path, "SHA256SUMS.txt", log_to_stderr)?;
+    download_file(&url, &path, "SHA256SUMS.txt", None, log_to_stderr)?;
     let contents = std::fs::read_to_string(&path)
-        .with_context(|| format!("读取 SHA256SUMS.txt 失败: {}", path.display()))?;
+        .with_context(|| format!("failed to read SHA256SUMS.txt: {}", path.display()))?;
     Ok(parse_sha256sums(&contents))
 }
 
@@ -590,7 +614,7 @@ fn expected_sha256_for_release_asset(
             if let Some(release) = release_sha256sums.get(asset) {
                 ensure!(
                     release.eq_ignore_ascii_case(embedded),
-                    "GitHub release SHA256SUMS.txt 与内置 pin 不一致: asset={asset}, release={release}, embedded={embedded}"
+                    "SHA256SUMS.txt does not match the built-in pin: asset={asset}, release={release}, embedded={embedded}"
                 );
             }
             return Ok(Some(embedded.to_string()));
@@ -600,48 +624,66 @@ fn expected_sha256_for_release_asset(
     Ok(release_sha256sums.get(asset).cloned())
 }
 
+fn expected_size_for_release_asset(tag: &str, asset: &str) -> Option<u64> {
+    (tag == DEFAULT_NVAFX_RELEASE_TAG)
+        .then(|| default_release_pin(asset).map(|pin| pin.size))
+        .flatten()
+}
+
 fn download_release_asset(
     url: &str,
     dest: &Path,
     expected_sha256: Option<&str>,
+    expected_size: Option<u64>,
     label: &str,
     log_to_stderr: bool,
 ) -> Result<()> {
     if dest.exists() {
         match expected_sha256 {
             Some(expected) => {
-                let actual = sha256_file(dest)
-                    .with_context(|| format!("校验已有下载失败: {}", dest.display()))?;
+                let actual = sha256_file(dest).with_context(|| {
+                    format!("failed to verify existing download: {}", dest.display())
+                })?;
                 if actual.eq_ignore_ascii_case(expected) {
                     install_log(
                         log_to_stderr,
-                        format!("{label} 已在缓存中且 SHA256 ok: {}", dest.display()),
+                        format!("{label} already cached and SHA256 ok: {}", dest.display()),
                     );
                     return Ok(());
                 }
                 install_log(
                     log_to_stderr,
-                    format!("{label} 缓存 SHA256 不匹配,重新下载: {}", dest.display()),
+                    format!(
+                        "{label} cached SHA256 mismatch; re-downloading: {}",
+                        dest.display()
+                    ),
                 );
             }
             None => {
                 install_log(
                     log_to_stderr,
                     format!(
-                        "{label} 已在缓存中,未提供期望 SHA256,将重新下载: {}",
+                        "{label} already cached, no expected SHA256 provided; re-downloading: {}",
                         dest.display()
                     ),
                 );
             }
         }
     }
-    download_file(url, dest, label, log_to_stderr)
+    download_file(url, dest, label, expected_size, log_to_stderr)
 }
 
-fn download_file(url: &str, dest: &Path, label: &str, log_to_stderr: bool) -> Result<()> {
+fn download_file(
+    url: &str,
+    dest: &Path,
+    label: &str,
+    expected_size: Option<u64>,
+    log_to_stderr: bool,
+) -> Result<()> {
     if let Some(parent) = dest.parent() {
-        create_dir_all(parent)
-            .with_context(|| format!("创建下载目录失败: {}", parent.display()))?;
+        create_dir_all(parent).with_context(|| {
+            format!("failed to create download directory: {}", parent.display())
+        })?;
     }
     let tmp = dest.with_extension(format!(
         "{}part",
@@ -651,28 +693,155 @@ fn download_file(url: &str, dest: &Path, label: &str, log_to_stderr: bool) -> Re
             .unwrap_or_default()
     ));
     let _ = std::fs::remove_file(&tmp);
-    install_log(log_to_stderr, format!("下载 {label}: {url}"));
+    install_log(log_to_stderr, format!("downloading {label}: {url}"));
+    let progress = log_to_stderr.then(|| {
+        spawn_download_progress_observer(
+            tmp.clone(),
+            label.to_string(),
+            expected_size,
+            DOWNLOAD_PROGRESS_INTERVAL,
+            DOWNLOAD_PROGRESS_STOP_TIMEOUT,
+            |label, received, total| emit_download_progress(true, label, received, total),
+        )
+    });
+
     match download_with_powershell(url, &tmp) {
-        Ok(()) => {
-            let _ = std::fs::remove_file(dest);
-            rename(&tmp, dest).with_context(|| {
-                format!("提交下载文件失败: {} -> {}", tmp.display(), dest.display())
-            })
-        }
+        Ok(()) => Ok(()),
         Err(power_shell_err) => {
             let _ = std::fs::remove_file(&tmp);
             install_log(
                 log_to_stderr,
-                format!("PowerShell 下载失败,尝试 curl.exe: {power_shell_err:#}"),
+                format!("PowerShell download failed, trying curl.exe: {power_shell_err:#}"),
             );
             download_with_curl(url, &tmp)
-                .with_context(|| format!("PowerShell 下载也失败: {power_shell_err:#}"))?;
-            let _ = std::fs::remove_file(dest);
-            rename(&tmp, dest).with_context(|| {
-                format!("提交下载文件失败: {} -> {}", tmp.display(), dest.display())
-            })
+                .with_context(|| format!("PowerShell download also failed: {power_shell_err:#}"))
+        }
+    }?;
+
+    commit_downloaded_file(&tmp, dest, progress)?;
+    let received = std::fs::metadata(dest).map(|meta| meta.len()).unwrap_or(0);
+    emit_download_progress(log_to_stderr, label, received, expected_size);
+    Ok(())
+}
+
+fn commit_downloaded_file(
+    partial: &Path,
+    destination: &Path,
+    progress: Option<DownloadProgressObserver>,
+) -> Result<()> {
+    if let Some(observer) = progress {
+        observer.stop();
+    }
+    let _ = std::fs::remove_file(destination);
+    rename(partial, destination).with_context(|| {
+        format!(
+            "failed to commit downloaded file: {} -> {}",
+            partial.display(),
+            destination.display()
+        )
+    })
+}
+
+struct DownloadProgressObserver {
+    stop: Option<Sender<()>>,
+    done: Receiver<()>,
+    handle: Option<JoinHandle<()>>,
+    stop_timeout: Duration,
+}
+
+impl DownloadProgressObserver {
+    fn stop(mut self) {
+        self.finish();
+    }
+
+    fn finish(&mut self) {
+        if self.handle.is_none() {
+            return;
+        }
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
+        }
+        match self.done.recv_timeout(self.stop_timeout) {
+            Ok(()) | Err(RecvTimeoutError::Disconnected) => {
+                if let Some(handle) = self.handle.take() {
+                    let _ = handle.join();
+                }
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                // Progress is optional: detach a stuck observer instead of delaying
+                // hashing, installation, or process exit.
+                self.handle.take();
+            }
         }
     }
+}
+
+impl Drop for DownloadProgressObserver {
+    fn drop(&mut self) {
+        self.finish();
+    }
+}
+
+fn spawn_download_progress_observer<F>(
+    path: PathBuf,
+    label: String,
+    total: Option<u64>,
+    interval: Duration,
+    stop_timeout: Duration,
+    emit: F,
+) -> DownloadProgressObserver
+where
+    F: Fn(&str, u64, Option<u64>) + Send + 'static,
+{
+    let (stop_tx, stop_rx) = mpsc::channel();
+    let (done_tx, done_rx) = mpsc::channel();
+    let handle = thread::spawn(move || {
+        let mut last_received = None;
+        loop {
+            let received = std::fs::metadata(&path)
+                .map(|metadata| metadata.len())
+                .unwrap_or(0);
+            if last_received != Some(received) {
+                emit(&label, received, total);
+                last_received = Some(received);
+            }
+            match stop_rx.recv_timeout(interval) {
+                Err(RecvTimeoutError::Timeout) => {}
+                Ok(()) | Err(RecvTimeoutError::Disconnected) => break,
+            }
+        }
+        let _ = done_tx.send(());
+    });
+    DownloadProgressObserver {
+        stop: Some(stop_tx),
+        done: done_rx,
+        handle: Some(handle),
+        stop_timeout,
+    }
+}
+
+fn emit_download_progress(enabled: bool, label: &str, received: u64, total: Option<u64>) {
+    if enabled {
+        eprintln!("{}", download_progress_payload(label, received, total));
+    }
+}
+
+fn download_progress_payload(label: &str, received: u64, total: Option<u64>) -> serde_json::Value {
+    let total = total.filter(|value| *value > 0).unwrap_or(0);
+    let pct = (total > 0).then(|| {
+        received
+            .min(total)
+            .saturating_mul(100)
+            .checked_div(total)
+            .unwrap_or(0) as u32
+    });
+    json!({
+        "event": "nvafx_download_progress",
+        "label": label,
+        "received": received,
+        "total": total,
+        "pct": pct,
+    })
 }
 
 fn download_with_powershell(url: &str, dest: &Path) -> Result<()> {
@@ -686,7 +855,7 @@ fn download_with_powershell(url: &str, dest: &Path) -> Result<()> {
         .arg(url)
         .arg(dest)
         .output()
-        .context("启动 powershell.exe 失败")?;
+        .context("failed to launch powershell.exe")?;
     if output.status.success() {
         return Ok(());
     }
@@ -708,7 +877,7 @@ fn download_with_curl(url: &str, dest: &Path) -> Result<()> {
         .arg(dest)
         .arg(url)
         .output()
-        .context("启动 curl.exe 失败")?;
+        .context("failed to launch curl.exe")?;
     if output.status.success() {
         return Ok(());
     }
@@ -723,7 +892,7 @@ fn download_with_curl(url: &str, dest: &Path) -> Result<()> {
 fn print_nvafx_doctor_report(report: &echoless_processors::nvafx::DoctorReport) {
     println!("NVIDIA AFX / RTX AEC doctor");
     println!(
-        "SDK {} · runtime file {} · 最低 driver {}",
+        "SDK {} · runtime file {} · minimum driver {}",
         echoless_processors::nvafx::SDK_VERSION,
         echoless_processors::nvafx::RUNTIME_FILE_VERSION,
         echoless_processors::nvafx::MIN_DRIVER_VERSION,
@@ -734,7 +903,7 @@ fn print_nvafx_doctor_report(report: &echoless_processors::nvafx::DoctorReport) 
         report.runtime_dir_source
     );
     if report.gpus.is_empty() {
-        println!("GPU:     未检测到 NVIDIA GPU");
+        println!("GPU:     no NVIDIA GPU detected");
     } else {
         println!("GPU:");
         for (index, gpu) in report.gpus.iter().enumerate() {
@@ -765,23 +934,26 @@ fn print_nvafx_doctor_report(report: &echoless_processors::nvafx::DoctorReport) 
             check.detail
         );
         if let Some(action) = &check.action {
-            println!("      处理: {action}");
+            println!("      action: {action}");
         }
     }
 
     if problems == 0 {
-        println!("\nRTX AEC runtime 预检通过。");
+        println!("\nRTX AEC runtime preflight passed.");
     } else {
-        println!("\nRTX AEC runtime 预检未通过: {problems} 个问题需要处理。");
+        println!("\nRTX AEC runtime preflight failed: {problems} issues to resolve.");
     }
 }
 
 fn expected_sha256_for_asset(path: &Path) -> Option<&'static str> {
     let asset = path.file_name()?.to_str()?;
+    default_release_pin(asset).map(|pin| pin.sha256)
+}
+
+fn default_release_pin(asset: &str) -> Option<&'static NvafxReleasePin> {
     NVAFX_DEFAULT_RELEASE_PINS
         .iter()
         .find(|pin| pin.asset == asset)
-        .map(|pin| pin.sha256)
 }
 
 fn verify_zip_sha256(
@@ -796,14 +968,14 @@ fn verify_zip_sha256(
             install_log(log_to_stderr, format!("{label} SHA256 ok: {actual}"));
         }
         Some(expected) => bail!(
-            "{label} SHA256 不匹配: actual={actual}, expected={expected}, file={}",
+            "{label} SHA256 mismatch: actual={actual}, expected={expected}, file={}",
             path.display()
         ),
         None => {
             install_log(
                 log_to_stderr,
                 format!(
-                    "{label} SHA256: {actual} (未找到官方期望值,仅记录;建议传 --{}-sha256)",
+                    "{label} SHA256: {actual} (no official expected value found, recording only; consider passing --{}-sha256)",
                     if label.starts_with("common") {
                         "common"
                     } else {
@@ -817,13 +989,14 @@ fn verify_zip_sha256(
 }
 
 fn sha256_file(path: &Path) -> Result<String> {
-    let mut file = File::open(path).with_context(|| format!("打开文件失败: {}", path.display()))?;
+    let mut file =
+        File::open(path).with_context(|| format!("failed to open file: {}", path.display()))?;
     let mut hasher = Sha256::new();
     let mut buf = vec![0u8; 64 * 1024];
     loop {
         let n = file
             .read(&mut buf)
-            .with_context(|| format!("读取文件失败: {}", path.display()))?;
+            .with_context(|| format!("failed to read file: {}", path.display()))?;
         if n == 0 {
             break;
         }
@@ -833,31 +1006,31 @@ fn sha256_file(path: &Path) -> Result<String> {
 }
 
 fn extract_zip(zip_path: &Path, dest: &Path) -> Result<()> {
-    let file =
-        File::open(zip_path).with_context(|| format!("打开 zip 失败: {}", zip_path.display()))?;
-    let mut archive =
-        ZipArchive::new(file).with_context(|| format!("读取 zip 失败: {}", zip_path.display()))?;
+    let file = File::open(zip_path)
+        .with_context(|| format!("failed to open zip: {}", zip_path.display()))?;
+    let mut archive = ZipArchive::new(file)
+        .with_context(|| format!("failed to read zip: {}", zip_path.display()))?;
     for index in 0..archive.len() {
-        let mut entry = archive
-            .by_index(index)
-            .with_context(|| format!("读取 zip entry #{index} 失败: {}", zip_path.display()))?;
+        let mut entry = archive.by_index(index).with_context(|| {
+            format!("failed to read zip entry #{index}: {}", zip_path.display())
+        })?;
         let enclosed = entry
             .enclosed_name()
-            .with_context(|| format!("zip entry 路径不安全: {}", entry.name()))?;
+            .with_context(|| format!("unsafe zip entry path: {}", entry.name()))?;
         let out_path = dest.join(enclosed);
         if entry.is_dir() {
             create_dir_all(&out_path)
-                .with_context(|| format!("创建目录失败: {}", out_path.display()))?;
+                .with_context(|| format!("failed to create directory: {}", out_path.display()))?;
             continue;
         }
         if let Some(parent) = out_path.parent() {
             create_dir_all(parent)
-                .with_context(|| format!("创建目录失败: {}", parent.display()))?;
+                .with_context(|| format!("failed to create directory: {}", parent.display()))?;
         }
         let mut out = File::create(&out_path)
-            .with_context(|| format!("创建文件失败: {}", out_path.display()))?;
+            .with_context(|| format!("failed to create file: {}", out_path.display()))?;
         copy(&mut entry, &mut out)
-            .with_context(|| format!("解压文件失败: {}", out_path.display()))?;
+            .with_context(|| format!("failed to extract file: {}", out_path.display()))?;
     }
     Ok(())
 }
@@ -865,22 +1038,26 @@ fn extract_zip(zip_path: &Path, dest: &Path) -> Result<()> {
 fn unique_install_staging_dir(runtime_dir: &Path) -> Result<PathBuf> {
     let parent = runtime_dir
         .parent()
-        .with_context(|| format!("runtime 目录缺少父目录: {}", runtime_dir.display()))?;
+        .with_context(|| format!("runtime directory has no parent: {}", runtime_dir.display()))?;
     let name = runtime_dir
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("nvafx-runtime");
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .context("系统时间早于 UNIX_EPOCH")?
+        .context("system time is before UNIX_EPOCH")?
         .as_nanos();
     let staging = parent.join(format!("{name}.installing-{}-{nanos}", std::process::id()));
     if staging.exists() {
-        remove_dir_all(&staging)
-            .with_context(|| format!("清理旧 staging 目录失败: {}", staging.display()))?;
+        remove_dir_all(&staging).with_context(|| {
+            format!(
+                "failed to clean up old staging directory: {}",
+                staging.display()
+            )
+        })?;
     }
     create_dir_all(&staging)
-        .with_context(|| format!("创建 staging 目录失败: {}", staging.display()))?;
+        .with_context(|| format!("failed to create staging directory: {}", staging.display()))?;
     Ok(staging)
 }
 
@@ -889,14 +1066,14 @@ fn replace_dir_with_staging(runtime_dir: &Path, staging_dir: &Path) -> Result<()
         "previous-{}",
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .context("系统时间早于 UNIX_EPOCH")?
+            .context("system time is before UNIX_EPOCH")?
             .as_nanos()
     ));
     let had_previous = runtime_dir.exists();
     if had_previous {
         rename(runtime_dir, &backup_dir).with_context(|| {
             format!(
-                "移动旧 runtime 目录失败: {} -> {}",
+                "failed to move old runtime directory: {} -> {}",
                 runtime_dir.display(),
                 backup_dir.display()
             )
@@ -907,7 +1084,7 @@ fn replace_dir_with_staging(runtime_dir: &Path, staging_dir: &Path) -> Result<()
             let _ = rename(&backup_dir, runtime_dir);
         }
         bail!(
-            "提交 runtime staging 目录失败: {} -> {}: {err}",
+            "failed to commit runtime staging directory: {} -> {}: {err}",
             staging_dir.display(),
             runtime_dir.display()
         );
@@ -924,19 +1101,19 @@ pub(crate) fn validate_nvafx_constraints(cfg: &PipelineConfig) -> Result<()> {
     }
     if cfg.sample_rate != echoless_processors::nvafx::NVAFX_SAMPLE_RATE {
         bail!(
-            "nvidia_afx_aec v1 只支持 {} Hz,当前 sample_rate={}",
+            "nvidia_afx_aec v1 only supports {} Hz; current sample_rate={}",
             echoless_processors::nvafx::NVAFX_SAMPLE_RATE,
             cfg.sample_rate
         );
     }
     if cfg.frame_ms != 10 {
         bail!(
-            "nvidia_afx_aec v1 只支持 10ms frame,当前 frame_ms={}",
+            "nvidia_afx_aec v1 only supports 10ms frames; current frame_ms={}",
             cfg.frame_ms
         );
     }
     if cfg.reference_channels != ReferenceChannels::Mono {
-        bail!("nvidia_afx_aec v1 只支持 mono reference;请设置 reference_channels = \"mono\"");
+        bail!("nvidia_afx_aec v1 only supports mono reference; set reference_channels = \"mono\"");
     }
     Ok(())
 }
@@ -966,6 +1143,166 @@ mod tests {
             url,
             "https://github.com/Haor/echoless/releases/download/preview%2Fa%20b/asset.zip"
         );
+    }
+
+    #[test]
+    fn nvafx_download_progress_reports_known_asset_percentage() {
+        let total = 1_001_010_819;
+        let start = download_progress_payload("common runtime", 0, Some(total));
+        assert_eq!(start["event"], "nvafx_download_progress");
+        assert_eq!(start["label"], "common runtime");
+        assert_eq!(start["received"], 0);
+        assert_eq!(start["total"], total);
+        assert_eq!(start["pct"], 0);
+
+        let halfway = download_progress_payload("common runtime", total / 2, Some(total));
+        assert_eq!(halfway["pct"], 49);
+
+        let complete = download_progress_payload("common runtime", total, Some(total));
+        assert_eq!(complete["received"], total);
+        assert_eq!(complete["total"], total);
+        assert_eq!(complete["pct"], 100);
+
+        let custom = download_progress_payload("custom asset", 12_345, None);
+        assert_eq!(custom["received"], 12_345);
+        assert_eq!(custom["total"], 0);
+        assert!(custom["pct"].is_null());
+    }
+
+    #[test]
+    fn official_nvafx_release_assets_have_pinned_sizes() {
+        assert_eq!(
+            expected_size_for_release_asset(DEFAULT_NVAFX_RELEASE_TAG, NVAFX_COMMON_RUNTIME_ASSET),
+            Some(1_001_010_819)
+        );
+        assert_eq!(
+            expected_size_for_release_asset(
+                DEFAULT_NVAFX_RELEASE_TAG,
+                "echoless-rtx-aec-model-win64-2.1.0-blackwell-aec48.zip"
+            ),
+            Some(48_927_764)
+        );
+        assert_eq!(
+            expected_size_for_release_asset("custom-tag", NVAFX_COMMON_RUNTIME_ASSET),
+            None
+        );
+    }
+
+    #[test]
+    fn local_progress_observer_reports_growing_partial_file() {
+        let path = env::temp_dir().join(format!(
+            "echoless-nvafx-progress-{}-{}.part",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&path, []).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let observer = spawn_download_progress_observer(
+            path.clone(),
+            "common runtime".to_string(),
+            Some(100),
+            Duration::from_millis(5),
+            Duration::from_millis(50),
+            move |label, received, total| {
+                let _ = tx.send(download_progress_payload(label, received, total));
+            },
+        );
+
+        let start = rx.recv_timeout(Duration::from_millis(250)).unwrap();
+        assert_eq!(start["received"], 0);
+        assert_eq!(start["pct"], 0);
+
+        std::fs::write(&path, vec![0u8; 50]).unwrap();
+        let halfway = loop {
+            let payload = rx.recv_timeout(Duration::from_millis(250)).unwrap();
+            if payload["received"] == 50 {
+                break payload;
+            }
+        };
+        assert_eq!(halfway["pct"], 50);
+
+        std::fs::write(&path, vec![0u8; 100]).unwrap();
+        let complete = loop {
+            let payload = rx.recv_timeout(Duration::from_millis(250)).unwrap();
+            if payload["received"] == 100 {
+                break payload;
+            }
+        };
+        assert_eq!(complete["pct"], 100);
+
+        observer.stop();
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn progress_observer_stop_is_bounded_when_emission_stalls() {
+        let path = env::temp_dir().join(format!(
+            "echoless-nvafx-progress-stall-{}-{}.part",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&path, []).unwrap();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let observer = spawn_download_progress_observer(
+            path.clone(),
+            "common runtime".to_string(),
+            Some(100),
+            Duration::from_millis(5),
+            Duration::from_millis(20),
+            move |_, _, _| {
+                let _ = entered_tx.send(());
+                let _ = release_rx.recv();
+            },
+        );
+        entered_rx.recv_timeout(Duration::from_millis(250)).unwrap();
+
+        let started = std::time::Instant::now();
+        observer.stop();
+        assert!(started.elapsed() < Duration::from_millis(250));
+
+        let _ = release_tx.send(());
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn committing_download_stops_observer_before_partial_file_disappears() {
+        let base = env::temp_dir().join(format!(
+            "echoless-nvafx-progress-commit-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let partial = base.with_extension("zip.part");
+        let destination = base.with_extension("zip");
+        std::fs::write(&partial, vec![0u8; 100]).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let observer = spawn_download_progress_observer(
+            partial.clone(),
+            "common runtime".to_string(),
+            Some(100),
+            Duration::from_millis(5),
+            Duration::from_millis(50),
+            move |_, received, _| {
+                let _ = tx.send(received);
+            },
+        );
+        assert_eq!(rx.recv_timeout(Duration::from_millis(250)).unwrap(), 100);
+
+        commit_downloaded_file(&partial, &destination, Some(observer)).unwrap();
+
+        assert!(rx.try_iter().all(|received| received != 0));
+        assert!(!partial.exists());
+        assert_eq!(std::fs::metadata(&destination).unwrap().len(), 100);
+        std::fs::remove_file(destination).unwrap();
     }
 
     #[test]
@@ -1027,7 +1364,10 @@ mod tests {
         )
         .unwrap_err()
         .to_string();
-        assert!(err.contains("SHA256SUMS.txt 与内置 pin 不一致"), "{err}");
+        assert!(
+            err.contains("SHA256SUMS.txt does not match the built-in pin"),
+            "{err}"
+        );
 
         sums.insert(
             NVAFX_COMMON_RUNTIME_ASSET.to_string(),
@@ -1102,16 +1442,47 @@ mod tests {
                 .as_nanos()
         ));
         let runtime = root.join("runtime");
+        let sentinel = root.join("outside-sentinel.txt");
         let staging = unique_install_staging_dir(&runtime).unwrap();
         std::fs::create_dir_all(&runtime).unwrap();
         std::fs::write(runtime.join("old.txt"), b"old").unwrap();
         std::fs::write(staging.join("new.txt"), b"new").unwrap();
+        std::fs::write(&sentinel, b"keep").unwrap();
 
         replace_dir_with_staging(&runtime, &staging).unwrap();
 
         assert!(!staging.exists());
         assert!(!runtime.join("old.txt").exists());
         assert_eq!(std::fs::read(runtime.join("new.txt")).unwrap(), b"new");
+        assert_eq!(std::fs::read(&sentinel).unwrap(), b"keep");
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn replace_dir_with_staging_rolls_back_without_touching_sibling() {
+        let root = env::temp_dir().join(format!(
+            "echoless-nvafx-rollback-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let runtime = root.join("runtime");
+        let sentinel = root.join("outside-sentinel.txt");
+        let missing_staging = root.join("missing-staging");
+        std::fs::create_dir_all(&runtime).unwrap();
+        std::fs::write(runtime.join("old.txt"), b"old").unwrap();
+        std::fs::write(&sentinel, b"keep").unwrap();
+
+        let error = replace_dir_with_staging(&runtime, &missing_staging).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("failed to commit runtime staging"));
+        assert_eq!(std::fs::read(runtime.join("old.txt")).unwrap(), b"old");
+        assert_eq!(std::fs::read(&sentinel).unwrap(), b"keep");
 
         let _ = std::fs::remove_dir_all(root);
     }

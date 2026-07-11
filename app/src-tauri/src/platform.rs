@@ -33,16 +33,22 @@ pub(crate) fn write_toml_create_new(path: &Path, toml_text: &str) -> Result<(), 
         .write(true)
         .create_new(true)
         .open(path)
-        .map_err(|e| format!("创建配置文件失败: {}: {e}", path.display()))?;
+        .map_err(|e| format!("failed to create config file {}: {e}", path.display()))?;
     if let Err(err) = file.write_all(toml_text.as_bytes()) {
         drop(file);
         cleanup_run_config(path);
-        return Err(format!("写入配置文件失败: {}: {err}", path.display()));
+        return Err(format!(
+            "failed to write config file {}: {err}",
+            path.display()
+        ));
     }
     if let Err(err) = file.flush() {
         drop(file);
         cleanup_run_config(path);
-        return Err(format!("刷新配置文件失败: {}: {err}", path.display()));
+        return Err(format!(
+            "failed to flush config file {}: {err}",
+            path.display()
+        ));
     }
     Ok(())
 }
@@ -64,7 +70,7 @@ pub(crate) fn write_transient_config_toml(
             Err(err) => return Err(err),
         }
     }
-    Err("无法创建唯一配置文件".to_string())
+    Err("failed to create a unique config file".to_string())
 }
 
 pub(crate) fn cleanup_run_config(path: &Path) {
@@ -90,13 +96,13 @@ pub(crate) fn open_url(url: String) -> Result<(), String> {
 pub(crate) fn validate_browser_url(url: &str) -> Result<String, String> {
     let trimmed = url.trim();
     if trimmed.is_empty() {
-        return Err("URL 不能为空".to_string());
+        return Err("URL must not be empty".to_string());
     }
     if trimmed
         .chars()
         .any(|ch| ch.is_control() || ch.is_whitespace())
     {
-        return Err("URL 不能包含空白或控制字符".to_string());
+        return Err("URL must not contain whitespace or control characters".to_string());
     }
     // 系统设置深链只允许跳到隐私面板;不要把整个 scheme 当作通用白名单。
     // 放行两种:隐私根面板 `?Privacy`(系统录音无稳定锚点,只能回退根面板),
@@ -107,40 +113,27 @@ pub(crate) fn validate_browser_url(url: &str) -> Result<String, String> {
         if trimmed == PRIVACY_ROOT || trimmed.starts_with(&format!("{PRIVACY_ROOT}_")) {
             return Ok(trimmed.to_string());
         }
-        return Err("仅允许打开系统隐私设置面板".to_string());
+        return Err("only the system privacy settings pane is allowed".to_string());
     }
-    if !trimmed.starts_with("https://") {
-        return Err("仅允许打开 https URL".to_string());
+    let parsed = tauri::Url::parse(trimmed).map_err(|_| "URL is not valid".to_string())?;
+    if parsed.scheme() != "https" {
+        return Err("only https URLs are allowed".to_string());
     }
-
-    let host = https_url_host(trimmed).ok_or_else(|| "URL 缺少主机名".to_string())?;
-    if !is_allowed_browser_host(&host) {
-        return Err("URL 主机不在允许列表".to_string());
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err("URL credentials are not allowed".to_string());
     }
-
-    Ok(trimmed.to_string())
-}
-
-fn https_url_host(url: &str) -> Option<String> {
-    let rest = url.strip_prefix("https://")?;
-    let host_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
-    if host_end == 0 {
-        return None;
+    if parsed.port().is_some_and(|port| port != 443) {
+        return Err("only the default HTTPS port is allowed".to_string());
     }
-    let host_port = &rest[..host_end];
-    let host = host_port
-        .rsplit_once('@')
-        .map(|(_, host)| host)
-        .unwrap_or(host_port);
-    let host = host
-        .split_once(':')
-        .map(|(host, _)| host)
-        .unwrap_or(host)
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| "URL is missing a host".to_string())?
         .trim_end_matches('.');
-    if host.is_empty() {
-        return None;
+    if !is_allowed_browser_host(host) {
+        return Err("URL host is not in the allow list".to_string());
     }
-    Some(host.to_ascii_lowercase())
+
+    Ok(parsed.into())
 }
 
 fn is_allowed_browser_host(host: &str) -> bool {
@@ -174,8 +167,27 @@ pub(crate) fn browser_open_command(url: &str) -> (&'static str, Vec<String>) {
 /// 诊断录制默认目录(绝对路径,session-* 会写在其下)。
 #[tauri::command]
 pub(crate) fn default_diag_dir() -> String {
-    let (base, _) = echoless_paths::brand_data_root();
-    base.join("diagnostics").to_string_lossy().to_string()
+    echoless_paths::diagnostics_dir()
+        .to_string_lossy()
+        .to_string()
+}
+
+/// 在系统文件管理器里打开固定诊断录制目录。
+#[tauri::command]
+pub(crate) fn open_diagnostics_dir() -> Result<(), String> {
+    let path = ensure_diagnostics_dir()?;
+    open_path(path.to_string_lossy().to_string())
+}
+
+pub(crate) fn ensure_diagnostics_dir() -> Result<PathBuf, String> {
+    let path = echoless_paths::diagnostics_dir();
+    std::fs::create_dir_all(&path).map_err(|e| {
+        format!(
+            "failed to create diagnostics directory {}: {e}",
+            path.display()
+        )
+    })?;
+    Ok(path)
 }
 
 /// 在系统文件管理器里打开目录。
@@ -199,9 +211,9 @@ pub(crate) fn validate_open_path(path: &str) -> Result<PathBuf, String> {
     let p = Path::new(path);
     let canonical = p
         .canonicalize()
-        .map_err(|e| format!("目录不存在或不可访问: {e}"))?;
+        .map_err(|e| format!("directory does not exist or is not accessible: {e}"))?;
     if !canonical.is_dir() {
-        return Err("只能打开目录".to_string());
+        return Err("only directories can be opened".to_string());
     }
     let allowed_roots = allowed_open_path_roots();
     if allowed_roots
@@ -210,7 +222,7 @@ pub(crate) fn validate_open_path(path: &str) -> Result<PathBuf, String> {
     {
         return Ok(canonical);
     }
-    Err("目录不在 Echoless 允许范围内".to_string())
+    Err("directory is outside the Echoless allowed scope".to_string())
 }
 
 fn allowed_open_path_roots() -> Vec<PathBuf> {

@@ -1,5 +1,3 @@
-use std::path::Path;
-
 use anyhow::{bail, Result};
 use clap::{Args, Subcommand};
 use serde_json::json;
@@ -8,7 +6,7 @@ use echoless_core::{
     PipelineConfig, ReferenceChannels, MAX_INITIAL_DELAY_MS, MAX_NEAR_DELAY_MS, MAX_OUTPUT_LEVEL,
     MIN_OUTPUT_LEVEL,
 };
-use echoless_processors::{registry, NodeConfig};
+use echoless_processors::{aec3::MIN_TAIL_MS, registry, NodeConfig};
 
 #[derive(Args)]
 pub(crate) struct ConfigArgs {
@@ -18,16 +16,16 @@ pub(crate) struct ConfigArgs {
 
 #[derive(Subcommand)]
 enum ConfigCmd {
-    /// 校验管线 TOML 配置
+    /// Validate the pipeline TOML config
     Validate(ConfigValidateArgs),
 }
 
 #[derive(Args)]
 struct ConfigValidateArgs {
-    /// 管线 TOML 配置
+    /// Pipeline TOML config
     #[arg(long)]
     config: String,
-    /// 输出结构化 JSON 结果
+    /// Emit a structured JSON result
     #[arg(long)]
     json: bool,
 }
@@ -43,7 +41,7 @@ fn cmd_config_validate(args: ConfigValidateArgs) -> Result<()> {
     if args.json {
         println!("{}", serde_json::to_string_pretty(&report.to_json())?);
     } else if report.ok {
-        println!("配置校验通过: {}", args.config);
+        println!("config validation passed: {}", args.config);
     } else {
         for error in &report.errors {
             eprintln!("{}: {}", error.path, error.message);
@@ -53,7 +51,7 @@ fn cmd_config_validate(args: ConfigValidateArgs) -> Result<()> {
     if report.ok {
         Ok(())
     } else {
-        bail!("配置校验失败: {} 个问题", report.errors.len())
+        bail!("config validation failed: {} issues", report.errors.len())
     }
 }
 
@@ -107,7 +105,7 @@ fn validate_config_file(path: &str) -> ConfigValidationReport {
         Err(err) => {
             return ConfigValidationReport::new(vec![ConfigValidationError::new(
                 "config",
-                format!("读取配置失败: {err}"),
+                format!("failed to read config: {err}"),
             )])
         }
     };
@@ -116,7 +114,7 @@ fn validate_config_file(path: &str) -> ConfigValidationReport {
         Err(err) => {
             return ConfigValidationReport::new(vec![ConfigValidationError::new(
                 "config",
-                format!("解析 TOML 失败: {err}"),
+                format!("failed to parse TOML: {err}"),
             )])
         }
     };
@@ -129,7 +127,7 @@ fn validate_config_file(path: &str) -> ConfigValidationReport {
         Err(err) => {
             return ConfigValidationReport::new(vec![ConfigValidationError::new(
                 "config",
-                format!("解析配置失败: {err}"),
+                format!("failed to deserialize config: {err}"),
             )])
         }
     };
@@ -199,7 +197,7 @@ fn validate_config_shape(value: &toml::Value) -> Vec<ConfigValidationError> {
     }
     if let Some(value) = table.get("diagnostics") {
         if let Some(diagnostics) = value.as_table() {
-            expect_top_string(diagnostics, "diagnostics.record_dir", &mut errors);
+            expect_bool(diagnostics, "diagnostics", "enabled", &mut errors);
             expect_top_i64(diagnostics, "diagnostics.max_seconds", &mut errors);
         } else {
             errors.push(ConfigValidationError::new(
@@ -302,17 +300,6 @@ pub(crate) fn validate_pipeline_config(cfg: &PipelineConfig) -> Vec<ConfigValida
             format!("output_level must be <= {MAX_OUTPUT_LEVEL}"),
         ));
     }
-    if cfg
-        .diagnostics
-        .record_dir
-        .as_deref()
-        .is_some_and(|value| value.trim().is_empty())
-    {
-        errors.push(ConfigValidationError::new(
-            "diagnostics.record_dir",
-            "record_dir must not be empty",
-        ));
-    }
     if matches!(cfg.diagnostics.max_seconds, Some(0)) {
         errors.push(ConfigValidationError::new(
             "diagnostics.max_seconds",
@@ -370,7 +357,7 @@ fn validate_aec3_node(base: &str, params: &toml::Table, errors: &mut Vec<ConfigV
         i64::from(MAX_INITIAL_DELAY_MS),
         errors,
     );
-    expect_i64_min(params, base, "tail_ms", 4, errors);
+    expect_i64_min(params, base, "tail_ms", i64::from(MIN_TAIL_MS), errors);
     expect_i64_min(params, base, "delay_num_filters", 1, errors);
     expect_string_one_of(
         params,
@@ -447,7 +434,6 @@ fn validate_nvafx_node(
             "nvidia_afx_aec requires mono reference",
         ));
     }
-    expect_optional_nonempty_string(params, base, "runtime_dir", errors);
     expect_optional_nonempty_string(params, base, "model_path", errors);
     expect_finite_number_min(params, base, "intensity_ratio", 0.0, errors);
     expect_bool(params, base, "use_default_gpu", errors);
@@ -459,13 +445,7 @@ fn validate_nvafx_node(
         &["silence", "bypass"],
         errors,
     );
-    let runtime_dir = params
-        .get("runtime_dir")
-        .and_then(toml::Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty() && !value.eq_ignore_ascii_case("auto"))
-        .map(Path::new);
-    match echoless_processors::nvafx::doctor_report(runtime_dir) {
+    match echoless_processors::nvafx::doctor_report() {
         Ok(report) if report.ok() => {}
         Ok(report) => {
             let detail = report
@@ -699,6 +679,27 @@ mod tests {
     }
 
     #[test]
+    fn aec3_tail_validation_matches_the_runtime_boundary() {
+        let mut params = toml::Table::new();
+        params.insert(
+            "tail_ms".into(),
+            toml::Value::Integer(i64::from(MIN_TAIL_MS - 1)),
+        );
+        let mut errors = Vec::new();
+        validate_aec3_node("chain[0]", &params, &mut errors);
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].path, "chain[0].tail_ms");
+
+        params.insert(
+            "tail_ms".into(),
+            toml::Value::Integer(i64::from(MIN_TAIL_MS)),
+        );
+        errors.clear();
+        validate_aec3_node("chain[0]", &params, &mut errors);
+        assert!(errors.is_empty(), "{errors:?}");
+    }
+
+    #[test]
     fn config_deserialization_defaults_device_fields() {
         let cfg: PipelineConfig = toml::from_str(
             r#"
@@ -729,6 +730,22 @@ mod tests {
         .unwrap();
 
         assert!(cfg.bypass);
+    }
+
+    #[test]
+    fn config_shape_validation_reports_non_boolean_diagnostics_enabled() {
+        let value: toml::Value = toml::from_str(
+            r#"
+            [diagnostics]
+            enabled = "yes"
+            "#,
+        )
+        .unwrap();
+
+        let errors = validate_config_shape(&value);
+
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].path, "diagnostics.enabled");
     }
 
     #[test]

@@ -36,9 +36,11 @@ fn default_reference_channels() -> ReferenceChannels {
 }
 pub fn default_near_delay_ms() -> u32 {
     if cfg!(target_os = "macos") {
+        // macOS Process Tap 的参考常晚到(负 lag);近端延迟做常开负方向搜索偏置。
         25
     } else {
-        20
+        // Windows/Linux 参考先到(正 lag),AEC3 自搜即可;近端延迟默认不设。
+        0
     }
 }
 fn default_mic() -> String {
@@ -55,6 +57,9 @@ pub fn default_output_level() -> u32 {
 }
 pub fn default_bypass() -> bool {
     false
+}
+pub fn default_output_rate_match() -> bool {
+    true
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -83,12 +88,19 @@ impl ReferenceChannels {
 /// Diagnostic capture settings for realtime evidence collection.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct DiagnosticsConfig {
-    /// Directory where timestamped diagnostic sessions are written.
+    /// Whether diagnostics recording starts with the realtime pipeline.
     #[serde(default)]
-    pub record_dir: Option<String>,
-    /// Optional maximum recording duration. None means record until stop.
+    pub enabled: bool,
+    /// Optional maximum recording duration. None means record until stop when enabled.
     #[serde(default)]
     pub max_seconds: Option<u32>,
+}
+
+impl DiagnosticsConfig {
+    /// Report whether diagnostics recording starts with the realtime pipeline.
+    pub fn recording_enabled(&self) -> bool {
+        self.enabled
+    }
 }
 
 /// 整条管线配置(设备选择 + 处理链)。TOML/JSON 都映射到它。
@@ -118,6 +130,12 @@ pub struct PipelineConfig {
     /// Start realtime run in mic passthrough mode; processors may stay warm in realtime.
     #[serde(default = "default_bypass")]
     pub bypass: bool,
+    /// Adaptive output/reference rate matching (T3): track the output-ring water
+    /// level and trim the resampling ratio (±3%) so the mic-clock producer stays
+    /// aligned with the device consumer clock. Disable to fall back to fixed-ratio
+    /// passthrough (pre-T3 behaviour).
+    #[serde(default = "default_output_rate_match")]
+    pub output_rate_match: bool,
     /// Optional realtime diagnostic recordings.
     #[serde(default)]
     pub diagnostics: DiagnosticsConfig,
@@ -138,6 +156,7 @@ impl Default for PipelineConfig {
             near_delay_ms: default_near_delay_ms(),
             output_level: default_output_level(),
             bypass: default_bypass(),
+            output_rate_match: default_output_rate_match(),
             diagnostics: DiagnosticsConfig::default(),
             chain: Vec::new(),
         }
@@ -339,6 +358,42 @@ mod tests {
             (a - b).abs() <= epsilon,
             "expected {a} to be within {epsilon} of {b}"
         );
+    }
+
+    #[test]
+    fn diagnostics_recording_is_independent_of_the_optional_time_cap() {
+        assert!(!DiagnosticsConfig::default().recording_enabled());
+        assert!(DiagnosticsConfig {
+            enabled: true,
+            max_seconds: None,
+        }
+        .recording_enabled());
+        assert!(!DiagnosticsConfig {
+            enabled: false,
+            max_seconds: Some(30),
+        }
+        .recording_enabled());
+
+        let unbounded: PipelineConfig = toml::from_str(
+            r#"
+            [diagnostics]
+            enabled = true
+            "#,
+        )
+        .unwrap();
+        assert!(unbounded.diagnostics.recording_enabled());
+        assert_eq!(unbounded.diagnostics.max_seconds, None);
+
+        let bounded: PipelineConfig = toml::from_str(
+            r#"
+            [diagnostics]
+            enabled = true
+            max_seconds = 30
+            "#,
+        )
+        .unwrap();
+        assert!(bounded.diagnostics.recording_enabled());
+        assert_eq!(bounded.diagnostics.max_seconds, Some(30));
     }
 
     #[test]

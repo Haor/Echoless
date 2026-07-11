@@ -13,7 +13,7 @@ pub(crate) fn cmd_run(a: RunArgs) -> Result<()> {
     validate_nvafx_constraints(&cfg)?;
     let opts = runtime_options_from_args(&a)?;
     let run_config = format!(
-        "实时运行配置: mic={} ref={} out={}",
+        "realtime run config: mic={} ref={} out={}",
         cfg.mic, cfg.reference, cfg.output
     );
     if opts.status_json {
@@ -26,7 +26,9 @@ pub(crate) fn cmd_run(a: RunArgs) -> Result<()> {
 
 #[cfg(not(feature = "realtime"))]
 pub(crate) fn cmd_run(_a: RunArgs) -> Result<()> {
-    anyhow::bail!("实时管线需 realtime 特性(cpal);当前构建未启用")
+    anyhow::bail!(
+        "realtime pipeline requires the realtime feature (cpal); current build has it disabled"
+    )
 }
 
 #[cfg_attr(not(feature = "realtime"), allow(dead_code))]
@@ -79,7 +81,7 @@ fn apply_run_overrides(mut cfg: PipelineConfig, a: &RunArgs) -> Result<PipelineC
     apply_reference_channels_to_chain(&mut cfg.chain, cfg.reference_channels);
 
     if a.ns && a.no_ns {
-        bail!("--ns 与 --no-ns 不能同时使用");
+        bail!("--ns and --no-ns cannot be used together");
     }
     if a.ns {
         set_aec3_param(&mut cfg.chain, "ns", toml::Value::Boolean(true))?;
@@ -102,16 +104,15 @@ fn apply_run_overrides(mut cfg: PipelineConfig, a: &RunArgs) -> Result<PipelineC
             toml::Value::Integer(tail_ms.into()),
         )?;
     }
-    if let Some(dir) = &a.diagnostic_dir {
-        if dir.trim().is_empty() {
-            bail!("--diagnostic-dir 不能为空");
-        }
-        cfg.diagnostics.record_dir = Some(dir.clone());
+    if a.diagnostics {
+        cfg.diagnostics.enabled = true;
+        cfg.diagnostics.max_seconds = None;
     }
     if let Some(seconds) = a.diagnostic_seconds {
         if seconds == 0 {
-            bail!("--diagnostic-seconds 必须大于 0");
+            bail!("--diagnostic-seconds must be greater than 0");
         }
+        cfg.diagnostics.enabled = true;
         cfg.diagnostics.max_seconds = Some(seconds);
     }
 
@@ -124,7 +125,7 @@ fn set_aec3_param(nodes: &mut [NodeConfig], key: &str, value: toml::Value) -> Re
         .iter_mut()
         .find(|node| echoless_processors::registry::canonical_kind(&node.kind) == "aec3")
     else {
-        bail!("{key} 需要配置中存在 aec3 节点,或使用 --processor aec3");
+        bail!("{key} requires an aec3 node in the config, or use --processor aec3");
     };
     node.params.insert(key.to_string(), value);
     Ok(())
@@ -133,7 +134,7 @@ fn set_aec3_param(nodes: &mut [NodeConfig], key: &str, value: toml::Value) -> Re
 #[cfg(feature = "realtime")]
 fn runtime_options_from_args(a: &RunArgs) -> Result<realtime::RuntimeOptions> {
     if matches!(a.stats_interval_ms, Some(0)) {
-        bail!("--stats-interval-ms 必须大于 0");
+        bail!("--stats-interval-ms must be greater than 0");
     }
     Ok(realtime::RuntimeOptions {
         stats_interval_ms: a
@@ -166,7 +167,7 @@ mod tests {
             verbose: false,
             stats_interval_ms: None,
             status_json: false,
-            diagnostic_dir: None,
+            diagnostics: false,
             diagnostic_seconds: None,
         }
     }
@@ -211,15 +212,28 @@ mod tests {
     }
 
     #[test]
-    fn run_overrides_apply_diagnostics() {
+    fn run_overrides_enable_fixed_diagnostics_with_a_duration() {
         let mut args = run_args();
-        args.diagnostic_dir = Some("diag".into());
         args.diagnostic_seconds = Some(30);
 
         let cfg = apply_run_overrides(PipelineConfig::default(), &args).unwrap();
 
-        assert_eq!(cfg.diagnostics.record_dir.as_deref(), Some("diag"));
+        assert!(cfg.diagnostics.recording_enabled());
         assert_eq!(cfg.diagnostics.max_seconds, Some(30));
+    }
+
+    #[test]
+    fn run_overrides_enable_unbounded_fixed_diagnostics() {
+        let mut args = run_args();
+        args.diagnostics = true;
+        let mut base = PipelineConfig::default();
+        base.diagnostics.enabled = true;
+        base.diagnostics.max_seconds = Some(30);
+
+        let cfg = apply_run_overrides(base, &args).unwrap();
+
+        assert!(cfg.diagnostics.recording_enabled());
+        assert_eq!(cfg.diagnostics.max_seconds, None);
     }
 
     #[test]
@@ -239,7 +253,7 @@ mod tests {
 
         let err = apply_run_overrides(PipelineConfig::default(), &args).unwrap_err();
 
-        assert!(err.to_string().contains("大于 0"));
+        assert!(err.to_string().contains("greater than 0"));
     }
 
     #[test]
@@ -274,6 +288,6 @@ mod tests {
 
         let err = runtime_options_from_args(&args).unwrap_err();
 
-        assert!(err.to_string().contains("大于 0"));
+        assert!(err.to_string().contains("greater than 0"));
     }
 }

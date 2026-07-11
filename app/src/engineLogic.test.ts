@@ -11,8 +11,81 @@ import {
   bypassToggleTarget,
   settleBypassObservation,
   clearBypassPending,
+  createRunIntentGuard,
   createSerialQueue,
+  routeEngineKindSelection,
+  shouldPickLocalvqeModel,
 } from "./engineLogic";
+
+describe("routeEngineKindSelection", () => {
+  it.each(["localvqe", "nvidia_afx_aec"])(
+    "keeps AEC3 active while unready %s setup stops the old run once",
+    (target) => {
+      const current = { current: "aec3" };
+      const aec3Params = { tail_ms: 52 };
+      const targetParams = { existing: target };
+      const paramsByKind: Record<string, Record<string, unknown>> = {
+        aec3: aec3Params,
+        [target]: targetParams,
+      };
+      let activeParams: Record<string, unknown> = aec3Params;
+      let running = true;
+      let stops = 0;
+      let applies = 0;
+      const setups: string[] = [];
+      const handlers = {
+        setup: (next: string) => {
+          if (running) {
+            running = false;
+            stops += 1;
+          }
+          setups.push(next);
+        },
+        apply: (previous: string, next: string) => {
+          paramsByKind[previous] = activeParams;
+          activeParams = paramsByKind[next];
+          applies += 1;
+        },
+      };
+
+      expect(
+        routeEngineKindSelection(current, target, false, handlers),
+      ).toBe("setup");
+      expect(
+        routeEngineKindSelection(current, target, false, handlers),
+      ).toBe("setup");
+
+      expect(current.current).toBe("aec3");
+      expect(activeParams).toBe(aec3Params);
+      expect(paramsByKind[target]).toBe(targetParams);
+      expect(stops).toBe(1);
+      expect(applies).toBe(0);
+      expect(setups).toEqual([target, target]);
+
+      expect(routeEngineKindSelection(current, target, true, handlers)).toBe(
+        "apply",
+      );
+      expect(routeEngineKindSelection(current, target, true, handlers)).toBe(
+        "noop",
+      );
+      expect(current.current).toBe(target);
+      expect(activeParams).toBe(targetParams);
+      expect(applies).toBe(1);
+    },
+  );
+});
+
+describe("shouldPickLocalvqeModel", () => {
+  it("rejects the selected path and accepts a different or first model", () => {
+    expect(shouldPickLocalvqeModel("/models/a.gguf", "/models/a.gguf")).toBe(
+      false,
+    );
+    expect(shouldPickLocalvqeModel("/models/a.gguf", "/models/b.gguf")).toBe(
+      true,
+    );
+    expect(shouldPickLocalvqeModel(undefined, "/models/a.gguf")).toBe(true);
+  });
+});
 
 describe("LocalVQE NOISE ↔ model mapping", () => {
   it("NOISE on 选 v1.3(AEC+降噪),off 选 v1.4(纯 AEC)", () => {
@@ -115,6 +188,29 @@ describe("bypass pending state", () => {
     expect(
       clearBypassPending({ bypassed: false, bypassPending: true }, true),
     ).toEqual({ bypassed: false, bypassPending: null });
+  });
+});
+
+describe("run intent guard", () => {
+  it("invalidates an in-flight restart as soon as stop becomes the terminal intent", () => {
+    const guard = createRunIntentGuard(true);
+    const applyIntent = guard.snapshot();
+
+    expect(guard.allowsStart(applyIntent)).toBe(true);
+    guard.request(false);
+
+    expect(guard.wantsRun()).toBe(false);
+    expect(guard.allowsStart(applyIntent)).toBe(false);
+  });
+
+  it("requires a fresh generation before a later explicit start", () => {
+    const guard = createRunIntentGuard(true);
+    const staleApply = guard.snapshot();
+    guard.request(false);
+    const explicitStart = guard.request(true);
+
+    expect(guard.allowsStart(staleApply)).toBe(false);
+    expect(guard.allowsStart(explicitStart)).toBe(true);
   });
 });
 

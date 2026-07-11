@@ -8,6 +8,7 @@ import type {
   Platform,
   ProcessorManifest,
   RunEvent,
+  RunExitEvent,
   ValidateResult,
 } from "./types";
 import {
@@ -80,8 +81,9 @@ export function downloadLocalvqeModel(filename: string): Promise<string> {
   return invoke<string>("download_localvqe_model", { filename });
 }
 
-// 主动近端延迟侦测 / AEC 链路诊断。后端 shell `echoless probe-delay --json`,约 15 秒,
-// 会外放一串蜂鸣 —— 调用前必须先停掉主 run。字段以 CLI `probe-delay --json` 实测为准(docs/CLI.md)。
+// 主动近端延迟侦测 / AEC 链路诊断。后端 shell `echoless probe-delay --json`,通常约 15 秒;
+// 首次 macOS 权限/Process Tap 启动可能更久。会外放一串蜂鸣 —— 调用前必须先停掉主 run。
+// 字段以 CLI `probe-delay --json` 实测为准(docs/CLI.md)。
 export interface NearDelayProbeResult {
   session_dir: string;
   session_retained: boolean;
@@ -110,30 +112,24 @@ export function probeDelay(p: {
   });
 }
 
-export function nvafxDoctor(runtimeDir?: string): Promise<NvafxDoctor> {
-  return invoke<NvafxDoctor>("nvafx_doctor", { runtimeDir: runtimeDir ?? null });
+export function nvafxDoctor(): Promise<NvafxDoctor> {
+  return invoke<NvafxDoctor>("nvafx_doctor");
 }
 
 // RTX AEC runtime 安装:解压 common + 按架构 model zip,回传安装后的 doctor 报告。
 export function nvafxInstall(p: {
   commonZip: string;
   modelZip: string;
-  runtimeDir?: string;
 }): Promise<NvafxDoctor> {
   return invoke<NvafxDoctor>("nvafx_install", {
     commonZip: p.commonZip,
     modelZip: p.modelZip,
-    runtimeDir: p.runtimeDir ?? null,
   });
 }
 
 // 从公共 GitHub release 下载 + 安装(后端按 GPU 架构自动选模型)。回传安装后 doctor。
-export function nvafxDownloadInstall(p: {
-  runtimeDir?: string;
-}): Promise<NvafxDoctor> {
-  return invoke<NvafxDoctor>("nvafx_download_install", {
-    runtimeDir: p.runtimeDir ?? null,
-  });
+export function nvafxDownloadInstall(): Promise<NvafxDoctor> {
+  return invoke<NvafxDoctor>("nvafx_download_install");
 }
 
 export function openUrl(url: string): Promise<void> {
@@ -144,8 +140,21 @@ export function defaultDiagDir(): Promise<string> {
   return invoke<string>("default_diag_dir");
 }
 
+export function openDiagnosticsDir(): Promise<void> {
+  return invoke<void>("open_diagnostics_dir");
+}
+
 export function openPath(path: string): Promise<void> {
   return invoke<void>("open_path", { path });
+}
+
+// 前端错误落盘(logs/echoless-*.log):ErrorBoundary / window.onerror /
+// unhandledrejection 汇入,用户报障直接发日志文件。fire-and-forget,绝不 throw。
+export function frontendLog(
+  level: "error" | "warn" | "info",
+  message: string,
+): void {
+  invoke<void>("frontend_log", { level, message }).catch(() => {});
 }
 
 export function validateConfig(tomlText: string): Promise<ValidateResult> {
@@ -155,23 +164,20 @@ export function validateConfig(tomlText: string): Promise<ValidateResult> {
 export function startRun(
   tomlText: string,
   statsIntervalMs = 80,
-): Promise<void> {
-  return invoke<void>("start_run", { tomlText, statsIntervalMs });
+): Promise<number> {
+  return invoke<number>("start_run", { tomlText, statsIntervalMs });
 }
 
-export function stopRun(): Promise<void> {
-  return invoke<void>("stop_run");
+export function stopRun(): Promise<number | null> {
+  return invoke<number | null>("stop_run");
 }
 
 // 向运行中的子进程 stdin 写一行 JSON 控制命令。具体能力以 started.supported_controls 为准。
 function sendRunControl(line: string): Promise<void> {
   return invoke<void>("send_run_control", { line });
 }
-export function startDiagnostics(
-  recordDir: string,
-  maxSeconds: number | null,
-): Promise<void> {
-  return sendRunControl(startDiagnosticsControlLine(recordDir, maxSeconds));
+export function startDiagnostics(maxSeconds: number | null): Promise<void> {
+  return sendRunControl(startDiagnosticsControlLine(maxSeconds));
 }
 export function stopDiagnostics(): Promise<void> {
   return sendRunControl(stopDiagnosticsControlLine());
@@ -217,11 +223,9 @@ export function onRunEvent(cb: (e: RunEvent) => void): Promise<UnlistenFn> {
   return listen<RunEvent>("echoless://status", (e) => cb(e.payload));
 }
 export function onRunExit(
-  cb: (e: { intentional?: boolean }) => void,
+  cb: (e: RunExitEvent) => void,
 ): Promise<UnlistenFn> {
-  return listen<{ intentional?: boolean }>("echoless://exit", (e) =>
-    cb(e.payload ?? {}),
-  );
+  return listen<RunExitEvent>("echoless://exit", (e) => cb(e.payload));
 }
 export function onRunLog(cb: (line: string) => void): Promise<UnlistenFn> {
   return listen<string>("echoless://log", (e) => cb(e.payload));
@@ -248,6 +252,38 @@ export function onProbeProgress(
   );
 }
 
+// LocalVQE 模型下载进度:后端 poller 线程轮询 .part 字节数 / pin.size。
+export interface LocalvqeProgress {
+  filename: string;
+  pct: number;
+  received: number;
+  total: number;
+}
+export function onLocalvqeProgress(
+  cb: (p: LocalvqeProgress) => void,
+): Promise<UnlistenFn> {
+  return listen<LocalvqeProgress>("echoless://localvqe-progress", (e) =>
+    cb(e.payload),
+  );
+}
+
+// NVAFX 下载进度:CLI download-install 在 stderr 打的 nvafx_download_progress JSONL。
+// 默认固定资产使用内置 total/pct;自定义 tag 无内置大小时退化为已接收字节。
+export interface NvafxProgress {
+  event?: string;
+  label: string;
+  pct: number | null;
+  received: number;
+  total: number;
+}
+export function onNvafxProgress(
+  cb: (p: NvafxProgress) => void,
+): Promise<UnlistenFn> {
+  return listen<NvafxProgress>("echoless://nvafx-progress", (e) =>
+    cb(e.payload),
+  );
+}
+
 // ---- 配置生成:把 UI 选择拼成后端 PipelineConfig(TOML) ----
 export interface PipelineCfg {
   sample_rate: number;
@@ -267,7 +303,6 @@ export function outputLevelToGain(level: number): number {
   return Math.pow(v / OUTPUT_LEVEL_UNITY, OUTPUT_LEVEL_EXP);
 }
 export interface DiagnosticsCfg {
-  record_dir: string;
   max_seconds: number | null;
 }
 export interface ConfigChoice {
@@ -280,8 +315,42 @@ export interface ConfigChoice {
   diagnostics?: DiagnosticsCfg | null; // 开启录制时写入 [diagnostics]
 }
 
-function tomlString(v: string): string {
-  return `"${v.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
+export function tomlString(v: string): string {
+  let escaped = "";
+  for (const char of v) {
+    switch (char) {
+      case "\\":
+        escaped += "\\\\";
+        break;
+      case '"':
+        escaped += '\\"';
+        break;
+      case "\b":
+        escaped += "\\b";
+        break;
+      case "\t":
+        escaped += "\\t";
+        break;
+      case "\n":
+        escaped += "\\n";
+        break;
+      case "\f":
+        escaped += "\\f";
+        break;
+      case "\r":
+        escaped += "\\r";
+        break;
+      default: {
+        const codePoint = char.codePointAt(0)!;
+        if (codePoint <= 0x1f || codePoint === 0x7f) {
+          escaped += `\\u${codePoint.toString(16).toUpperCase().padStart(4, "0")}`;
+        } else {
+          escaped += char;
+        }
+      }
+    }
+  }
+  return `"${escaped}"`;
 }
 
 function tomlValue(v: unknown): string | null {
@@ -308,7 +377,7 @@ export function buildConfigToml(c: ConfigChoice): string {
   lines.push(``);
   if (c.diagnostics) {
     lines.push(`[diagnostics]`);
-    lines.push(`record_dir = ${tomlString(c.diagnostics.record_dir)}`);
+    lines.push(`enabled = true`);
     if (c.diagnostics.max_seconds != null)
       lines.push(`max_seconds = ${c.diagnostics.max_seconds}`);
     lines.push(``);
@@ -316,6 +385,7 @@ export function buildConfigToml(c: ConfigChoice): string {
   lines.push(`[[chain]]`, `kind = ${tomlString(c.kind)}`);
   for (const [k, raw] of Object.entries(c.params)) {
     if (k === "reference_channels") continue; // 顶层管线项,不重复
+    if (c.kind === "nvidia_afx_aec" && k === "runtime_dir") continue;
     const val = tomlValue(raw);
     if (val !== null) lines.push(`${k} = ${val}`);
   }

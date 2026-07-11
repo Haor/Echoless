@@ -9,7 +9,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::dsp::{rms_dbfs_from_sum_squares as rms_dbfs, sum_squares};
 use anyhow::{bail, Context, Result};
-use echoless_core::{output_level_gain_db, DiagnosticsConfig};
+use echoless_core::output_level_gain_db;
 use echoless_processors::ProcessorStats;
 use hound::{WavSpec, WavWriter};
 use serde_json::json;
@@ -18,7 +18,8 @@ use super::print_human;
 use super::stats::{
     aggregate_aec3_delay_blocks, aggregate_diverged, aggregate_estimated_delay_ms,
     aggregate_last_error, aggregate_process_time_ms, aggregate_runtime_errors,
-    estimate_user_latency_ms, input_queue_latency_ms, output_queue_latency_ms, StatsSample,
+    estimate_user_latency_ms, input_queue_latency_ms, output_queue_latency_ms, ref_pace_loss,
+    ClockSkewDirection, ClockSkewSnapshot, StatsSample,
 };
 
 const DIAGNOSTIC_QUEUE_FRAMES: usize = 128;
@@ -215,7 +216,8 @@ pub(super) struct DiagnosticRecorder {
 }
 
 pub(super) struct DiagnosticRecorderConfig<'a> {
-    pub(super) cfg: &'a DiagnosticsConfig,
+    pub(super) enabled: bool,
+    pub(super) max_seconds: Option<u32>,
     pub(super) sample_rate: u32,
     pub(super) reference_channels: u16,
     pub(super) frame_ms: u32,
@@ -227,18 +229,20 @@ pub(super) struct DiagnosticRecorderConfig<'a> {
 
 impl DiagnosticRecorder {
     pub(super) fn new(config: DiagnosticRecorderConfig<'_>) -> Result<Option<Self>> {
-        let Some(record_dir) = config
-            .cfg
-            .record_dir
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-        else {
+        let base = echoless_paths::diagnostics_dir();
+        Self::new_in(config, &base)
+    }
+
+    fn new_in(config: DiagnosticRecorderConfig<'_>, base: &Path) -> Result<Option<Self>> {
+        if !config.enabled {
             return Ok(None);
-        };
-        let base = Path::new(record_dir);
-        create_dir_all(base)
-            .with_context(|| format!("创建诊断录制目录失败: {}", base.display()))?;
+        }
+        create_dir_all(base).with_context(|| {
+            format!(
+                "failed to create diagnostics recording directory: {}",
+                base.display()
+            )
+        })?;
         let dir = make_session_dir(base)?;
         let spec = WavSpec {
             channels: 1,
@@ -251,7 +255,6 @@ impl DiagnosticRecorder {
             ..spec
         };
         let max_frames = config
-            .cfg
             .max_seconds
             .map(|seconds| u64::from(seconds) * u64::from(config.sample_rate));
 
@@ -266,10 +269,9 @@ impl DiagnosticRecorder {
             node_stats: config.node_stats,
         })?;
         let stats_part_path = dir.join("stats.csv.part");
-        let mut stats = BufWriter::new(
-            File::create(&stats_part_path)
-                .with_context(|| format!("创建诊断 stats.csv 失败: {}", dir.display()))?,
-        );
+        let mut stats = BufWriter::new(File::create(&stats_part_path).with_context(|| {
+            format!("failed to create diagnostics stats.csv: {}", dir.display())
+        })?);
         writeln!(
             stats,
             "frame_index,frames,near_delay_ms,near_delay_buffered_samples,mic_dbfs,ref_dbfs,out_dbfs,mic_q,ref_q,out_q,input_queue_latency_ms,output_queue_latency_ms,estimated_user_latency_ms,aec_estimated_delay_ms,aec3_delay_blocks,mic_input_drops,ref_input_drops,input_drops,mic_stale_drops,ref_stale_drops,stale_drops,ref_underruns,output_overruns,output_underruns,node_process_time_ms,node_runtime_errors,node_diverged,node_last_error"
@@ -294,11 +296,18 @@ impl DiagnosticRecorder {
             ref_path: dir.join("ref.wav"),
             out_path: dir.join("out.wav"),
             stats_path: dir.join("stats.csv"),
+            summary_path: dir.join("summary.txt"),
             sample_rate: config.sample_rate,
             frame_ms: config.frame_ms,
             max_frames,
             written_frames: 0,
             frame_index: 0,
+            output_observed_frames: 0,
+            total_output_underruns: 0,
+            total_output_overruns: 0,
+            total_ref_input_drops: 0,
+            total_ref_stale_drops: 0,
+            total_ref_underruns: 0,
             human_to_stderr: config.status_json,
             status_json: config.status_json,
             status: status.clone(),
@@ -309,7 +318,7 @@ impl DiagnosticRecorder {
 
         print_human(
             config.status_json,
-            format!("诊断录制目录: {}", dir.display()),
+            format!("diagnostics recording directory: {}", dir.display()),
         );
         Ok(Some(Self {
             dir,
@@ -353,7 +362,7 @@ impl DiagnosticRecorder {
             }
             Err(TrySendError::Disconnected(_)) => {
                 self.status.set_recording(false);
-                bail!("诊断 writer 线程已退出")
+                bail!("diagnostics writer thread has exited")
             }
         }
     }
@@ -385,7 +394,7 @@ impl DiagnosticRecorder {
         }
         if let Some(writer) = self.writer.take() {
             if let Err(err) = writer.join() {
-                eprintln!("诊断 writer 线程退出异常: {err:?}");
+                eprintln!("diagnostics writer thread exited abnormally: {err:?}");
             }
         }
     }
@@ -411,11 +420,18 @@ struct DiagnosticWriter {
     ref_path: PathBuf,
     out_path: PathBuf,
     stats_path: PathBuf,
+    summary_path: PathBuf,
     sample_rate: u32,
     frame_ms: u32,
     max_frames: Option<u64>,
     written_frames: u64,
     frame_index: u64,
+    output_observed_frames: u64,
+    total_output_underruns: u64,
+    total_output_overruns: u64,
+    total_ref_input_drops: u64,
+    total_ref_stale_drops: u64,
+    total_ref_underruns: u64,
     human_to_stderr: bool,
     status_json: bool,
     status: DiagnosticsStatusHandle,
@@ -438,7 +454,7 @@ impl DiagnosticWriter {
                             break;
                         }
                         Err(err) => {
-                            eprintln!("诊断写入失败: {err:#}");
+                            eprintln!("diagnostics write failed: {err:#}");
                             reason = DiagnosticDoneReason::Error;
                             ok = false;
                             break;
@@ -481,9 +497,25 @@ impl DiagnosticWriter {
                 writer.write_sample(*v)?;
             }
         }
+        self.output_observed_frames = self
+            .output_observed_frames
+            .saturating_add(frame.frame_size as u64);
+        self.total_output_underruns = self
+            .total_output_underruns
+            .saturating_add(frame.output_underruns);
+        self.total_output_overruns = self
+            .total_output_overruns
+            .saturating_add(frame.output_overruns);
+        self.total_ref_input_drops = self
+            .total_ref_input_drops
+            .saturating_add(frame.ref_input_drops);
+        self.total_ref_stale_drops = self
+            .total_ref_stale_drops
+            .saturating_add(frame.ref_stale_drops);
+        self.total_ref_underruns = self.total_ref_underruns.saturating_add(frame.ref_underruns);
 
         let Some(stats) = self.stats.as_mut() else {
-            bail!("诊断 stats writer 已关闭");
+            bail!("diagnostics stats writer is closed");
         };
         writeln!(
             stats,
@@ -542,6 +574,7 @@ impl DiagnosticWriter {
         ok &= self.finalize_wav("ref.wav", DiagnosticWavKind::Ref);
         ok &= self.finalize_wav("out.wav", DiagnosticWavKind::Out);
         ok &= self.finalize_stats();
+        ok &= self.write_summary(reason);
 
         self.status.set_frames(self.written_frames);
         self.status.set_recording(false);
@@ -558,11 +591,11 @@ impl DiagnosticWriter {
             return true;
         };
         if let Err(err) = writer.finalize() {
-            eprintln!("写入 {label} 尾部失败: {err}");
+            eprintln!("failed to write {label} tail: {err}");
             return false;
         }
         if let Err(err) = rename(part_path, final_path) {
-            eprintln!("提交 {label} 失败: {err}");
+            eprintln!("failed to finalize {label}: {err}");
             return false;
         }
         true
@@ -574,18 +607,85 @@ impl DiagnosticWriter {
         };
         let mut ok = true;
         if let Err(err) = stats.flush() {
-            eprintln!("刷新诊断 stats.csv 失败: {err}");
+            eprintln!("failed to flush diagnostics stats.csv: {err}");
             ok = false;
         }
         drop(stats);
         if let Err(err) = rename(&self.stats_part_path, &self.stats_path) {
-            eprintln!("提交诊断 stats.csv 失败: {err}");
+            eprintln!("failed to finalize diagnostics stats.csv: {err}");
             ok = false;
         }
         ok
     }
 
+    fn clock_skew_snapshot(&self) -> ClockSkewSnapshot {
+        ClockSkewSnapshot::from_frame_counts(
+            self.output_observed_frames,
+            self.total_output_underruns,
+            self.total_output_overruns,
+            ref_pace_loss(self.total_ref_stale_drops, self.total_ref_input_drops),
+            self.total_ref_underruns,
+        )
+    }
+
+    fn write_summary(&self, reason: DiagnosticDoneReason) -> bool {
+        let skew = self.clock_skew_snapshot();
+        let clock_skew_detected = skew.output_skew_pct.abs() > 2.0 && skew.ref_correlated;
+        let mut file = match File::create(&self.summary_path) {
+            Ok(file) => BufWriter::new(file),
+            Err(err) => {
+                eprintln!("failed to create diagnostics summary.txt: {err}");
+                return false;
+            }
+        };
+        let result = (|| -> Result<()> {
+            writeln!(file, "reason={}", reason.as_str())?;
+            writeln!(file, "frames={}", self.written_frames)?;
+            writeln!(file, "seconds={:.3}", self.status.elapsed_s())?;
+            writeln!(
+                file,
+                "output_observed_frames={}",
+                self.output_observed_frames
+            )?;
+            writeln!(
+                file,
+                "output_underruns_total={}",
+                self.total_output_underruns
+            )?;
+            writeln!(file, "output_overruns_total={}", self.total_output_overruns)?;
+            writeln!(file, "ref_input_drops_total={}", self.total_ref_input_drops)?;
+            writeln!(file, "ref_stale_drops_total={}", self.total_ref_stale_drops)?;
+            writeln!(file, "ref_underruns_total={}", self.total_ref_underruns)?;
+            writeln!(file, "output_skew_pct={:.3}", skew.output_skew_pct)?;
+            writeln!(file, "ref_skew_pct={:.3}", skew.ref_skew_pct)?;
+            writeln!(
+                file,
+                "clock_skew_direction={}",
+                skew.direction
+                    .map(ClockSkewDirection::as_str)
+                    .unwrap_or("none")
+            )?;
+            writeln!(file, "clock_skew_ref_correlated={}", skew.ref_correlated)?;
+            writeln!(file, "clock_skew_detected={clock_skew_detected}")?;
+            writeln!(file, "out_wav_capture_point=pre_output_ring")?;
+            writeln!(file, "out_wav_device_underrun_blind_spot=true")?;
+            writeln!(
+                file,
+                "note=out.wav is recorded before the output ring; device callback zero-fill is visible in output_underruns_total/output_skew_pct, not in out.wav"
+            )?;
+            file.flush()?;
+            Ok(())
+        })();
+        if let Err(err) = result {
+            eprintln!("failed to write diagnostics summary.txt: {err:#}");
+            false
+        } else {
+            true
+        }
+    }
+
     fn emit_done(&self, reason: DiagnosticDoneReason, ok: bool) {
+        let skew = self.clock_skew_snapshot();
         if self.status_json {
             let event = json!({
                 "type": "diagnostics_done",
@@ -595,16 +695,28 @@ impl DiagnosticWriter {
                 "reason": reason.as_str(),
                 "drops": self.status.drops(),
                 "ok": ok,
+                "summary_path": self.summary_path.display().to_string(),
+                "output_underruns": self.total_output_underruns,
+                "output_overruns": self.total_output_overruns,
+                "ref_input_drops": self.total_ref_input_drops,
+                "ref_stale_drops": self.total_ref_stale_drops,
+                "ref_underruns": self.total_ref_underruns,
+                "output_skew_pct": skew.output_skew_pct,
+                "ref_skew_pct": skew.ref_skew_pct,
+                "clock_skew_direction": skew.direction.map(ClockSkewDirection::as_str),
+                "clock_skew_ref_correlated": skew.ref_correlated,
             });
             println!("{event}");
         } else {
             print_human(
                 self.human_to_stderr,
                 format!(
-                    "诊断录制完成(reason={}, ok={}, drops={}): {}",
+                    "diagnostics recording complete (reason={}, ok={}, drops={}, output_underruns={}, output_skew_pct={:.2}): {}",
                     reason.as_str(),
                     ok,
                     self.status.drops(),
+                    self.total_output_underruns,
+                    skew.output_skew_pct,
                     self.dir.display()
                 ),
             );
@@ -621,7 +733,7 @@ enum DiagnosticWavKind {
 fn make_session_dir(base: &Path) -> Result<PathBuf> {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .context("系统时间早于 UNIX_EPOCH")?
+        .context("system time is before UNIX_EPOCH")?
         .as_secs();
     for attempt in 0..1000 {
         let name = if attempt == 0 {
@@ -634,12 +746,19 @@ fn make_session_dir(base: &Path) -> Result<PathBuf> {
             Ok(()) => return Ok(dir),
             Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(err) => {
-                return Err(err)
-                    .with_context(|| format!("创建诊断 session 目录失败: {}", dir.display()));
+                return Err(err).with_context(|| {
+                    format!(
+                        "failed to create diagnostics session directory: {}",
+                        dir.display()
+                    )
+                });
             }
         }
     }
-    bail!("创建诊断 session 目录失败: {} 下重名过多", base.display())
+    bail!(
+        "failed to create diagnostics session directory: too many name collisions under {}",
+        base.display()
+    )
 }
 
 struct DiagnosticMetadata<'a> {
@@ -655,8 +774,12 @@ struct DiagnosticMetadata<'a> {
 
 fn write_diagnostic_metadata(metadata: DiagnosticMetadata<'_>) -> Result<()> {
     let mut file = BufWriter::new(
-        File::create(metadata.dir.join("metadata.txt"))
-            .with_context(|| format!("创建诊断 metadata.txt 失败: {}", metadata.dir.display()))?,
+        File::create(metadata.dir.join("metadata.txt")).with_context(|| {
+            format!(
+                "failed to create diagnostics metadata.txt: {}",
+                metadata.dir.display()
+            )
+        })?,
     );
     writeln!(file, "version={}", env!("CARGO_PKG_VERSION"))?;
     writeln!(file, "sample_rate={}", metadata.sample_rate)?;
@@ -702,6 +825,9 @@ mod tests {
     use super::*;
 
     use echoless_processors::ProcessorStats;
+    use std::sync::Mutex;
+
+    static DATA_ROOT_ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn temp_diagnostic_dir(prefix: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
@@ -712,6 +838,45 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ))
+    }
+
+    #[test]
+    fn diagnostic_recorder_uses_only_the_fixed_brand_directory() -> Result<()> {
+        let _guard = DATA_ROOT_ENV_LOCK.lock().unwrap();
+        let root = temp_diagnostic_dir("echoless-diagnostic-fixed-root");
+        let external = temp_diagnostic_dir("echoless-diagnostic-external");
+        std::fs::create_dir_all(&external)?;
+        let sentinel = external.join("sentinel.txt");
+        std::fs::write(&sentinel, b"keep")?;
+        let previous = std::env::var_os(echoless_paths::DATA_ROOT_ENV_VAR);
+        std::env::set_var(echoless_paths::DATA_ROOT_ENV_VAR, &root);
+
+        let node_stats = [ProcessorStats::empty("test")];
+        let recorder = DiagnosticRecorder::new(DiagnosticRecorderConfig {
+            enabled: true,
+            max_seconds: None,
+            sample_rate: 48_000,
+            reference_channels: 1,
+            frame_ms: 10,
+            near_delay_ms: 0,
+            output_level: 50,
+            node_stats: &node_stats,
+            status_json: false,
+        })?
+        .unwrap();
+        let session = recorder.dir.clone();
+        drop(recorder);
+
+        if let Some(previous) = previous {
+            std::env::set_var(echoless_paths::DATA_ROOT_ENV_VAR, previous);
+        } else {
+            std::env::remove_var(echoless_paths::DATA_ROOT_ENV_VAR);
+        }
+        assert_eq!(session.parent(), Some(root.join("diagnostics").as_path()));
+        assert_eq!(std::fs::read(&sentinel)?, b"keep");
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(external);
+        Ok(())
     }
 
     #[test]
@@ -787,21 +952,21 @@ mod tests {
     #[test]
     fn diagnostic_recorder_writes_audio_and_stats() -> Result<()> {
         let base = temp_diagnostic_dir("echoless-diagnostic-test");
-        let cfg = DiagnosticsConfig {
-            record_dir: Some(base.to_string_lossy().to_string()),
-            max_seconds: Some(1),
-        };
         let node_stats = [ProcessorStats::empty("test")];
-        let mut recorder = DiagnosticRecorder::new(DiagnosticRecorderConfig {
-            cfg: &cfg,
-            sample_rate: 48_000,
-            reference_channels: 2,
-            frame_ms: 10,
-            near_delay_ms: 25,
-            output_level: 75,
-            node_stats: &node_stats,
-            status_json: false,
-        })?
+        let mut recorder = DiagnosticRecorder::new_in(
+            DiagnosticRecorderConfig {
+                enabled: true,
+                max_seconds: Some(1),
+                sample_rate: 48_000,
+                reference_channels: 2,
+                frame_ms: 10,
+                near_delay_ms: 25,
+                output_level: 75,
+                node_stats: &node_stats,
+                status_json: false,
+            },
+            &base,
+        )?
         .unwrap();
         let dir = recorder.dir.clone();
         let near = [0.25f32, -0.25];
@@ -821,10 +986,10 @@ mod tests {
             mic_input_drops: 0,
             ref_input_drops: 0,
             mic_stale_drops: 0,
-            ref_stale_drops: 0,
+            ref_stale_drops: 1,
             ref_underruns: 0,
             output_overruns: 0,
-            output_underruns: 0,
+            output_underruns: 1,
             node_stats: &node_stats,
         };
 
@@ -848,6 +1013,16 @@ mod tests {
         let metadata = std::fs::read_to_string(dir.join("metadata.txt"))?;
         assert!(metadata.contains("near_delay_ms=25"));
         assert!(metadata.contains("output_level=75"));
+        let summary = std::fs::read_to_string(dir.join("summary.txt"))?;
+        assert!(summary.contains("output_underruns_total=1"));
+        assert!(summary.contains("ref_stale_drops_total=1"));
+        assert!(summary.contains("output_observed_frames=2"));
+        assert!(summary.contains("output_skew_pct=50.000"));
+        assert!(summary.contains("ref_skew_pct=50.000"));
+        assert!(summary.contains("clock_skew_direction=output_faster_than_capture"));
+        assert!(summary.contains("clock_skew_ref_correlated=true"));
+        assert!(summary.contains("out_wav_capture_point=pre_output_ring"));
+        assert!(summary.contains("out_wav_device_underrun_blind_spot=true"));
 
         let _ = std::fs::remove_dir_all(base);
         Ok(())
@@ -856,21 +1031,21 @@ mod tests {
     #[test]
     fn diagnostic_recorder_auto_finishes_at_max_seconds() -> Result<()> {
         let base = temp_diagnostic_dir("echoless-diagnostic-max-test");
-        let cfg = DiagnosticsConfig {
-            record_dir: Some(base.to_string_lossy().to_string()),
-            max_seconds: Some(1),
-        };
         let node_stats = [ProcessorStats::empty("test")];
-        let mut recorder = DiagnosticRecorder::new(DiagnosticRecorderConfig {
-            cfg: &cfg,
-            sample_rate: 2,
-            reference_channels: 1,
-            frame_ms: 1000,
-            near_delay_ms: 0,
-            output_level: 50,
-            node_stats: &node_stats,
-            status_json: false,
-        })?
+        let mut recorder = DiagnosticRecorder::new_in(
+            DiagnosticRecorderConfig {
+                enabled: true,
+                max_seconds: Some(1),
+                sample_rate: 2,
+                reference_channels: 1,
+                frame_ms: 1000,
+                near_delay_ms: 0,
+                output_level: 50,
+                node_stats: &node_stats,
+                status_json: false,
+            },
+            &base,
+        )?
         .unwrap();
         let dir = recorder.dir.clone();
         let status = recorder.status_handle();
@@ -923,21 +1098,21 @@ mod tests {
     #[test]
     fn diagnostic_recorder_async_stop_finalizes_files() -> Result<()> {
         let base = temp_diagnostic_dir("echoless-diagnostic-stop-test");
-        let cfg = DiagnosticsConfig {
-            record_dir: Some(base.to_string_lossy().to_string()),
-            max_seconds: None,
-        };
         let node_stats = [ProcessorStats::empty("test")];
-        let mut recorder = DiagnosticRecorder::new(DiagnosticRecorderConfig {
-            cfg: &cfg,
-            sample_rate: 48_000,
-            reference_channels: 1,
-            frame_ms: 10,
-            near_delay_ms: 0,
-            output_level: 50,
-            node_stats: &node_stats,
-            status_json: false,
-        })?
+        let mut recorder = DiagnosticRecorder::new_in(
+            DiagnosticRecorderConfig {
+                enabled: true,
+                max_seconds: None,
+                sample_rate: 48_000,
+                reference_channels: 1,
+                frame_ms: 10,
+                near_delay_ms: 0,
+                output_level: 50,
+                node_stats: &node_stats,
+                status_json: false,
+            },
+            &base,
+        )?
         .unwrap();
         let dir = recorder.dir.clone();
         let status = recorder.status_handle();
@@ -987,21 +1162,21 @@ mod tests {
     #[test]
     fn diagnostic_recorder_stop_keeps_writer_joinable() -> Result<()> {
         let base = temp_diagnostic_dir("echoless-diagnostic-join-test");
-        let cfg = DiagnosticsConfig {
-            record_dir: Some(base.to_string_lossy().to_string()),
-            max_seconds: None,
-        };
         let node_stats = [ProcessorStats::empty("test")];
-        let mut recorder = DiagnosticRecorder::new(DiagnosticRecorderConfig {
-            cfg: &cfg,
-            sample_rate: 48_000,
-            reference_channels: 1,
-            frame_ms: 10,
-            near_delay_ms: 0,
-            output_level: 50,
-            node_stats: &node_stats,
-            status_json: false,
-        })?
+        let mut recorder = DiagnosticRecorder::new_in(
+            DiagnosticRecorderConfig {
+                enabled: true,
+                max_seconds: None,
+                sample_rate: 48_000,
+                reference_channels: 1,
+                frame_ms: 10,
+                near_delay_ms: 0,
+                output_level: 50,
+                node_stats: &node_stats,
+                status_json: false,
+            },
+            &base,
+        )?
         .unwrap();
 
         recorder.request_finish(DiagnosticDoneReason::Stopped);

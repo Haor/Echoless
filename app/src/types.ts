@@ -116,6 +116,13 @@ export interface RuntimeStatus {
   output_underruns: number;
   output_overruns: number;
   stale_drops: number;
+  // 时钟漂移(2026-07 起 status 常驻):输出/参考时钟相对麦克风的偏差百分比。
+  // 旧 CLI 无此字段,须按可选处理。
+  output_skew_pct?: number;
+  ref_skew_pct?: number;
+  clock_skew_warning?: boolean;
+  clock_skew_ref_correlated?: boolean;
+  clock_skew_direction?: ClockSkewDirection | null;
   node_process_time_ms: number;
   runtime_errors: number;
   diverged: boolean;
@@ -161,7 +168,33 @@ export interface DiagnosticsStoppingEvent {
 }
 export interface ControlErrorEvent {
   type: "control_error";
-  cmd: string;
+  cmd: string | null;
+  message: string;
+}
+export interface StreamErrorEvent {
+  type: "stream_error";
+  stream: string;
+  message: string;
+  fatal: boolean;
+}
+export type ClockSkewDirection =
+  | "output_faster_than_capture"
+  | "capture_faster_than_output";
+interface ClockSkewEventFields {
+  output_skew_pct: number;
+  ref_skew_pct: number;
+  ref_correlated: boolean;
+  direction: ClockSkewDirection | null;
+  hint: string;
+}
+export interface ClockSkewWarningEvent extends ClockSkewEventFields {
+  type: "clock_skew_warning";
+}
+export interface ClockSkewResolvedEvent extends ClockSkewEventFields {
+  type: "clock_skew_resolved";
+}
+export interface RuntimeErrorEvent {
+  type: "error";
   message: string;
 }
 // set_output_level 实时生效后的回执(值由前端驱动,UI 仅忽略)。
@@ -224,13 +257,17 @@ export interface StartedEvent {
   reference_source?: string | null;
 }
 
-export type RunEvent =
+export type RunEventPayload =
   | RuntimeStatus
   | StartedEvent
   | DiagnosticsDoneEvent
   | DiagnosticsStartedEvent
   | DiagnosticsStoppingEvent
   | ControlErrorEvent
+  | StreamErrorEvent
+  | ClockSkewWarningEvent
+  | ClockSkewResolvedEvent
+  | RuntimeErrorEvent
   | OutputLevelChangedEvent
   | NearDelayChangedEvent
   | InitialDelayChangedEvent
@@ -238,6 +275,13 @@ export type RunEvent =
   | Aec3AgcChangedEvent
   | LocalvqeNoiseGateChangedEvent
   | BypassChangedEvent;
+
+export type RunEvent = RunEventPayload & { run_id: number };
+
+export interface RunExitEvent {
+  run_id: number;
+  intentional?: boolean;
+}
 
 // ---- doctor audio --json(虚拟声卡检测) ----
 export interface DoctorCandidate {
