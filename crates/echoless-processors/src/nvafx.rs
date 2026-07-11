@@ -7,9 +7,9 @@
 use std::env;
 use std::fmt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
-#[cfg(windows)]
-use std::time::Instant;
+use std::process::{Command, Output, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use serde::Serialize;
@@ -21,6 +21,9 @@ pub const RUNTIME_FILE_VERSION: &str = "2.1.0.9";
 pub const MIN_DRIVER_VERSION: &str = "572.61";
 pub const NVAFX_SAMPLE_RATE: u32 = 48_000;
 pub const NVAFX_FRAME_SAMPLES: u32 = 480;
+
+const NVIDIA_SMI_TIMEOUT: Duration = Duration::from_secs(10);
+const NVIDIA_SMI_POLL_INTERVAL: Duration = Duration::from_millis(25);
 
 const COMMON_REQUIRED_FILES: &[&str] = &[
     "bin/NVAudioEffects.dll",
@@ -608,17 +611,27 @@ fn resolve_nvidia_smi() -> PathBuf {
 
 fn detect_gpus() -> Result<Vec<GpuInfo>> {
     let nvidia_smi = resolve_nvidia_smi();
-    let output = Command::new(&nvidia_smi)
-        .args([
-            "--query-gpu=name,driver_version,compute_cap",
-            "--format=csv,noheader",
-        ])
-        .output()
-        .with_context(|| format!("failed to run nvidia-smi: {}", nvidia_smi.display()))?;
+    let mut command = Command::new(&nvidia_smi);
+    command.args([
+        "--query-gpu=name,driver_version,compute_cap",
+        "--format=csv,noheader",
+    ]);
+    run_nvidia_smi_command(
+        &mut command,
+        NVIDIA_SMI_TIMEOUT,
+        &format!("nvidia-smi ({})", nvidia_smi.display()),
+    )
+}
+
+fn run_nvidia_smi_command(
+    command: &mut Command,
+    timeout: Duration,
+    label: &str,
+) -> Result<Vec<GpuInfo>> {
+    let output = command_output_with_deadline(command, timeout, label)?;
     if !output.status.success() {
         bail!(
-            "nvidia-smi ({}) exited with code {:?}: {}",
-            nvidia_smi.display(),
+            "{label} exited with code {:?}: {}",
             output.status.code(),
             String::from_utf8_lossy(&output.stderr).trim()
         );
@@ -628,6 +641,57 @@ fn detect_gpus() -> Result<Vec<GpuInfo>> {
         .lines()
         .filter_map(parse_nvidia_smi_gpu_line)
         .collect())
+}
+
+fn command_output_with_deadline(
+    command: &mut Command,
+    timeout: Duration,
+    label: &str,
+) -> Result<Output> {
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = command
+        .spawn()
+        .with_context(|| format!("failed to run {label}"))?;
+    let pid = child.id();
+    let started = Instant::now();
+
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => {
+                return child
+                    .wait_with_output()
+                    .with_context(|| format!("failed to collect {label} output"));
+            }
+            Ok(None) if started.elapsed() >= timeout => {
+                let kill_error = child.kill().err();
+                let output = child
+                    .wait_with_output()
+                    .with_context(|| format!("failed to reap timed-out {label} pid {pid}"))?;
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                if let Some(kill_error) = kill_error {
+                    bail!(
+                        "{label} timed out after {} ms (pid {pid}); kill failed: {kill_error}; stderr: {}",
+                        timeout.as_millis(),
+                        stderr.trim()
+                    );
+                }
+                bail!(
+                    "{label} timed out after {} ms (pid {pid}); stderr: {}",
+                    timeout.as_millis(),
+                    stderr.trim()
+                );
+            }
+            Ok(None) => {
+                let remaining = timeout.saturating_sub(started.elapsed());
+                thread::sleep(NVIDIA_SMI_POLL_INTERVAL.min(remaining));
+            }
+            Err(err) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                bail!("failed to inspect {label} pid {pid}: {err}");
+            }
+        }
+    }
 }
 
 fn parse_nvidia_smi_gpu_line(line: &str) -> Option<GpuInfo> {
@@ -1279,6 +1343,44 @@ use ffi::AfxAecEffect;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+
+    const NVIDIA_SMI_TEST_MODE: &str = "ECHOLESS_NVIDIA_SMI_TEST_MODE";
+    const NVIDIA_SMI_TEST_STARTED: &str = "ECHOLESS_NVIDIA_SMI_TEST_STARTED";
+    const NVIDIA_SMI_TEST_DONE: &str = "ECHOLESS_NVIDIA_SMI_TEST_DONE";
+
+    fn nvidia_smi_test_command(mode: &str) -> Command {
+        let mut command = Command::new(env::current_exe().unwrap());
+        command
+            .arg("nvafx_deadline_test_child_entrypoint")
+            .arg("--nocapture")
+            .env(NVIDIA_SMI_TEST_MODE, mode);
+        command
+    }
+
+    #[test]
+    fn nvafx_deadline_test_child_entrypoint() {
+        let Ok(mode) = env::var(NVIDIA_SMI_TEST_MODE) else {
+            return;
+        };
+        match mode.as_str() {
+            "success" => {
+                println!("NVIDIA GeForce RTX 5080, 596.49, 12.0");
+            }
+            "nonzero" => {
+                eprintln!("injected nvidia-smi failure");
+                std::process::exit(7);
+            }
+            "hang" => {
+                let started = env::var_os(NVIDIA_SMI_TEST_STARTED).unwrap();
+                let done = env::var_os(NVIDIA_SMI_TEST_DONE).unwrap();
+                fs::write(started, "started").unwrap();
+                thread::sleep(Duration::from_secs(1));
+                fs::write(done, "completed").unwrap();
+            }
+            other => panic!("unknown nvidia-smi test mode: {other}"),
+        }
+    }
 
     #[test]
     fn maps_compute_capability_to_arch() {
@@ -1308,6 +1410,70 @@ mod tests {
         assert_eq!(gpu.name, "NVIDIA GeForce RTX 5080");
         assert_eq!(gpu.driver_version, "596.49");
         assert_eq!(gpu.arch, Some(GpuArch::Blackwell));
+    }
+
+    #[test]
+    fn nvidia_smi_deadline_runner_parses_normal_output() {
+        let mut command = nvidia_smi_test_command("success");
+        let gpus =
+            run_nvidia_smi_command(&mut command, Duration::from_secs(2), "injected nvidia-smi")
+                .unwrap();
+
+        assert_eq!(gpus.len(), 1);
+        assert_eq!(gpus[0].name, "NVIDIA GeForce RTX 5080");
+        assert_eq!(gpus[0].arch, Some(GpuArch::Blackwell));
+    }
+
+    #[test]
+    fn nvidia_smi_deadline_runner_preserves_nonzero_context() {
+        let mut command = nvidia_smi_test_command("nonzero");
+        let err =
+            run_nvidia_smi_command(&mut command, Duration::from_secs(2), "injected nvidia-smi")
+                .unwrap_err();
+        let message = err.to_string();
+
+        assert!(message.contains("injected nvidia-smi exited with code Some(7)"));
+        assert!(message.contains("injected nvidia-smi failure"));
+    }
+
+    #[test]
+    fn nvidia_smi_deadline_runner_kills_and_reaps_timeout() {
+        let base = env::temp_dir().join(format!(
+            "echoless-nvidia-smi-timeout-{}",
+            std::process::id()
+        ));
+        let started_marker = base.with_extension("started");
+        let done_marker = base.with_extension("done");
+        let _ = fs::remove_file(&started_marker);
+        let _ = fs::remove_file(&done_marker);
+
+        let mut command = nvidia_smi_test_command("hang");
+        command
+            .env(NVIDIA_SMI_TEST_STARTED, &started_marker)
+            .env(NVIDIA_SMI_TEST_DONE, &done_marker);
+        let started = Instant::now();
+        let err = run_nvidia_smi_command(
+            &mut command,
+            Duration::from_millis(400),
+            "injected nvidia-smi",
+        )
+        .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("injected nvidia-smi timed out after 400 ms"),
+            "{err:#}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(started_marker.is_file(), "test child never started");
+        thread::sleep(Duration::from_millis(800));
+        assert!(
+            !done_marker.exists(),
+            "timed-out nvidia-smi child continued after kill/reap"
+        );
+
+        let _ = fs::remove_file(started_marker);
+        let _ = fs::remove_file(done_marker);
     }
 
     #[test]
