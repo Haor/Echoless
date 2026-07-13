@@ -10,6 +10,16 @@ adheres to [Semantic Versioning](https://semver.org).
 - Windows **Auto Start** option: launch hidden after sign-in and start the saved
   Echoless audio pipeline automatically. Startup failures reveal the main window
   instead of remaining silent in the tray.
+- Shared **Noise Suppression** selector with `WEBRTC`, `RNNOISE`, and `OFF`
+  modes for AEC3, NVAFX, and the pure-AEC LocalVQE v1.4 model. RNNoise uses a
+  pinned, statically bundled Xiph runtime and model with no runtime download.
+
+### Changed
+- WebRTC noise suppression now runs as a shared post-AEC processor instead of
+  private AEC3 state. LocalVQE v1.2/v1.3 expose their built-in NS capability
+  and lock external suppression off to prevent double processing.
+- LocalVQE model badges now describe capability (`NS` or `AEC`), and model
+  tooltips explain behavior instead of exposing filesystem paths.
 
 ## [1.1.0] — 2026-07-11
 
