@@ -14,6 +14,7 @@ pub mod noise_suppression;
 pub mod nvafx;
 pub mod passthrough;
 pub mod registry;
+pub mod rnnoise;
 pub mod webrtc_ns;
 
 pub use chain::{chain_from_nodes, ProcessorChain};

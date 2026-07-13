@@ -11,6 +11,7 @@ toml.workspace = true
 serde.workspace = true
 libloading.workspace = true
 rubato.workspace = true
+nnnoiseless.workspace = true
 echoless-paths = { path = "../echoless-paths" }
 # 经典 AEC3 引擎:内化 fork(见 ../../aec3,上游基线 aacadf0,已完全内化维护)。
 # 改 path 依赖以便开放 EchoCanceller3Config 注入口(方案 A,见 research/aec3_internal_map.md §9)。

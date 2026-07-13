@@ -2,7 +2,7 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use echoless_processors::{
-    webrtc_ns::WebRtcNs, EchoProcessor, IoSpec, ProcessorChain, ProcessorStats,
+    rnnoise::RnNoise, webrtc_ns::WebRtcNs, EchoProcessor, IoSpec, ProcessorChain, ProcessorStats,
 };
 
 struct CountingAllocator;
@@ -115,6 +115,26 @@ fn processor_chain_process_is_allocation_free_after_warmup() {
         ALLOCATIONS.load(Ordering::SeqCst),
         0,
         "WebRTC NS chain allocated after warmup"
+    );
+
+    let mut rnnoise_chain = ProcessorChain::new(48_000, 1);
+    rnnoise_chain.push(Box::new(RnNoise::new()));
+    let allocations = std::thread::spawn(move || {
+        let near = sine_block(480, 440.0, 48_000);
+        let far = vec![0.0; 480];
+        let mut out = vec![0.0; 480];
+        rnnoise_chain.warm_up(480);
+
+        ALLOCATIONS.store(0, Ordering::SeqCst);
+        rnnoise_chain.process(&near, &far, &mut out, 480);
+        ALLOCATIONS.load(Ordering::SeqCst)
+    })
+    .join()
+    .unwrap();
+
+    assert_eq!(
+        allocations, 0,
+        "RNNoise allocated after audio-thread warmup"
     );
 }
 

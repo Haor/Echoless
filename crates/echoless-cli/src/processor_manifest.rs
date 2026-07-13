@@ -184,6 +184,21 @@ fn processor_manifest() -> serde_json::Value {
                 }
             },
             {
+                "kind": "rnnoise",
+                "label": "RNNoise",
+                "platforms": ["windows", "macos", "linux"],
+                "default": false,
+                "experimental": false,
+                "role": "noise_suppression",
+                "constraints": {
+                    "sample_rate": 48000,
+                    "frame_ms": 10,
+                    "channels": "mono",
+                    "algorithmic_latency_ms": echoless_processors::rnnoise::ALGORITHMIC_LATENCY_MS
+                },
+                "params": {}
+            },
+            {
                 "kind": "localvqe",
                 "label": "LocalVQE",
                 "platforms": ["windows", "macos", "linux"],
@@ -320,6 +335,16 @@ mod tests {
         assert_eq!(
             webrtc_ns["params"]["level"]["default"],
             echoless_processors::webrtc_ns::DEFAULT_LEVEL
+        );
+
+        let rnnoise = processors
+            .iter()
+            .find(|processor| processor["kind"] == "rnnoise")
+            .unwrap();
+        assert_eq!(rnnoise["role"], "noise_suppression");
+        assert_eq!(
+            rnnoise["constraints"]["algorithmic_latency_ms"],
+            json!(echoless_processors::rnnoise::ALGORITHMIC_LATENCY_MS)
         );
     }
 }

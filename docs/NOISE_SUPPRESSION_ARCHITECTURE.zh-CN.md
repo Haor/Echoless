@@ -180,9 +180,19 @@ capture format    = 48 kHz mono
 
 ### 5.3 RNNoise
 
-RNNoise 作为独立节点接收 AEC 输出。实现阶段应保持 RNNoise 原生 48 kHz/10 ms
-处理域,避免不必要的节点边界重采样。模型、原生库或 Rust 绑定的具体选型不属于
-本文决策范围,但不得改变 `NoiseMode` 与兼容矩阵。
+RNNoise 作为独立节点接收 AEC 输出,保持原生 48 kHz/10 ms 处理域,不增加节点边界
+重采样。实现采用 `nnnoiseless 0.5.2`,并关闭默认 feature:
+
+- 许可证为 BSD-3-Clause,与项目 MIT 许可证兼容;许可全文随发行包分发。
+- 纯 Rust 实现,Windows/macOS 不需要 C 编译器、libclang、额外 DLL 或运行时模型下载。
+- 模型约 88 KiB,直接编入二进制;更新通过 Cargo 依赖和 `Cargo.lock` 管理。
+- `f32` API 使用 16-bit PCM 幅度域,节点负责与 Echoless 的归一化 `[-1, 1]` 域双向转换。
+- FFT planner/scratch 使用线程局部懒初始化,因此处理链必须在实际音频线程再次预热。
+- 算法使用 960-sample 分析窗和 480-sample 步长,节点按 10 ms 上报额定延迟。
+
+未选择 `rnnoise-c`/`rnnoise-sys`,因为该封装已经停止维护,并会给 Windows 打包引入
+bindgen、libclang 与 C 工具链。也未直接内置 Xiph C 源码,因为它需要项目长期维护
+MSVC 构建、模型生成和跨平台补丁,对当前小型开源工具不成比例。
 
 ## 6. AEC3 行为变化
 

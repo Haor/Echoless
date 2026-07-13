@@ -573,6 +573,9 @@ fn process_loop<M, R, O>(
     O: Producer<Item = f32>,
 {
     let frame_size = runtime.frame_size;
+    // Some processors use thread-local FFT planners. Warm the final chain on
+    // the actual audio thread before entering the realtime loop.
+    chain.warm_up(frame_size);
     let far_samples_per_frame = frame_size * runtime.reference_channels;
     let mut mic_frame = vec![0.0f32; frame_size];
     let mut near = vec![0.0f32; frame_size];
