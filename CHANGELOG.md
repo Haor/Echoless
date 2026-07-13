@@ -22,6 +22,8 @@ adheres to [Semantic Versioning](https://semver.org).
   and lock external suppression off to prevent double processing.
 - LocalVQE model badges now describe capability (`NS` or `AEC`), and model
   tooltips explain behavior instead of exposing filesystem paths.
+- Advanced settings now place WebRTC NS and delay probing side by side, keeping
+  the session controls clear of the status bar as the parameter set grows.
 
 ### Fixed
 - RNNoise buffer-backed models now initialize their file handle before cleanup,
