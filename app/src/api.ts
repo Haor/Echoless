@@ -101,6 +101,16 @@ export function downloadLocalvqeModel(filename: string): Promise<string> {
 // 主动近端延迟侦测 / AEC 链路诊断。后端 shell `echoless probe-delay --json`,通常约 15 秒;
 // 首次 macOS 权限/Process Tap 启动可能更久。会外放一串蜂鸣 —— 调用前必须先停掉主 run。
 // 字段以 CLI `probe-delay --json` 实测为准(docs/CLI.md)。
+export type ProbeQuality = "valid" | "uncertain" | "invalid";
+export type ProbeQualityReason =
+  | "ref_signal_missing"
+  | "mic_signal_missing"
+  | "insufficient_reference_events"
+  | "insufficient_valid_lags"
+  | "weak_correlation"
+  | "inconsistent_lags"
+  | "lag_at_search_boundary";
+
 export interface NearDelayProbeResult {
   session_dir: string;
   session_retained: boolean;
@@ -108,12 +118,14 @@ export interface NearDelayProbeResult {
   mic_dbfs: number;
   global_lag_ms: number;
   global_corr: number;
+  quality: ProbeQuality;
+  quality_reasons: ProbeQualityReason[];
   event_count: number;
   event_detected: number;
-  event_lag_mean_ms: number;
-  event_lag_stddev_ms: number;
-  event_lag_drift_ms: number;
-  recommended_near_delay_ms: number;
+  event_lag_mean_ms: number | null;
+  event_lag_stddev_ms: number | null;
+  event_lag_drift_ms: number | null;
+  recommended_near_delay_ms: number | null;
   per_beep_lags: Array<{ index: number; time_s: number; lag_ms: number; corr: number }>;
   warnings: string[];
 }

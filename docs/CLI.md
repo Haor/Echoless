@@ -100,15 +100,28 @@ calibration rig. Portable scripts should pass `--mic`, `--reference`, and
 `--output` explicitly rather than relying on those defaults.
 
 Stops nothing by itself — don't run it while another `run` holds the devices.
-Flags: `--beeps N` (12), `--startup-delay S` (4), `--volume 0..1` (0.35),
+Flags: `--beeps N` (12, minimum 2), `--startup-delay S` (4),
+`--volume 0..1` (0.35),
 `--keep-session` (retain this run's fixed-directory session), `--keep-beep`,
 `--analyze-only <session>`.
 
-JSON result includes `recommended_near_delay_ms` (measured lag + 8 ms
-safety), per-beep lags, stddev/drift and warnings. In `--json` mode progress
-markers are emitted on stderr as JSONL (`beep_train_start` with the exact
-beep cadence). Supported on macOS, Windows and Linux (Linux maps the monitor
-reference back to its sink for playback).
+The JSON result includes `quality` (`valid`, `uncertain`, or `invalid`) and
+`quality_reasons`. Reasons are `ref_signal_missing`, `mic_signal_missing`,
+`insufficient_reference_events`, `insufficient_valid_lags`,
+`weak_correlation`, `inconsistent_lags`, and `lag_at_search_boundary`.
+Diagnostic fields include `global_lag_ms`, `global_corr`, `event_count`,
+`event_detected`, and `per_beep_lags`.
+
+`event_lag_mean_ms`, `event_lag_stddev_ms`, `event_lag_drift_ms`, and
+`recommended_near_delay_ms` are nullable. They are populated only for a
+`valid` measurement; the recommendation includes the 8 ms safety offset.
+Completed `uncertain` and `invalid` measurements still exit with status 0,
+but the desktop app does not apply their nullable recommendation. Device,
+capture, playback, session, and parse failures remain command errors.
+
+In `--json` mode progress markers are emitted on stderr as JSONL
+(`beep_train_start` with the exact beep cadence). Supported on macOS, Windows
+and Linux (Linux maps the monitor reference back to its sink for playback).
 
 ## offline
 

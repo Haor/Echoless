@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import appSource from "./App.tsx?raw";
 import controlsSource from "./components/Controls.tsx?raw";
+import i18nSource from "./i18n.tsx?raw";
 import advancedPageSource from "./pages/AdvancedPage.tsx?raw";
 import { canChangePipeline, pipelineForEngineKind } from "./engineLogic";
 
@@ -175,5 +176,29 @@ describe("delay probe page lifecycle", () => {
       "if (!visible && !probing && (probe != null || probeErr != null || lit > 0))",
     );
     expect(advancedPageSource).toContain("updateProbe(PROBE_INITIAL_STATE)");
+  });
+
+  it("uses backend quality as the only autofill and stable-state authority", () => {
+    expect(advancedPageSource).toContain(
+      "const fill = probeAutofill(r, platform, kind);",
+    );
+    expect(advancedPageSource).toMatch(
+      /if \(fill\.nearDelayMs != null\) \{\s*onPipeline/,
+    );
+    expect(advancedPageSource).toContain(
+      'const probeValid = probe?.quality === "valid";',
+    );
+    expect(advancedPageSource).not.toContain(
+      "Math.abs(probe.event_lag_stddev_ms)",
+    );
+    expect(advancedPageSource).not.toContain("probe.warnings.length === 0");
+  });
+
+  it("keeps failed probe guidance short and actionable", () => {
+    expect(i18nSource).toContain(
+      "reduce background noise or turn up the speaker, then retry",
+    );
+    expect(advancedPageSource).not.toContain("probe.warnings.join");
+    expect(advancedPageSource).not.toContain("qualityReasons");
   });
 });

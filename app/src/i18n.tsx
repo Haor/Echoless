@@ -259,9 +259,11 @@ const D: Record<string, { en: string; zh: string }> = {
   probeMic: { en: "Mic", zh: "Mic" },
   probeEcho: { en: "echo", zh: "echo" },
   probeOk: { en: "OK", zh: "OK" },
-  probeNoSig: { en: "no signal", zh: "无信号" },
+  probeNoSig: { en: "no beep", zh: "未检测到蜂鸣" },
   probeStable: { en: "stable", zh: "稳定" },
   probeUnstable: { en: "unstable", zh: "不稳定" },
+  probeUncertain: { en: "not measured", zh: "未测出" },
+  probeInvalid: { en: "not measured", zh: "未测出" },
   probeRec: { en: "set", zh: "建议" },
   probeNoFix: {
     // v8/C6:去掉「no fix needed」歧义 —— 正 lag 由 AEC3 自行追踪,near_delay 不动。
@@ -270,7 +272,10 @@ const D: Record<string, { en: string; zh: string }> = {
   },
   probeFilled: { en: "filled into Near Delay", zh: "已填入近端延迟" },
   probeInit: { en: "init", zh: "初始延迟" },
-
+  probeNoFill: {
+    en: "reduce background noise or turn up the speaker, then retry",
+    zh: "请减少周围杂音或调高扬声器音量后重试",
+  },
   // Session · Windows 后台启动与托盘偏好
   autoStart: { en: "Auto Start", zh: "开机启动" },
   autoStartHint: {

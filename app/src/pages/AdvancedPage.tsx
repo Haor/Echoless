@@ -16,6 +16,7 @@ import {
 import { useI18n, type Lang } from "../i18n";
 import { Hint } from "../components/Hint";
 import { Field, SegButtons } from "../components/Controls";
+import { probeAutofill } from "../probeQuality";
 
 interface Props {
   processors: Processor[];
@@ -65,11 +66,6 @@ const PROBE_BEEPS = 12;
 const PROBE_STEP_MS = 720;
 // afplay / cpal 输出流从 spawn 到出声的经验常量(进度灯对齐用,无需精确)。
 const PROBE_PLAYER_OPEN_MS = 150;
-// 信号判定阈值:dBFS 低于此视为没收到。
-const PROBE_SIG_DBFS = -55;
-// mac 上 near_delay 被侦测设非零时,顺带给 AEC3 一个 8ms 初始延迟 hint,
-// 减少初始 echo-path 搜索(实测有效)。仅 AEC3、仅 macOS、仅 recommended>0 时写。
-const PROBE_INIT_DELAY_MS = 8;
 
 // 参数说明(悬浮 label 时提示)。缺省键无提示。
 const DESC: Record<string, { en: string; zh: string }> = {
@@ -165,23 +161,6 @@ const PROBE_INITIAL_STATE: ProbeState = {
 
 function probeReducer(state: ProbeState, patch: ProbePatch): ProbeState {
   return typeof patch === "function" ? patch(state) : { ...state, ...patch };
-}
-
-function probeInitialDelay(
-  r: NearDelayProbeResult,
-  platform: Platform,
-  kind: string,
-): number | null {
-  if (kind !== "aec3") return null;
-  // mac:近端延迟已做负方向偏置对齐 → init 只需一个小的安全余量。
-  if (platform === "macos") return PROBE_INIT_DELAY_MS;
-  // win/其它:不设近端延迟 → init = 实测回声延迟(冷启动对齐起点),需稳定。
-  const stable =
-    r.warnings.length === 0 &&
-    Math.abs(r.event_lag_stddev_ms) < 5 &&
-    Math.abs(r.event_lag_drift_ms) < 10;
-  const measured = Math.round(r.event_lag_mean_ms);
-  return stable && measured >= 1 ? measured : null;
 }
 
 function ProbeSection({
@@ -282,13 +261,13 @@ function ProbeSection({
       }
       if (!mounted.current) return;
       updateProbeIfMounted({ probe: r });
-      // mac:近端延迟做负方向偏置(后端已含安全余量);win/其它:正 lag 无需近端延迟,不动。
-      if (platform === "macos") {
-        onPipeline({ near_delay_ms: r.recommended_near_delay_ms });
+      const fill = probeAutofill(r, platform, kind);
+      if (fill.nearDelayMs != null) {
+        onPipeline({ near_delay_ms: fill.nearDelayMs });
       }
-      // AEC3 初始延迟:mac 写 8ms 余量(near_delay 已对齐),win/其它写实测回声延迟(冷启动起点)。
-      const init = probeInitialDelay(r, platform, kind);
-      if (init != null) onParam("initial_delay_ms", init);
+      if (fill.initialDelayMs != null) {
+        onParam("initial_delay_ms", fill.initialDelayMs);
+      }
     } catch (e) {
       updateProbeIfMounted({ probeErr: String(e) });
     } finally {
@@ -311,13 +290,15 @@ function ProbeSection({
     }
   }
 
-  const probeStable =
-    !!probe &&
-    probe.warnings.length === 0 &&
-    Math.abs(probe.event_lag_stddev_ms) < 5 &&
-    Math.abs(probe.event_lag_drift_ms) < 10;
-  const initWritten = probe ? probeInitialDelay(probe, platform, kind) : null;
-
+  const probeValid = probe?.quality === "valid";
+  const fill = probe ? probeAutofill(probe, platform, kind) : null;
+  const refSignalOk = !probe?.quality_reasons.includes("ref_signal_missing");
+  const micSignalOk = !probe?.quality_reasons.includes("mic_signal_missing");
+  const qualityLabel = probeValid
+    ? t("probeStable")
+    : probe?.quality === "uncertain"
+      ? t("probeUncertain")
+      : t("probeInvalid");
   return (
     <section className="aprobe-section">
       <div className="asec">{t("secProbe")}</div>
@@ -378,42 +359,52 @@ function ProbeSection({
           {probe && !probeErr && (
             <div className="presult">
               <span className="pline">
-                <b className={probe.ref_dbfs >= PROBE_SIG_DBFS ? "ok" : "miss"}>
+                <b className={refSignalOk ? "ok" : "miss"}>
                   {t("probeRef")}{" "}
-                  {probe.ref_dbfs >= PROBE_SIG_DBFS ? t("probeOk") : t("probeNoSig")}
+                  {refSignalOk ? t("probeOk") : t("probeNoSig")}
                 </b>
                 <span className="psep">·</span>
-                <b className={probe.mic_dbfs >= PROBE_SIG_DBFS ? "ok" : "miss"}>
+                <b className={micSignalOk ? "ok" : "miss"}>
                   {t("probeMic")}{" "}
-                  {probe.mic_dbfs >= PROBE_SIG_DBFS ? t("probeOk") : t("probeNoSig")}
+                  {micSignalOk ? t("probeOk") : t("probeNoSig")}
                 </b>
+                {probeValid && probe.event_lag_mean_ms != null && (
+                  <>
+                    <span className="psep">·</span>
+                    <span>
+                      {t("probeEcho")}{" "}
+                      <b>{`${probe.event_lag_mean_ms >= 0 ? "+" : ""}${probe.event_lag_mean_ms.toFixed(1)}ms`}</b>
+                    </span>
+                  </>
+                )}
                 <span className="psep">·</span>
-                <span>
-                  {t("probeEcho")}{" "}
-                  <b>{`${probe.event_lag_mean_ms >= 0 ? "+" : ""}${probe.event_lag_mean_ms.toFixed(1)}ms`}</b>
-                </span>
-                <span className="psep">·</span>
-                <span className={probeStable ? "ok" : "miss"}>
-                  {probeStable ? t("probeStable") : t("probeUnstable")}
+                <span className={probeValid ? "ok" : "miss"}>
+                  {qualityLabel}
                 </span>
               </span>
               <span className="pline sub">
-                {/* 显示随平台分流,与填充逻辑一致:mac 填近端延迟,win/其它只填初始延迟。 */}
-                {platform === "macos" ? (
-                  <span className="ok">
-                    {t("probeRec")} {probe.recommended_near_delay_ms}ms · {t("probeFilled")}
-                    {initWritten != null && ` · ${t("probeInit")} ${initWritten}ms`}
-                  </span>
+                {!probeValid ? (
+                  <span className="miss">{t("probeNoFill")}</span>
+                ) : platform === "macos" ? (
+                  fill?.nearDelayMs != null ? (
+                    <span className="ok">
+                      {t("probeRec")} {fill.nearDelayMs}ms · {t("probeFilled")}
+                      {fill.initialDelayMs != null &&
+                        ` · ${t("probeInit")} ${fill.initialDelayMs}ms`}
+                    </span>
+                  ) : (
+                    <span className="miss">{t("probeNoFill")}</span>
+                  )
                 ) : (
                   <span>
                     {t("probeNoFix")}
-                    {initWritten != null && (
-                      <span className="ok"> · {t("probeInit")} {initWritten}ms</span>
+                    {fill?.initialDelayMs != null && (
+                      <span className="ok">
+                        {" "}
+                        · {t("probeInit")} {fill.initialDelayMs}ms
+                      </span>
                     )}
                   </span>
-                )}
-                {probe.warnings.length > 0 && (
-                  <span className="miss"> · {probe.warnings.join("; ")}</span>
                 )}
               </span>
             </div>

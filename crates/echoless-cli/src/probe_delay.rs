@@ -68,9 +68,7 @@ pub(crate) fn cmd_probe_delay(a: ProbeDelayArgs) -> Result<()> {
     if !a.volume.is_finite() || !(0.0..=1.0).contains(&a.volume) {
         bail!("--volume must be within 0.0..=1.0");
     }
-    if a.beeps == 0 {
-        bail!("--beeps must be greater than 0");
-    }
+    validate_probe_beep_count(a.beeps)?;
     let cancel = Arc::new(AtomicBool::new(false));
     ctrlc::set_handler({
         let cancel = Arc::clone(&cancel);
@@ -98,14 +96,18 @@ pub(crate) fn cmd_probe_delay(a: ProbeDelayArgs) -> Result<()> {
         session_retained = cleanup_generated_probe_session(&session_dir, a.json);
     }
     emit_probe_result(&result, a.json, session_retained)?;
-    if let Some(warning) = result.warnings.first() {
-        bail!("near delay probe warning: {warning}");
-    }
     Ok(())
 }
 
 fn cleanup_generated_probe_session(session_dir: &Path, json_mode: bool) -> bool {
     cleanup_probe_session_under(&echoless_paths::diagnostics_dir(), session_dir, json_mode)
+}
+
+fn validate_probe_beep_count(beeps: u32) -> Result<()> {
+    if beeps < 2 {
+        bail!("--beeps must be at least 2");
+    }
+    Ok(())
 }
 
 fn cleanup_probe_session_under(root: &Path, session_dir: &Path, json_mode: bool) -> bool {
@@ -201,6 +203,56 @@ const PROBE_GAP_MS: f64 = 650.0;
 const PROBE_MAX_LAG_MS: f64 = 250.0;
 const PROBE_SAFETY_MS: f64 = 8.0;
 const PROBE_ENV_STEP_MS: f64 = 0.5;
+const PROBE_MIN_CORR: f64 = 0.15;
+const PROBE_CLUSTER_WIDTH_MS: f64 = 10.0;
+const PROBE_MAX_STDDEV_MS: f64 = 5.0;
+const PROBE_MAX_DRIFT_MS: f64 = 10.0;
+const PROBE_MIN_REF_DBFS: f64 = -45.0;
+const PROBE_MIN_MIC_DBFS: f64 = -55.0;
+const PROBE_MIN_REF_CONTRAST_DB: f64 = 10.0;
+const PROBE_MIN_MIC_CONTRAST_DB: f64 = 4.0;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProbeQuality {
+    Valid,
+    Uncertain,
+    Invalid,
+}
+
+impl ProbeQuality {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Valid => "valid",
+            Self::Uncertain => "uncertain",
+            Self::Invalid => "invalid",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProbeQualityReason {
+    RefSignalMissing,
+    MicSignalMissing,
+    InsufficientReferenceEvents,
+    InsufficientValidLags,
+    WeakCorrelation,
+    InconsistentLags,
+    LagAtSearchBoundary,
+}
+
+impl ProbeQualityReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::RefSignalMissing => "ref_signal_missing",
+            Self::MicSignalMissing => "mic_signal_missing",
+            Self::InsufficientReferenceEvents => "insufficient_reference_events",
+            Self::InsufficientValidLags => "insufficient_valid_lags",
+            Self::WeakCorrelation => "weak_correlation",
+            Self::InconsistentLags => "inconsistent_lags",
+            Self::LagAtSearchBoundary => "lag_at_search_boundary",
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 struct ProbeLag {
@@ -217,14 +269,39 @@ struct ProbeResult {
     mic_dbfs: f64,
     global_lag_ms: f64,
     global_corr: f64,
+    quality: ProbeQuality,
+    quality_reasons: Vec<ProbeQualityReason>,
     event_count: usize,
     event_detected: usize,
-    event_lag_mean_ms: f64,
-    event_lag_stddev_ms: f64,
-    event_lag_drift_ms: f64,
-    recommended_near_delay_ms: u32,
+    event_lag_mean_ms: Option<f64>,
+    event_lag_stddev_ms: Option<f64>,
+    event_lag_drift_ms: Option<f64>,
+    recommended_near_delay_ms: Option<u32>,
     per_beep_lags: Vec<ProbeLag>,
     warnings: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
+struct ProbeAnalysis {
+    global_lag_ms: f64,
+    global_corr: f64,
+    quality: ProbeQuality,
+    quality_reasons: Vec<ProbeQualityReason>,
+    event_count: usize,
+    event_detected: usize,
+    event_lag_mean_ms: Option<f64>,
+    event_lag_stddev_ms: Option<f64>,
+    event_lag_drift_ms: Option<f64>,
+    recommended_near_delay_ms: Option<u32>,
+    per_beep_lags: Vec<ProbeLag>,
+}
+
+#[derive(Clone, Debug)]
+struct ProbeQualityAssessment {
+    quality: ProbeQuality,
+    reasons: Vec<ProbeQualityReason>,
+    inlier_lags: Vec<f64>,
+    recommended_lag_ms: Option<f64>,
 }
 
 fn probe_beep_path(a: &ProbeDelayArgs) -> Result<(PathBuf, Option<PathBuf>)> {
@@ -723,34 +800,12 @@ fn analyze_probe_session(a: &ProbeDelayArgs, session_dir: &Path) -> Result<Probe
     let step_frames = frames_for_ms(PROBE_ENV_STEP_MS).max(1);
     let ref_env = envelope(&reference, step_frames);
     let mic_env = envelope(&mic, step_frames);
-    let (global_lag_ms, global_corr) =
-        estimate_probe_lag(&ref_env, &mic_env, PROBE_ENV_STEP_MS, PROBE_MAX_LAG_MS);
-    let events = find_ref_events(&ref_env, PROBE_ENV_STEP_MS, a.beeps as usize);
-    let event_lags = per_event_lags(
-        &ref_env,
-        &mic_env,
-        &events,
-        PROBE_ENV_STEP_MS,
-        PROBE_MAX_LAG_MS,
-    );
-    let valid_lags = event_lags
-        .iter()
-        .filter(|(_, _, corr)| corr.abs() > 0.15)
-        .map(|(_, lag, _)| *lag)
-        .collect::<Vec<_>>();
-    let (mean, stddev, drift) = if valid_lags.is_empty() {
-        (global_lag_ms, 0.0, 0.0)
-    } else {
-        let mean = valid_lags.iter().sum::<f64>() / valid_lags.len() as f64;
-        let variance =
-            valid_lags.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / valid_lags.len() as f64;
-        let drift = valid_lags.last().unwrap() - valid_lags.first().unwrap();
-        (mean, variance.sqrt(), drift)
-    };
     let ref_dbfs = rms_dbfs(&reference);
     let mic_dbfs = rms_dbfs(&mic);
+    let analysis =
+        analyze_probe_envelopes(&ref_env, &mic_env, a.beeps as usize, ref_dbfs, mic_dbfs);
     let mut warnings = Vec::new();
-    if ref_dbfs < -45.0 {
+    if ref_dbfs < PROBE_MIN_REF_DBFS {
         warnings.push("ref is very quiet; play the beep through the system output".to_string());
     }
 
@@ -758,14 +813,93 @@ fn analyze_probe_session(a: &ProbeDelayArgs, session_dir: &Path) -> Result<Probe
         session_dir: session_dir.to_path_buf(),
         ref_dbfs,
         mic_dbfs,
+        global_lag_ms: analysis.global_lag_ms,
+        global_corr: analysis.global_corr,
+        quality: analysis.quality,
+        quality_reasons: analysis.quality_reasons,
+        event_count: analysis.event_count,
+        event_detected: analysis.event_detected,
+        event_lag_mean_ms: analysis.event_lag_mean_ms,
+        event_lag_stddev_ms: analysis.event_lag_stddev_ms,
+        event_lag_drift_ms: analysis.event_lag_drift_ms,
+        recommended_near_delay_ms: analysis.recommended_near_delay_ms,
+        per_beep_lags: analysis.per_beep_lags,
+        warnings,
+    })
+}
+
+fn analyze_probe_envelopes(
+    ref_env: &[f64],
+    mic_env: &[f64],
+    expected_beeps: usize,
+    ref_dbfs: f64,
+    mic_dbfs: f64,
+) -> ProbeAnalysis {
+    let (global_lag_ms, global_corr) =
+        estimate_probe_lag(ref_env, mic_env, PROBE_ENV_STEP_MS, PROBE_MAX_LAG_MS);
+    let events = find_ref_events(ref_env, PROBE_ENV_STEP_MS, expected_beeps);
+    let event_lags = per_event_lags(
+        ref_env,
+        mic_env,
+        &events,
+        PROBE_ENV_STEP_MS,
+        PROBE_MAX_LAG_MS,
+    );
+    let mut assessment = assess_probe_quality(expected_beeps, events.len(), &event_lags);
+    let ref_contrast = probe_event_contrast_db(ref_env, &events, PROBE_ENV_STEP_MS);
+    let mic_events = aligned_mic_event_centers(
+        &event_lags,
+        mic_env.len(),
+        PROBE_ENV_STEP_MS,
+        PROBE_MIN_CORR,
+    );
+    let mic_contrast = probe_event_contrast_db(mic_env, &mic_events, PROBE_ENV_STEP_MS);
+    if ref_dbfs < PROBE_MIN_REF_DBFS
+        || ref_contrast.is_none_or(|contrast| contrast < PROBE_MIN_REF_CONTRAST_DB)
+    {
+        assessment.quality = ProbeQuality::Invalid;
+        assessment
+            .reasons
+            .insert(0, ProbeQualityReason::RefSignalMissing);
+    }
+    if mic_dbfs < PROBE_MIN_MIC_DBFS
+        || mic_contrast.is_none_or(|contrast| contrast < PROBE_MIN_MIC_CONTRAST_DB)
+    {
+        assessment.quality = ProbeQuality::Invalid;
+        assessment
+            .reasons
+            .insert(0, ProbeQualityReason::MicSignalMissing);
+    }
+    assessment.reasons.dedup();
+
+    let valid = assessment.quality == ProbeQuality::Valid;
+    let (mean, stddev, drift, recommendation) = if valid {
+        let mean = mean(&assessment.inlier_lags);
+        let stddev = standard_deviation(&assessment.inlier_lags, mean);
+        let drift = assessment
+            .inlier_lags
+            .last()
+            .zip(assessment.inlier_lags.first())
+            .map(|(last, first)| last - first);
+        let recommendation = assessment
+            .recommended_lag_ms
+            .map(|lag| recommended_near_delay_ms(lag, PROBE_SAFETY_MS));
+        (Some(mean), Some(stddev), drift, recommendation)
+    } else {
+        (None, None, None, None)
+    };
+
+    ProbeAnalysis {
         global_lag_ms,
         global_corr,
-        event_count: valid_lags.len(),
+        quality: assessment.quality,
+        quality_reasons: assessment.reasons,
+        event_count: assessment.inlier_lags.len(),
         event_detected: events.len(),
         event_lag_mean_ms: mean,
         event_lag_stddev_ms: stddev,
         event_lag_drift_ms: drift,
-        recommended_near_delay_ms: recommended_near_delay_ms(mean, PROBE_SAFETY_MS),
+        recommended_near_delay_ms: recommendation,
         per_beep_lags: event_lags
             .into_iter()
             .enumerate()
@@ -776,8 +910,162 @@ fn analyze_probe_session(a: &ProbeDelayArgs, session_dir: &Path) -> Result<Probe
                 corr,
             })
             .collect(),
-        warnings,
-    })
+    }
+}
+
+fn assess_probe_quality(
+    expected_beeps: usize,
+    event_detected: usize,
+    event_lags: &[(usize, f64, f64)],
+) -> ProbeQualityAssessment {
+    let minimum_events = minimum_probe_events(expected_beeps);
+    let mut reasons = Vec::new();
+
+    if event_detected < minimum_events {
+        reasons.push(ProbeQualityReason::InsufficientReferenceEvents);
+    }
+
+    let boundary_margin = PROBE_ENV_STEP_MS / 2.0;
+    let boundary_hits = event_lags
+        .iter()
+        .filter(|(_, lag, corr)| {
+            *corr > PROBE_MIN_CORR && (lag.abs() - PROBE_MAX_LAG_MS).abs() <= boundary_margin
+        })
+        .count();
+    let positive_matches = event_lags
+        .iter()
+        .filter(|(_, _, corr)| *corr > PROBE_MIN_CORR)
+        .count();
+    let candidates = event_lags
+        .iter()
+        .filter(|(_, lag, corr)| {
+            *corr > PROBE_MIN_CORR && lag.abs() < PROBE_MAX_LAG_MS - boundary_margin
+        })
+        .map(|(_, lag, _)| *lag)
+        .collect::<Vec<_>>();
+
+    if candidates.len() < minimum_events {
+        let inlier_lags = densest_lag_cluster(&candidates, PROBE_CLUSTER_WIDTH_MS);
+        reasons.push(ProbeQualityReason::InsufficientValidLags);
+        if positive_matches < minimum_events.min(event_detected) {
+            reasons.push(ProbeQualityReason::WeakCorrelation);
+        }
+        if boundary_hits > 0 {
+            reasons.push(ProbeQualityReason::LagAtSearchBoundary);
+        }
+        return ProbeQualityAssessment {
+            quality: if event_detected < minimum_events || candidates.len() <= 1 {
+                ProbeQuality::Invalid
+            } else {
+                ProbeQuality::Uncertain
+            },
+            reasons,
+            inlier_lags,
+            recommended_lag_ms: None,
+        };
+    }
+
+    let inlier_lags = densest_lag_cluster(&candidates, PROBE_CLUSTER_WIDTH_MS);
+
+    if inlier_lags.len() < minimum_events {
+        reasons.push(ProbeQualityReason::InsufficientValidLags);
+        reasons.push(ProbeQualityReason::InconsistentLags);
+        return ProbeQualityAssessment {
+            quality: ProbeQuality::Uncertain,
+            reasons,
+            inlier_lags,
+            recommended_lag_ms: None,
+        };
+    }
+
+    let inlier_mean = mean(&inlier_lags);
+    let stddev = standard_deviation(&inlier_lags, inlier_mean);
+    let drift = inlier_lags
+        .last()
+        .zip(inlier_lags.first())
+        .map_or(0.0, |(last, first)| last - first);
+    if stddev > PROBE_MAX_STDDEV_MS || drift.abs() > PROBE_MAX_DRIFT_MS {
+        reasons.push(ProbeQualityReason::InconsistentLags);
+        return ProbeQualityAssessment {
+            quality: ProbeQuality::Uncertain,
+            reasons,
+            inlier_lags,
+            recommended_lag_ms: None,
+        };
+    }
+
+    if event_detected < minimum_events {
+        return ProbeQualityAssessment {
+            quality: ProbeQuality::Invalid,
+            reasons,
+            inlier_lags,
+            recommended_lag_ms: None,
+        };
+    }
+
+    ProbeQualityAssessment {
+        quality: ProbeQuality::Valid,
+        reasons,
+        recommended_lag_ms: Some(median(&inlier_lags)),
+        inlier_lags,
+    }
+}
+
+fn densest_lag_cluster(candidates: &[f64], width_ms: f64) -> Vec<f64> {
+    if candidates.is_empty() {
+        return Vec::new();
+    }
+    let mut sorted = candidates.to_vec();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
+    let mut left = 0usize;
+    let mut best = (0usize, 0usize);
+    for right in 0..sorted.len() {
+        while sorted[right] - sorted[left] > width_ms {
+            left += 1;
+        }
+        if right - left > best.1 - best.0 {
+            best = (left, right);
+        }
+    }
+    let lower = sorted[best.0];
+    let upper = sorted[best.1];
+    candidates
+        .iter()
+        .copied()
+        .filter(|lag| *lag >= lower && *lag <= upper)
+        .collect()
+}
+
+fn minimum_probe_events(expected_beeps: usize) -> usize {
+    expected_beeps.saturating_mul(2).div_ceil(3).max(2)
+}
+
+fn median(values: &[f64]) -> f64 {
+    if values.is_empty() {
+        return 0.0;
+    }
+    let mut sorted = values.to_vec();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let middle = sorted.len() / 2;
+    if sorted.len().is_multiple_of(2) {
+        (sorted[middle - 1] + sorted[middle]) / 2.0
+    } else {
+        sorted[middle]
+    }
+}
+
+fn mean(values: &[f64]) -> f64 {
+    values.iter().sum::<f64>() / values.len().max(1) as f64
+}
+
+fn standard_deviation(values: &[f64], mean: f64) -> f64 {
+    let variance = values
+        .iter()
+        .map(|value| (value - mean).powi(2))
+        .sum::<f64>()
+        / values.len().max(1) as f64;
+    variance.sqrt()
 }
 
 fn read_wav_mono(path: &Path) -> Result<(u32, Vec<f32>)> {
@@ -831,20 +1119,88 @@ fn envelope(samples: &[f32], step_frames: usize) -> Vec<f64> {
         .collect()
 }
 
-fn standardize(values: &[f64]) -> Vec<f64> {
-    if values.is_empty() {
-        return Vec::new();
+fn aligned_mic_event_centers(
+    event_lags: &[(usize, f64, f64)],
+    mic_len: usize,
+    step_ms: f64,
+    min_corr: f64,
+) -> Vec<usize> {
+    event_lags
+        .iter()
+        .filter(|(_, _, corr)| *corr > min_corr)
+        .filter_map(|(event, lag_ms, _)| {
+            let center = *event as isize + (lag_ms / step_ms).round() as isize;
+            usize::try_from(center)
+                .ok()
+                .filter(|center| *center < mic_len)
+        })
+        .collect()
+}
+
+fn probe_event_contrast_db(envelope: &[f64], event_centers: &[usize], step_ms: f64) -> Option<f64> {
+    if envelope.is_empty() || event_centers.is_empty() {
+        return None;
     }
-    let mean = values.iter().sum::<f64>() / values.len() as f64;
-    let centered = values.iter().map(|v| v - mean).collect::<Vec<_>>();
-    let energy = centered.iter().map(|v| v * v).sum::<f64>().sqrt().max(1.0);
-    centered.into_iter().map(|v| v / energy).collect()
+    let pre = (10.0 / step_ms).round().max(1.0) as usize;
+    let post = (PROBE_BEEP_MS / step_ms).round().max(1.0) as usize;
+    let mut event_mask = vec![false; envelope.len()];
+    for center in event_centers {
+        let start = center.saturating_sub(pre);
+        let end = envelope.len().min(center.saturating_add(post));
+        event_mask[start..end].fill(true);
+    }
+
+    let event_values = envelope
+        .iter()
+        .zip(&event_mask)
+        .filter_map(|(value, selected)| selected.then_some(*value))
+        .collect::<Vec<_>>();
+    let background_values = envelope
+        .iter()
+        .zip(&event_mask)
+        .filter_map(|(value, selected)| (!selected).then_some(*value))
+        .collect::<Vec<_>>();
+    if event_values.is_empty() || background_values.is_empty() {
+        return None;
+    }
+    let event_level = median(&event_values);
+    let background_level = median(&background_values);
+    if event_level <= f64::EPSILON {
+        return None;
+    }
+    if background_level <= f64::EPSILON {
+        return Some(f64::INFINITY);
+    }
+    Some(20.0 * (event_level / background_level).log10())
+}
+
+fn normalized_correlation(reference: &[f64], mic: &[f64]) -> f64 {
+    let len = reference.len().min(mic.len());
+    if len < 2 {
+        return 0.0;
+    }
+    let ref_mean = reference[..len].iter().sum::<f64>() / len as f64;
+    let mic_mean = mic[..len].iter().sum::<f64>() / len as f64;
+    let mut covariance = 0.0;
+    let mut ref_energy = 0.0;
+    let mut mic_energy = 0.0;
+    for index in 0..len {
+        let reference = reference[index] - ref_mean;
+        let mic = mic[index] - mic_mean;
+        covariance += reference * mic;
+        ref_energy += reference * reference;
+        mic_energy += mic * mic;
+    }
+    let denominator = (ref_energy * mic_energy).sqrt();
+    if denominator <= f64::EPSILON {
+        0.0
+    } else {
+        (covariance / denominator).clamp(-1.0, 1.0)
+    }
 }
 
 fn estimate_probe_lag(reference: &[f64], mic: &[f64], step_ms: f64, max_lag_ms: f64) -> (f64, f64) {
     let n = reference.len().min(mic.len());
-    let reference = standardize(&reference[..n]);
-    let mic = standardize(&mic[..n]);
     let max_lag = (max_lag_ms / step_ms).round().max(1.0) as isize;
     let mut best_lag = 0isize;
     let mut best_corr = 0.0f64;
@@ -860,9 +1216,10 @@ fn estimate_probe_lag(reference: &[f64], mic: &[f64], step_ms: f64, max_lag_ms: 
         if len < 10 {
             continue;
         }
-        let corr = (0..len)
-            .map(|i| reference[ref_start + i] * mic[mic_start + i])
-            .sum::<f64>();
+        let corr = normalized_correlation(
+            &reference[ref_start..ref_start + len],
+            &mic[mic_start..mic_start + len],
+        );
         if corr.abs() > best_corr.abs() {
             best_corr = corr;
             best_lag = lag;
@@ -919,19 +1276,37 @@ fn per_event_lags(
     step_ms: f64,
     max_lag_ms: f64,
 ) -> Vec<(usize, f64, f64)> {
-    let half_window = (160.0 / step_ms).round().max(20.0) as usize;
+    let half_window = (100.0 / step_ms).round().max(20.0) as usize;
+    let max_lag = (max_lag_ms / step_ms).round().max(1.0) as isize;
     events
         .iter()
         .map(|event| {
-            let start = event.saturating_sub(half_window);
-            let end = reference.len().min(event + half_window);
-            let (lag_ms, corr) = estimate_probe_lag(
-                &reference[start..end],
-                &mic[start..end],
-                step_ms,
-                max_lag_ms,
-            );
-            (*event, lag_ms, corr)
+            let lag_margin = max_lag as usize;
+            let start = event.saturating_sub(half_window).max(lag_margin);
+            let end = reference
+                .len()
+                .min(event + half_window)
+                .min(mic.len().saturating_sub(lag_margin));
+            if start >= end {
+                return (*event, 0.0, 0.0);
+            }
+            let template = &reference[start..end];
+            let mut best_lag = 0isize;
+            let mut best_corr = 0.0f64;
+            for lag in -max_lag..=max_lag {
+                let mic_start = start as isize + lag;
+                let mic_end = end as isize + lag;
+                if mic_start < 0 || mic_end > mic.len() as isize {
+                    continue;
+                }
+                let corr =
+                    normalized_correlation(template, &mic[mic_start as usize..mic_end as usize]);
+                if corr.abs() > best_corr.abs() {
+                    best_corr = corr;
+                    best_lag = lag;
+                }
+            }
+            (*event, best_lag as f64 * step_ms, best_corr)
         })
         .collect()
 }
@@ -946,27 +1321,7 @@ fn emit_probe_result(result: &ProbeResult, json_mode: bool, session_retained: bo
     if json_mode {
         println!(
             "{}",
-            serde_json::to_string(&json!({
-                "session_dir": result.session_dir.display().to_string(),
-                "session_retained": session_retained,
-                "ref_dbfs": round2(result.ref_dbfs),
-                "mic_dbfs": round2(result.mic_dbfs),
-                "global_lag_ms": round2(result.global_lag_ms),
-                "global_corr": round4(result.global_corr),
-                "event_count": result.event_count,
-                "event_detected": result.event_detected,
-                "event_lag_mean_ms": round2(result.event_lag_mean_ms),
-                "event_lag_stddev_ms": round2(result.event_lag_stddev_ms),
-                "event_lag_drift_ms": round2(result.event_lag_drift_ms),
-                "recommended_near_delay_ms": result.recommended_near_delay_ms,
-                "per_beep_lags": result.per_beep_lags.iter().map(|lag| json!({
-                    "index": lag.index,
-                    "time_s": round3(lag.time_s),
-                    "lag_ms": round2(lag.lag_ms),
-                    "corr": round4(lag.corr),
-                })).collect::<Vec<_>>(),
-                "warnings": result.warnings,
-            }))?
+            serde_json::to_string(&probe_result_json(result, session_retained))?
         );
         return Ok(());
     }
@@ -980,16 +1335,39 @@ fn emit_probe_result(result: &ProbeResult, json_mode: bool, session_retained: bo
         "global_lag_ms: {:+.2}  corr={:+.3}",
         result.global_lag_ms, result.global_corr
     );
+    println!("quality: {}", result.quality.as_str());
+    if !result.quality_reasons.is_empty() {
+        println!(
+            "quality_reasons: {}",
+            result
+                .quality_reasons
+                .iter()
+                .map(|reason| reason.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
     println!(
         "event_count: {}/{}",
         result.event_count, result.event_detected
     );
-    println!("event_lag_mean_ms: {:+.2}", result.event_lag_mean_ms);
-    println!("event_lag_stddev_ms: {:.2}", result.event_lag_stddev_ms);
-    println!("event_lag_drift_ms: {:+.2}", result.event_lag_drift_ms);
+    println!(
+        "event_lag_mean_ms: {}",
+        format_optional_ms(result.event_lag_mean_ms, true)
+    );
+    println!(
+        "event_lag_stddev_ms: {}",
+        format_optional_ms(result.event_lag_stddev_ms, false)
+    );
+    println!(
+        "event_lag_drift_ms: {}",
+        format_optional_ms(result.event_lag_drift_ms, true)
+    );
     println!(
         "recommended_near_delay_ms: {}",
-        result.recommended_near_delay_ms
+        result
+            .recommended_near_delay_ms
+            .map_or_else(|| "unavailable".to_string(), |value| value.to_string())
     );
     println!("\nper-beep lags:");
     for lag in &result.per_beep_lags {
@@ -1002,6 +1380,40 @@ fn emit_probe_result(result: &ProbeResult, json_mode: bool, session_retained: bo
         println!("\nwarning: {warning}");
     }
     Ok(())
+}
+
+fn probe_result_json(result: &ProbeResult, session_retained: bool) -> serde_json::Value {
+    json!({
+        "session_dir": result.session_dir.display().to_string(),
+        "session_retained": session_retained,
+        "ref_dbfs": round2(result.ref_dbfs),
+        "mic_dbfs": round2(result.mic_dbfs),
+        "global_lag_ms": round2(result.global_lag_ms),
+        "global_corr": round4(result.global_corr),
+        "quality": result.quality.as_str(),
+        "quality_reasons": result.quality_reasons.iter().map(|reason| reason.as_str()).collect::<Vec<_>>(),
+        "event_count": result.event_count,
+        "event_detected": result.event_detected,
+        "event_lag_mean_ms": result.event_lag_mean_ms.map(round2),
+        "event_lag_stddev_ms": result.event_lag_stddev_ms.map(round2),
+        "event_lag_drift_ms": result.event_lag_drift_ms.map(round2),
+        "recommended_near_delay_ms": result.recommended_near_delay_ms,
+        "per_beep_lags": result.per_beep_lags.iter().map(|lag| json!({
+            "index": lag.index,
+            "time_s": round3(lag.time_s),
+            "lag_ms": round2(lag.lag_ms),
+            "corr": round4(lag.corr),
+        })).collect::<Vec<_>>(),
+        "warnings": result.warnings,
+    })
+}
+
+fn format_optional_ms(value: Option<f64>, signed: bool) -> String {
+    match (value, signed) {
+        (Some(value), true) => format!("{value:+.2}"),
+        (Some(value), false) => format!("{value:.2}"),
+        (None, _) => "unavailable".to_string(),
+    }
 }
 
 fn round2(value: f64) -> f64 {
@@ -1025,6 +1437,83 @@ fn probe_log(json_mode: bool, message: impl AsRef<str>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const SYNTHETIC_BEEPS: usize = 12;
+
+    fn synthetic_probe_envelope() -> Vec<f64> {
+        let pre = (PROBE_PRE_ROLL_S * 1000.0 / PROBE_ENV_STEP_MS) as usize;
+        let beep = (PROBE_BEEP_MS / PROBE_ENV_STEP_MS) as usize;
+        let gap = (PROBE_GAP_MS / PROBE_ENV_STEP_MS) as usize;
+        let mut envelope = vec![0.0; pre + SYNTHETIC_BEEPS * (beep + gap) + 1_000];
+        for index in 0..SYNTHETIC_BEEPS {
+            let start = pre + index * (beep + gap);
+            for (offset, value) in envelope[start..start + beep].iter_mut().enumerate() {
+                let phase = offset as f64 / beep as f64;
+                *value = (std::f64::consts::PI * phase).sin().max(0.0);
+            }
+        }
+        envelope
+    }
+
+    fn synthetic_flat_probe_envelope() -> Vec<f64> {
+        let pre = (PROBE_PRE_ROLL_S * 1000.0 / PROBE_ENV_STEP_MS) as usize;
+        let beep = (PROBE_BEEP_MS / PROBE_ENV_STEP_MS) as usize;
+        let gap = (PROBE_GAP_MS / PROBE_ENV_STEP_MS) as usize;
+        let mut envelope = vec![0.0; pre + SYNTHETIC_BEEPS * (beep + gap) + 1_000];
+        for index in 0..SYNTHETIC_BEEPS {
+            let start = pre + index * (beep + gap);
+            envelope[start..start + beep].fill(1.0);
+        }
+        envelope
+    }
+
+    fn add_power_noise(signal: &[f64], noise: f64, snr_db: f64) -> Vec<f64> {
+        let signal_scale = noise * 10.0f64.powf(snr_db / 20.0);
+        signal
+            .iter()
+            .map(|sample| (noise * noise + (sample * signal_scale).powi(2)).sqrt())
+            .collect()
+    }
+
+    fn shift_envelope(source: &[f64], lag_steps: isize) -> Vec<f64> {
+        let mut shifted = vec![0.0; source.len()];
+        for (index, value) in source.iter().copied().enumerate() {
+            let target = index as isize + lag_steps;
+            if let Some(slot) = usize::try_from(target)
+                .ok()
+                .and_then(|target| shifted.get_mut(target))
+            {
+                *slot = value;
+            }
+        }
+        shifted
+    }
+
+    fn deterministic_noise(len: usize) -> Vec<f64> {
+        let mut state = 0x4d59_5df4_d0f3_3173_u64;
+        (0..len)
+            .map(|_| {
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1);
+                0.02 + ((state >> 32) as f64 / u32::MAX as f64) * 0.02
+            })
+            .collect()
+    }
+
+    fn write_silent_test_wav(path: &Path) {
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: PROBE_SAMPLE_RATE,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut writer = hound::WavWriter::create(path, spec).unwrap();
+        for _ in 0..PROBE_SAMPLE_RATE {
+            writer.write_sample(0_i16).unwrap();
+        }
+        writer.finalize().unwrap();
+    }
 
     fn temp_probe_test_dir(name: &str) -> PathBuf {
         let dir = env::temp_dir().join(format!(
@@ -1245,5 +1734,340 @@ mod tests {
         assert!(event_lags
             .iter()
             .all(|(_, lag_ms, corr)| *lag_ms == -2.0 && *corr > 0.95));
+    }
+
+    #[test]
+    fn native_probe_correlation_is_independent_of_signal_scale() {
+        let mut reference = vec![0.0; 1_100];
+        let mut mic = vec![0.0; 1_100];
+        for index in [100usize, 500, 900] {
+            reference[index] = 1.0;
+            mic[index - 4] = 0.001;
+        }
+
+        let (lag_ms, corr) = estimate_probe_lag(&reference, &mic, 0.5, 20.0);
+
+        assert_eq!(lag_ms, -2.0);
+        assert!(corr > 0.95, "scaled correlation was {corr}");
+    }
+
+    #[test]
+    fn native_probe_event_search_reaches_the_configured_boundary() {
+        let mut reference = vec![0.0; 3_000];
+        let mut mic = vec![0.0; 3_000];
+        let event = 1_200usize;
+        reference[event] = 1.0;
+        mic[event + 500] = 1.0;
+
+        let lags = per_event_lags(&reference, &mic, &[event], 0.5, 250.0);
+
+        assert_eq!(lags.len(), 1);
+        assert_eq!(lags[0].1, 250.0);
+        assert!(lags[0].2 > 0.95, "boundary correlation was {}", lags[0].2);
+    }
+
+    #[test]
+    fn probe_quality_rejects_silent_microphone_without_a_recommendation() {
+        let reference = synthetic_probe_envelope();
+        let mic = vec![0.0; reference.len()];
+
+        let analysis = analyze_probe_envelopes(&reference, &mic, SYNTHETIC_BEEPS, -6.0, -120.0);
+
+        assert_eq!(analysis.quality, ProbeQuality::Invalid);
+        assert!(analysis
+            .quality_reasons
+            .contains(&ProbeQualityReason::MicSignalMissing));
+        assert_eq!(analysis.event_lag_mean_ms, None);
+        assert_eq!(analysis.event_lag_stddev_ms, None);
+        assert_eq!(analysis.event_lag_drift_ms, None);
+        assert_eq!(analysis.recommended_near_delay_ms, None);
+    }
+
+    #[test]
+    fn probe_quality_rejects_deterministic_noise_without_a_recommendation() {
+        let reference = synthetic_probe_envelope();
+        let mic = deterministic_noise(reference.len());
+
+        let analysis = analyze_probe_envelopes(&reference, &mic, SYNTHETIC_BEEPS, -6.0, -24.0);
+
+        assert_ne!(analysis.quality, ProbeQuality::Valid);
+        assert_eq!(analysis.recommended_near_delay_ms, None);
+    }
+
+    #[test]
+    fn probe_quality_rejects_one_matching_event_as_insufficient() {
+        let reference = synthetic_probe_envelope();
+        let shifted = shift_envelope(&reference, -40);
+        let first_event_end =
+            ((PROBE_PRE_ROLL_S * 1000.0 + PROBE_BEEP_MS) / PROBE_ENV_STEP_MS) as usize;
+        let mut mic = vec![0.0; reference.len()];
+        mic[..first_event_end].copy_from_slice(&shifted[..first_event_end]);
+
+        let analysis = analyze_probe_envelopes(&reference, &mic, SYNTHETIC_BEEPS, -6.0, -18.0);
+
+        assert_ne!(analysis.quality, ProbeQuality::Valid);
+        assert!(analysis
+            .quality_reasons
+            .contains(&ProbeQualityReason::InsufficientValidLags));
+        assert_eq!(analysis.recommended_near_delay_ms, None);
+    }
+
+    #[test]
+    fn probe_quality_never_accepts_negative_correlation() {
+        let reference = synthetic_probe_envelope();
+        let mic = reference
+            .iter()
+            .map(|value| 1.0 - value)
+            .collect::<Vec<_>>();
+
+        let analysis = analyze_probe_envelopes(&reference, &mic, SYNTHETIC_BEEPS, -6.0, -6.0);
+
+        assert_ne!(analysis.quality, ProbeQuality::Valid);
+        assert!(analysis.per_beep_lags.iter().all(|lag| lag.corr <= 0.0));
+        assert_eq!(analysis.recommended_near_delay_ms, None);
+    }
+
+    #[test]
+    fn probe_quality_rejects_a_cluster_on_the_search_boundary() {
+        let event_lags = (0..SYNTHETIC_BEEPS)
+            .map(|index| (1_000 + index * 1_440, PROBE_MAX_LAG_MS, 0.9))
+            .collect::<Vec<_>>();
+
+        let quality = assess_probe_quality(SYNTHETIC_BEEPS, SYNTHETIC_BEEPS, &event_lags);
+
+        assert_ne!(quality.quality, ProbeQuality::Valid);
+        assert!(quality
+            .reasons
+            .contains(&ProbeQualityReason::LagAtSearchBoundary));
+        assert_eq!(quality.recommended_lag_ms, None);
+    }
+
+    #[test]
+    fn probe_quality_accepts_the_full_twelve_beep_fixture() {
+        let reference = synthetic_probe_envelope();
+        let mic = shift_envelope(&reference, -40);
+
+        let analysis = analyze_probe_envelopes(&reference, &mic, SYNTHETIC_BEEPS, -6.0, -12.0);
+
+        assert_eq!(analysis.quality, ProbeQuality::Valid);
+        assert_eq!(analysis.quality_reasons, Vec::new());
+        assert_eq!(analysis.event_count, SYNTHETIC_BEEPS);
+        assert_eq!(analysis.event_lag_mean_ms, Some(-20.0));
+        assert_eq!(analysis.event_lag_stddev_ms, Some(0.0));
+        assert_eq!(analysis.event_lag_drift_ms, Some(0.0));
+        assert_eq!(
+            analysis.recommended_near_delay_ms,
+            Some(recommended_near_delay_ms(-20.0, PROBE_SAFETY_MS))
+        );
+    }
+
+    #[test]
+    fn probe_quality_uses_the_majority_cluster_and_ignores_outliers() {
+        let event_lags = (0..SYNTHETIC_BEEPS)
+            .map(|index| {
+                let lag = if index < 8 { -20.0 } else { 80.0 };
+                (1_000 + index * 1_440, lag, 0.9)
+            })
+            .collect::<Vec<_>>();
+
+        let quality = assess_probe_quality(SYNTHETIC_BEEPS, SYNTHETIC_BEEPS, &event_lags);
+
+        assert_eq!(quality.quality, ProbeQuality::Valid);
+        assert_eq!(quality.inlier_lags, vec![-20.0; 8]);
+        assert_eq!(quality.recommended_lag_ms, Some(-20.0));
+    }
+
+    #[test]
+    fn probe_quality_accepts_eight_events_inside_one_ten_ms_cluster() {
+        let event_lags = (0..SYNTHETIC_BEEPS)
+            .map(|index| {
+                let lag = if index < 7 {
+                    -20.0
+                } else if index < 10 {
+                    -12.0
+                } else {
+                    80.0
+                };
+                (1_000 + index * 1_440, lag, 0.9)
+            })
+            .collect::<Vec<_>>();
+
+        let quality = assess_probe_quality(SYNTHETIC_BEEPS, SYNTHETIC_BEEPS, &event_lags);
+
+        assert_eq!(quality.quality, ProbeQuality::Valid);
+        assert_eq!(quality.inlier_lags.len(), 10);
+        assert_eq!(quality.recommended_lag_ms, Some(-20.0));
+    }
+
+    #[test]
+    fn probe_quality_requires_two_thirds_of_the_reference_events() {
+        let event_lags = (0..3)
+            .map(|index| (1_000 + index * 1_440, -20.0, 0.9))
+            .collect::<Vec<_>>();
+
+        let quality = assess_probe_quality(SYNTHETIC_BEEPS, 3, &event_lags);
+
+        assert_eq!(minimum_probe_events(SYNTHETIC_BEEPS), 8);
+        assert_eq!(quality.quality, ProbeQuality::Invalid);
+        assert!(quality
+            .reasons
+            .contains(&ProbeQualityReason::InsufficientReferenceEvents));
+        assert_eq!(quality.recommended_lag_ms, None);
+    }
+
+    #[test]
+    fn invalid_probe_json_uses_null_for_every_fillable_measurement() {
+        let result = ProbeResult {
+            session_dir: PathBuf::from("/tmp/session-test"),
+            ref_dbfs: -6.0,
+            mic_dbfs: -120.0,
+            global_lag_ms: 137.5,
+            global_corr: 0.2,
+            quality: ProbeQuality::Invalid,
+            quality_reasons: vec![ProbeQualityReason::MicSignalMissing],
+            event_count: 0,
+            event_detected: SYNTHETIC_BEEPS,
+            event_lag_mean_ms: None,
+            event_lag_stddev_ms: None,
+            event_lag_drift_ms: None,
+            recommended_near_delay_ms: None,
+            per_beep_lags: Vec::new(),
+            warnings: vec!["diagnostic warning".to_string()],
+        };
+
+        let payload = probe_result_json(&result, false);
+
+        assert_eq!(payload["quality"], "invalid");
+        assert_eq!(payload["quality_reasons"][0], "mic_signal_missing");
+        assert_eq!(payload["global_lag_ms"], 137.5);
+        assert!(payload["event_lag_mean_ms"].is_null());
+        assert!(payload["event_lag_stddev_ms"].is_null());
+        assert!(payload["event_lag_drift_ms"].is_null());
+        assert!(payload["recommended_near_delay_ms"].is_null());
+    }
+
+    #[test]
+    fn completed_invalid_measurement_is_a_successful_cli_result() {
+        let session = temp_probe_test_dir("invalid-is-result");
+        write_silent_test_wav(&session.join("ref.wav"));
+        write_silent_test_wav(&session.join("mic.wav"));
+        let args = ProbeDelayArgs {
+            mic: "unused".to_string(),
+            reference: "unused".to_string(),
+            output: "unused".to_string(),
+            keep_session: false,
+            startup_delay: 0.0,
+            beeps: SYNTHETIC_BEEPS as u32,
+            volume: 0.35,
+            analyze_only: Some(session.clone()),
+            keep_beep: None,
+            json: true,
+        };
+
+        let result = cmd_probe_delay(args);
+
+        assert!(result.is_ok());
+        let _ = remove_dir_all(session);
+    }
+
+    #[test]
+    fn probe_cli_requires_at_least_two_beeps() {
+        assert!(validate_probe_beep_count(0).is_err());
+        assert!(validate_probe_beep_count(1).is_err());
+        assert!(validate_probe_beep_count(2).is_ok());
+    }
+
+    #[test]
+    fn probe_event_contrast_matches_power_snr_evidence() {
+        let clean = synthetic_flat_probe_envelope();
+        let events = find_ref_events(&clean, PROBE_ENV_STEP_MS, SYNTHETIC_BEEPS);
+        let snr_3 = add_power_noise(&clean, 0.1, 3.0);
+        let snr_0 = add_power_noise(&clean, 0.1, 0.0);
+
+        let contrast_3 = probe_event_contrast_db(&snr_3, &events, PROBE_ENV_STEP_MS).unwrap();
+        let contrast_0 = probe_event_contrast_db(&snr_0, &events, PROBE_ENV_STEP_MS).unwrap();
+
+        assert!(
+            (4.6..=4.9).contains(&contrast_3),
+            "3dB SNR -> {contrast_3}dB contrast"
+        );
+        assert!(
+            (2.9..=3.1).contains(&contrast_0),
+            "0dB SNR -> {contrast_0}dB contrast"
+        );
+    }
+
+    #[test]
+    fn probe_mic_contrast_accepts_snr_three_and_rejects_snr_zero() {
+        let reference = synthetic_flat_probe_envelope();
+        for (snr_db, expected_quality) in [
+            (6.0, ProbeQuality::Valid),
+            (3.0, ProbeQuality::Valid),
+            (0.0, ProbeQuality::Invalid),
+        ] {
+            let mic = shift_envelope(&add_power_noise(&reference, 0.1, snr_db), -40);
+            let analysis = analyze_probe_envelopes(&reference, &mic, SYNTHETIC_BEEPS, -6.0, -12.0);
+
+            assert_eq!(analysis.quality, expected_quality, "SNR {snr_db}dB");
+            assert_eq!(
+                analysis
+                    .quality_reasons
+                    .contains(&ProbeQualityReason::MicSignalMissing),
+                snr_db == 0.0,
+                "SNR {snr_db}dB reasons: {:?}",
+                analysis.quality_reasons,
+            );
+        }
+    }
+
+    #[test]
+    fn probe_ref_contrast_accepts_twelve_db_and_rejects_nine_db() {
+        let clean = synthetic_flat_probe_envelope();
+        for (snr_db, expected_quality) in
+            [(12.0, ProbeQuality::Valid), (9.0, ProbeQuality::Invalid)]
+        {
+            let reference = add_power_noise(&clean, 0.1, snr_db);
+            let mic = shift_envelope(&reference, -40);
+
+            let analysis = analyze_probe_envelopes(&reference, &mic, SYNTHETIC_BEEPS, -6.0, -12.0);
+
+            assert_eq!(analysis.quality, expected_quality, "SNR {snr_db}dB");
+            assert_eq!(
+                analysis
+                    .quality_reasons
+                    .contains(&ProbeQualityReason::RefSignalMissing),
+                snr_db == 9.0,
+            );
+        }
+    }
+
+    #[test]
+    fn probe_wrong_route_high_noise_reports_missing_mic_signal() {
+        let reference = synthetic_flat_probe_envelope();
+        let mic = deterministic_noise(reference.len());
+
+        let analysis = analyze_probe_envelopes(&reference, &mic, SYNTHETIC_BEEPS, -6.0, -12.0);
+
+        assert_ne!(analysis.quality, ProbeQuality::Valid);
+        assert!(analysis
+            .quality_reasons
+            .contains(&ProbeQualityReason::MicSignalMissing));
+        assert_eq!(analysis.recommended_near_delay_ms, None);
+    }
+
+    #[test]
+    fn strong_boundary_matches_do_not_report_weak_correlation() {
+        let event_lags = (0..SYNTHETIC_BEEPS)
+            .map(|index| (1_000 + index * 1_440, PROBE_MAX_LAG_MS, 0.9))
+            .collect::<Vec<_>>();
+
+        let quality = assess_probe_quality(SYNTHETIC_BEEPS, SYNTHETIC_BEEPS, &event_lags);
+
+        assert!(quality
+            .reasons
+            .contains(&ProbeQualityReason::LagAtSearchBoundary));
+        assert!(!quality
+            .reasons
+            .contains(&ProbeQualityReason::WeakCorrelation));
     }
 }

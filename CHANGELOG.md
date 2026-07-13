@@ -6,6 +6,12 @@ adheres to [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
+## [1.2.0-rc.1] — 2026-07-13
+
+Preview of the 1.2.0 feature release: Windows login startup, shared WebRTC and
+RNNoise post-AEC suppression, a safer delay probe, and a reorganized Advanced
+page.
+
 ### Added
 - Windows **Auto Start** option: launch hidden after sign-in and start the saved
   Echoless audio pipeline automatically. Startup failures reveal the main window
@@ -28,6 +34,10 @@ adheres to [Semantic Versioning](https://semver.org).
 ### Fixed
 - RNNoise buffer-backed models now initialize their file handle before cleanup,
   preventing a Linux crash when the processor is destroyed.
+- Delay Probe now rejects missing, weak, sparse, inconsistent, and search-limit
+  measurements instead of treating a repeatable bad match as stable. Invalid
+  results leave the existing delay untouched and give the user a short retry
+  hint instead of exposing internal correlation diagnostics.
 
 ## [1.1.0] — 2026-07-11
 
