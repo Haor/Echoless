@@ -1996,6 +1996,9 @@ hr.hair {
   padding-right: 0;
   text-align: center;
 }
+#ns .b.long-label {
+  letter-spacing: 0.08em;
+}
 
 /* signal — 三路示波(near-end MIC+REF → clean OUT) */
 .sig {

@@ -2443,7 +2443,9 @@ function AppShell() {
                   <button
                     type="button"
                     key={mode}
-                    className={`b ${active ? "active" : ""}`}
+                    className={`b ${mode === "off" ? "" : "long-label"} ${
+                      active ? "active" : ""
+                    }`}
                     disabled={busy || active || !compatible}
                     onClick={() => selectNoiseMode(mode)}
                   >
