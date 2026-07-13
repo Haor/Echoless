@@ -98,6 +98,7 @@ import {
   allowedNoiseModes,
   modelFileName,
   normalizeNoiseMode,
+  patchNoiseModeParam,
   shouldSelectNoiseMode,
   isNearDelayOnlyPatch,
   hotInitialDelayValue,
@@ -341,6 +342,9 @@ type SelectionState = {
 type EngineState = {
   kind: string;
   noiseMode: NoiseMode;
+  noiseParamsByMode: Partial<
+    Record<NoiseMode, Record<string, unknown>>
+  >;
   pipeline: PipelineCfg;
   params: Record<string, unknown>;
 };
@@ -397,6 +401,7 @@ const INITIAL_APP_STATE: AppState = {
 const INITIAL_ENGINE_STATE: EngineState = {
   kind: "aec3",
   noiseMode: "off",
+  noiseParamsByMode: {},
   pipeline: INITIAL_PIPELINE,
   params: {},
 };
@@ -408,6 +413,9 @@ const ENGINE_STATE_KEY = "echoless.engine.v2";
 type SavedEngineState = {
   kind?: string;
   noiseMode?: NoiseMode;
+  noiseParamsByMode?: Partial<
+    Record<NoiseMode, Record<string, unknown>>
+  >;
   pipeline?: Partial<PipelineCfg>;
   paramsByKind?: Record<string, Record<string, unknown>>;
 };
@@ -425,6 +433,10 @@ function readSavedEngineState(): SavedEngineState {
         p.noiseMode === "rnnoise" ||
         p.noiseMode === "off"
           ? p.noiseMode
+          : undefined,
+      noiseParamsByMode:
+        p.noiseParamsByMode && typeof p.noiseParamsByMode === "object"
+          ? p.noiseParamsByMode
           : undefined,
       pipeline:
         p.pipeline && typeof p.pipeline === "object" ? p.pipeline : undefined,
@@ -461,6 +473,7 @@ function initEngineState(): EngineState {
   return {
     kind,
     noiseMode: SAVED_ENGINE.noiseMode ?? "off",
+    noiseParamsByMode: SAVED_ENGINE.noiseParamsByMode ?? {},
     pipeline: pipelineForEngineKind(kind, savedPipeline),
     params: SAVED_ENGINE.paramsByKind?.[kind] ?? {},
   };
@@ -627,9 +640,11 @@ function useEngineConfig({
     undefined,
     initEngineState,
   );
-  const { kind, noiseMode, pipeline, params } = engineState;
+  const { kind, noiseMode, noiseParamsByMode, pipeline, params } = engineState;
   const noiseModeRef = useRef(noiseMode);
   noiseModeRef.current = noiseMode;
+  const noiseParamsByModeRef = useRef(noiseParamsByMode);
+  noiseParamsByModeRef.current = noiseParamsByMode;
   const pipelineRef = useRef(pipeline);
   pipelineRef.current = pipeline;
   const paramsRef = useRef(params);
@@ -801,6 +816,20 @@ function useEngineConfig({
     applyChangeRef.current({ noiseMode: next });
   }
 
+  function setNoiseParam(key: string, val: unknown) {
+    const mode = noiseModeRef.current;
+    const next = patchNoiseModeParam(
+      noiseParamsByModeRef.current,
+      mode,
+      key,
+      val,
+    );
+    if (!next) return;
+    noiseParamsByModeRef.current = next;
+    updateEngine({ noiseParamsByMode: next });
+    applyChangeRef.current({ noiseMode: mode });
+  }
+
   function hotNearDelayValue(next: PipelineCfg): number {
     return next.near_delay_ms ?? platformNearDelayDefault(platform);
   }
@@ -851,6 +880,7 @@ function useEngineConfig({
         JSON.stringify({
           kind,
           noiseMode,
+          noiseParamsByMode,
           pipeline,
           paramsByKind: paramsByKind.current,
         }),
@@ -858,12 +888,13 @@ function useEngineConfig({
     } catch {
       /* 持久化失败不阻塞 */
     }
-  }, [kind, noiseMode, pipeline, params]);
+  }, [kind, noiseMode, noiseParamsByMode, pipeline, params]);
 
   return {
     engineState,
     updateEngine,
     noiseModeRef,
+    noiseParamsByModeRef,
     pipelineRef,
     paramsRef,
     paramsByKind,
@@ -871,6 +902,7 @@ function useEngineConfig({
     changeKind,
     setParam,
     selectNoiseMode,
+    setNoiseParam,
     pickLocalvqeModel,
     changePipeline,
     changeOutVolume,
@@ -890,6 +922,9 @@ type RunLifecycleDeps = {
   kind: string;
   engineReady: (kind: string) => boolean;
   noiseModeRef: MutableRefObject<NoiseMode>;
+  noiseParamsByModeRef: MutableRefObject<
+    Partial<Record<NoiseMode, Record<string, unknown>>>
+  >;
   pipelineRef: MutableRefObject<PipelineCfg>;
   paramsRef: MutableRefObject<Record<string, unknown>>;
   telRef: MutableRefObject<Telemetry>;
@@ -920,6 +955,7 @@ function useRunLifecycle({
   kind,
   engineReady,
   noiseModeRef,
+  noiseParamsByModeRef,
   pipelineRef,
   paramsRef,
   telRef,
@@ -1158,12 +1194,14 @@ function useRunLifecycle({
   }, [hasRunControl, noteError, startDiag, updateApp]);
 
   function currentToml(over?: Override, bypass = false) {
+    const selectedNoiseMode = over?.noiseMode ?? noiseModeRef.current;
     return buildConfigToml({
       mic: over?.mic ?? selInput,
       output: over?.output ?? selOutput,
       reference: over?.reference ?? reference,
       kind: over?.kind ?? kind,
-      noiseMode: over?.noiseMode ?? noiseModeRef.current,
+      noiseMode: selectedNoiseMode,
+      noiseParams: noiseParamsByModeRef.current[selectedNoiseMode] ?? {},
       pipeline: over?.pipeline ?? pipelineRef.current,
       params: over?.params ?? paramsRef.current,
       bypass,
@@ -1562,6 +1600,7 @@ function AppShell() {
     engineState,
     updateEngine,
     noiseModeRef,
+    noiseParamsByModeRef,
     pipelineRef,
     paramsRef,
     paramsByKind,
@@ -1569,6 +1608,7 @@ function AppShell() {
     changeKind,
     setParam,
     selectNoiseMode,
+    setNoiseParam,
     pickLocalvqeModel,
     changePipeline,
     changeOutVolume,
@@ -1586,7 +1626,7 @@ function AppShell() {
     hasRunControl,
     reportMissingRunControl,
   });
-  const { kind, noiseMode, pipeline, params } = engineState;
+  const { kind, noiseMode, noiseParamsByMode, pipeline, params } = engineState;
 
   const {
     applyChange,
@@ -1609,6 +1649,7 @@ function AppShell() {
     kind,
     engineReady,
     noiseModeRef,
+    noiseParamsByModeRef,
     pipelineRef,
     paramsRef,
     telRef,
@@ -1694,12 +1735,27 @@ function AppShell() {
             mergedParams,
             cur.noiseMode,
           );
+          const mergedNoiseParamsByMode = {
+            ...cur.noiseParamsByMode,
+          };
+          for (const mode of m.noise_suppression.modes) {
+            if (!mode.processor_kind) continue;
+            const noiseProcessor = m.processors.find(
+              (processor) => processor.kind === mode.processor_kind,
+            );
+            mergedNoiseParamsByMode[mode.id] = {
+              ...defaultParams(noiseProcessor),
+              ...(cur.noiseParamsByMode[mode.id] ?? {}),
+            };
+          }
           paramsRef.current = mergedParams;
           paramsByKind.current[cur.kind] = mergedParams;
           noiseModeRef.current = normalizedNoiseMode;
+          noiseParamsByModeRef.current = mergedNoiseParamsByMode;
           return {
             ...cur,
             noiseMode: normalizedNoiseMode,
+            noiseParamsByMode: mergedNoiseParamsByMode,
             params: mergedParams,
           };
         });
@@ -2464,11 +2520,15 @@ function AppShell() {
         {view === "advanced" && (
           <AdvancedPage
             processors={processors}
+            noiseSuppression={noiseSuppression}
             kind={kind}
+            noiseMode={noiseMode}
+            noiseParams={noiseParamsByMode[noiseMode] ?? {}}
             pipeline={pipeline}
             params={params}
             onPipeline={changePipeline}
             onParam={setParam}
+            onNoiseParam={setNoiseParam}
             platform={platformView}
             mic={selInput}
             reference={reference}

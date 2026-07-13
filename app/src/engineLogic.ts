@@ -37,6 +37,22 @@ export function shouldSelectNoiseMode(
   return current !== next && allowed.includes(next);
 }
 
+export function patchNoiseModeParam(
+  current: Partial<Record<NoiseMode, Record<string, unknown>>>,
+  mode: NoiseMode,
+  key: string,
+  value: unknown,
+): Partial<Record<NoiseMode, Record<string, unknown>>> | null {
+  if (mode === "off" || Object.is(current[mode]?.[key], value)) return null;
+  return {
+    ...current,
+    [mode]: {
+      ...(current[mode] ?? {}),
+      [key]: value,
+    },
+  };
+}
+
 export function claimEngineKindChange(
   current: { current: string },
   next: string,

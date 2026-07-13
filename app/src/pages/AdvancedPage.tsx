@@ -1,5 +1,11 @@
 import { useEffect, useReducer, useRef } from "react";
-import type { ParamSpec, Platform, Processor } from "../types";
+import type {
+  NoiseMode,
+  NoiseSuppressionManifest,
+  ParamSpec,
+  Platform,
+  Processor,
+} from "../types";
 import type { TrayPrefsState } from "../App";
 import {
   onProbeProgress,
@@ -13,11 +19,15 @@ import { Field, SegButtons } from "../components/Controls";
 
 interface Props {
   processors: Processor[];
+  noiseSuppression: NoiseSuppressionManifest | null;
   kind: string;
+  noiseMode: NoiseMode;
+  noiseParams: Record<string, unknown>;
   pipeline: PipelineCfg;
   params: Record<string, unknown>;
   onPipeline: (patch: Partial<PipelineCfg>) => void;
   onParam: (key: string, val: unknown) => void;
+  onNoiseParam: (key: string, val: unknown) => void;
   platform: Platform;
   // 延迟侦测用:当前设备 selector(透传给 probe-delay)+ 是否在跑 + 停/起引擎回调。
   mic: string;
@@ -45,6 +55,11 @@ const HIDDEN_PARAMS: Record<string, Set<string>> = {
   ]),
 };
 
+const NOISE_LEVEL_LABELS: Record<string, string> = {
+  moderate: "mid",
+  veryhigh: "max",
+};
+
 const PROBE_BEEPS = 12;
 const PROBE_FIRST_MS = 4500;
 const PROBE_STEP_MS = 720;
@@ -69,6 +84,10 @@ const DESC: Record<string, { en: string; zh: string }> = {
   reference_channels: {
     en: "Whether the system-audio reference enters the AEC as mono or stereo. Mono is the stable baseline.",
     zh: "系统声音(参考)送入 AEC 时按 mono 还是 stereo。Mono 为稳定基线。",
+  },
+  level: {
+    en: "WebRTC noise-suppression strength. Higher levels remove more background noise but may affect voice detail.",
+    zh: "WebRTC 降噪强度。档位越高，背景噪声抑制越强，但也可能影响人声细节。",
   },
   agc: {
     en: "Automatic Gain Control — auto-levels mic volume. Off by default (it can cause volume pumping).",
@@ -403,11 +422,15 @@ function ProbeSection({
 
 export function AdvancedPage({
   processors,
+  noiseSuppression,
   kind,
+  noiseMode,
+  noiseParams,
   pipeline,
   params,
   onPipeline,
   onParam,
+  onNoiseParam,
   platform,
   mic,
   reference,
@@ -422,6 +445,12 @@ export function AdvancedPage({
 }: Props) {
   const { t, lang, setLang } = useI18n();
   const proc = processors.find((p) => p.kind === kind);
+  const noiseProcessorKind = noiseSuppression?.modes.find(
+    (mode) => mode.id === noiseMode,
+  )?.processor_kind;
+  const noiseProcessor = processors.find(
+    (processor) => processor.kind === noiseProcessorKind,
+  );
   const desc = (k: string) => DESC[k]?.[lang];
   const pipelineDisabled = kind === "nvidia_afx_aec";
 
@@ -438,9 +467,14 @@ export function AdvancedPage({
       !hidden?.has(k) &&
       reqMet(spec),
   );
+  const noiseBackendParams = Object.entries(noiseProcessor?.params ?? {});
 
-  const control = (key: string, spec: ParamSpec) => {
-    const val = params[key];
+  const control = (
+    key: string,
+    spec: ParamSpec,
+    val: unknown,
+    onChange: (key: string, val: unknown) => void,
+  ) => {
     if (spec.type === "bool") {
       return (
         <SegButtons
@@ -449,7 +483,7 @@ export function AdvancedPage({
             { value: "on", label: "ON" },
             { value: "off", label: "OFF" },
           ]}
-          onChange={(v) => onParam(key, v === "on")}
+          onChange={(v) => onChange(key, v === "on")}
         />
       );
     }
@@ -459,9 +493,9 @@ export function AdvancedPage({
           value={String(val ?? spec.default ?? "")}
           options={(spec.values ?? []).map((v) => ({
             value: v,
-            label: v,
+            label: NOISE_LEVEL_LABELS[v] ?? v,
           }))}
-          onChange={(v) => onParam(key, v)}
+          onChange={(v) => onChange(key, v)}
         />
       );
     }
@@ -470,17 +504,23 @@ export function AdvancedPage({
         value={val}
         numeric={spec.type === "number"}
         placeholder={spec.required ? "required" : t("auto")}
-        onCommit={(v) => onParam(key, v)}
+        onCommit={(v) => onChange(key, v)}
       />
     );
   };
 
-  const arow = (key: string, label: string, spec: ParamSpec) => (
+  const arow = (
+    key: string,
+    label: string,
+    spec: ParamSpec,
+    values: Record<string, unknown> = params,
+    onChange: (key: string, val: unknown) => void = onParam,
+  ) => (
     <div className="arow" key={key}>
       <Hint text={desc(key)}>
         <span className="alabel">{label}</span>
       </Hint>
-      <span className="aval">{control(key, spec)}</span>
+      <span className="aval">{control(key, spec, values[key], onChange)}</span>
     </div>
   );
 
@@ -557,6 +597,17 @@ export function AdvancedPage({
         )}
         {backendParams.map(([key, spec]) => arow(key, key, spec))}
       </div>
+
+      {noiseMode === "webrtc" && noiseBackendParams.length > 0 && (
+        <>
+          <div className="asec">{backendLabel("webrtc_ns", noiseProcessor)}</div>
+          <div className="acols">
+            {noiseBackendParams.map(([key, spec]) =>
+              arow(key, `NS ${key}`, spec, noiseParams, onNoiseParam),
+            )}
+          </div>
+        </>
+      )}
 
       <ProbeSection
         platform={platform}

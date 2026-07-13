@@ -154,6 +154,47 @@ describe("TOML basic string encoding", () => {
     expect(config).not.toContain("ns_level");
   });
 
+  it("writes WebRTC strength on the shared node instead of AEC3", () => {
+    const config = buildConfigToml({
+      mic: "default",
+      reference: "system",
+      output: "default",
+      kind: "nvidia_afx_aec",
+      noiseMode: "webrtc",
+      noiseParams: { level: "high" },
+      pipeline: {
+        sample_rate: 48_000,
+        frame_ms: 10,
+        reference_channels: "mono",
+      },
+      params: { intensity_ratio: 1 },
+    });
+
+    expect(config).toContain(
+      'kind = "nvidia_afx_aec"\nintensity_ratio = 1\n\n[[chain]]\nkind = "webrtc_ns"\nlevel = "high"',
+    );
+  });
+
+  it("does not leak WebRTC strength into RNNoise", () => {
+    const config = buildConfigToml({
+      mic: "default",
+      reference: "system",
+      output: "default",
+      kind: "aec3",
+      noiseMode: "rnnoise",
+      noiseParams: { level: "high" },
+      pipeline: {
+        sample_rate: 48_000,
+        frame_ms: 10,
+        reference_channels: "mono",
+      },
+      params: {},
+    });
+
+    expect(config).toContain('kind = "rnnoise"');
+    expect(config).not.toMatch(/^level =/m);
+  });
+
   it("preserves bypass across a structural restart", () => {
     const config = buildConfigToml({
       mic: "default",

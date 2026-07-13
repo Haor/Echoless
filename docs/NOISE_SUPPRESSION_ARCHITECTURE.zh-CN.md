@@ -175,8 +175,10 @@ capture format    = 48 kHz mono
 三频带拆分/合并、上频带增益、延迟补偿、clamp 与帧状态管理。NS-only APM 已经包含
 这些边界行为,更适合作为通用节点。
 
-第一版保持现有 WebRTC NS 档位的产品默认值。档位是否继续暴露为高级参数,
-由实现阶段另行决定;它不改变主页面的三选一结构。
+第一版保持现有 WebRTC NS 档位的产品默认值,并在高级页保留
+`low / moderate / high / veryhigh` 四档。该参数属于 `webrtc_ns` 节点,不再属于 AEC3。
+RNNoise 官方 API 没有抑制强度参数,因此选择 RNNoise 或 `OFF` 时高级页不显示强度行;
+不通过输出混合或私有阈值伪造 RNNoise 强度。
 
 ### 5.3 RNNoise
 

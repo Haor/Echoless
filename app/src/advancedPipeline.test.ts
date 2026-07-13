@@ -107,3 +107,23 @@ describe("NVAFX Advanced pipeline lock", () => {
     );
   });
 });
+
+describe("shared NS Advanced parameters", () => {
+  it("shows manifest-backed strength only for WebRTC NS", () => {
+    expect(advancedPageSource).toContain(
+      "const noiseProcessorKind = noiseSuppression?.modes.find(",
+    );
+    expect(advancedPageSource).toContain(
+      'noiseMode === "webrtc" && noiseBackendParams.length > 0',
+    );
+    expect(advancedPageSource).toContain(
+      "arow(key, `NS ${key}`, spec, noiseParams, onNoiseParam)",
+    );
+  });
+
+  it("keeps mode parameters separate and ignores the selected value", () => {
+    expect(appSource).toContain("noiseParams={noiseParamsByMode[noiseMode] ?? {}}");
+    expect(appSource).toContain("const next = patchNoiseModeParam(");
+    expect(appSource).toContain("if (!next) return;");
+  });
+});

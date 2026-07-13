@@ -325,6 +325,7 @@ export interface ConfigChoice {
   reference: string; // "system" | "none" | "input:<stable_id>" | ...
   kind: string; // backend kind
   noiseMode: NoiseMode;
+  noiseParams?: Record<string, unknown>; // selected shared NS node parameters
   pipeline: PipelineCfg;
   params: Record<string, unknown>; // chain[0] 参数(不含 reference_channels)
   diagnostics?: DiagnosticsCfg | null; // 开启录制时写入 [diagnostics]
@@ -411,6 +412,14 @@ export function buildConfigToml(c: ConfigChoice): string {
     lines.push(``, `[[chain]]`, `kind = "webrtc_ns"`);
   } else if (c.noiseMode === "rnnoise") {
     lines.push(``, `[[chain]]`, `kind = "rnnoise"`);
+  }
+  // Official RNNoise exposes no suppression-strength parameter. Keep the
+  // persisted WebRTC parameter namespace from leaking into another backend.
+  if (c.noiseMode === "webrtc") {
+    for (const [key, raw] of Object.entries(c.noiseParams ?? {})) {
+      const value = tomlValue(raw);
+      if (value !== null) lines.push(`${key} = ${value}`);
+    }
   }
   return lines.join("\n") + "\n";
 }

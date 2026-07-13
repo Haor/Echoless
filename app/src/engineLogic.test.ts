@@ -3,6 +3,7 @@ import {
   allowedNoiseModes,
   modelFileName,
   normalizeNoiseMode,
+  patchNoiseModeParam,
   shouldSelectNoiseMode,
   isNearDelayOnlyPatch,
   hotInitialDelayValue,
@@ -179,6 +180,21 @@ describe("shared noise suppression compatibility", () => {
     expect(modelFileName("C:\\models\\model.gguf")).toBe("model.gguf");
     expect(modelFileName("/models/model.gguf")).toBe("model.gguf");
     expect(modelFileName(undefined)).toBeNull();
+  });
+
+  it("persists WebRTC strength independently and ignores repeat selections", () => {
+    const current = {
+      webrtc: { level: "low" },
+      rnnoise: {},
+    } satisfies Partial<Record<"webrtc" | "rnnoise", Record<string, unknown>>>;
+    const next = patchNoiseModeParam(current, "webrtc", "level", "high");
+
+    expect(next).toEqual({
+      webrtc: { level: "high" },
+      rnnoise: {},
+    });
+    expect(patchNoiseModeParam(next!, "webrtc", "level", "high")).toBeNull();
+    expect(patchNoiseModeParam(next!, "off", "level", "low")).toBeNull();
   });
 });
 

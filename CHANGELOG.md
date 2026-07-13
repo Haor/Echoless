@@ -13,6 +13,8 @@ adheres to [Semantic Versioning](https://semver.org).
 - Shared **Noise Suppression** selector with `WEBRTC`, `RNNOISE`, and `OFF`
   modes for AEC3, NVAFX, and the pure-AEC LocalVQE v1.4 model. RNNoise uses a
   pinned, statically bundled Xiph runtime and model with no runtime download.
+- WebRTC NS keeps its four strength levels in Advanced settings. RNNoise uses
+  the official fixed-strength runtime and does not expose a synthetic level.
 
 ### Changed
 - WebRTC noise suppression now runs as a shared post-AEC processor instead of
