@@ -17,6 +17,11 @@ weights_blob.bin sha256: 1b99898350e75656c77d068162fea402afe51eff15dc751989b1e9f
 
 `weights_blob.bin` 由官方 `src/write_weights.c` 使用该模型包的 `src/rnnoise_data.c` 生成。源码和模型在构建时编入静态产物，运行时不下载模型，也不依赖外部 RNNoise 动态库。
 
+Echoless 对该快照保留一处生命周期修补：`rnnoise_model_from_buffer()` 会把
+`RNNModel.file` 显式初始化为 `NULL`。上游函数没有初始化该字段，而
+`rnnoise_model_free()` 会读取它并在非空时调用 `fclose()`；未初始化值会在部分 Linux
+分配布局下导致析构崩溃。该修补不改变模型或音频处理行为。
+
 上游地址：<https://github.com/xiph/rnnoise>
 
 许可见同目录 `COPYING`（BSD-3-Clause）。

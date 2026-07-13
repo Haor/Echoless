@@ -343,6 +343,7 @@ fn validate_chain_node(
         "localvqe" => validate_localvqe_node(&base, &node.params, errors),
         "nvidia_afx_aec" => validate_nvafx_node(cfg, &base, &node.params, errors),
         "webrtc_ns" => validate_webrtc_ns_node(&base, &node.params, errors),
+        "rnnoise" => validate_rnnoise_node(&base, &node.params, errors),
         "passthrough" => {}
         _ => {}
     }
@@ -353,6 +354,14 @@ fn is_known_processor_kind(kind: &str) -> bool {
 }
 
 fn validate_aec3_node(base: &str, params: &toml::Table, errors: &mut Vec<ConfigValidationError>) {
+    for key in ["ns", "ns_level"] {
+        if params.contains_key(key) {
+            errors.push(ConfigValidationError::new(
+                format!("{base}.{key}"),
+                format!("{key} is no longer an AEC3 parameter; add a separate webrtc_ns node"),
+            ));
+        }
+    }
     expect_bool(params, base, "agc", errors);
     expect_bool(params, base, "linear_stable_echo_path", errors);
     expect_i64_range(
@@ -404,6 +413,19 @@ fn validate_webrtc_ns_node(
         ],
         errors,
     );
+}
+
+fn validate_rnnoise_node(
+    base: &str,
+    params: &toml::Table,
+    errors: &mut Vec<ConfigValidationError>,
+) {
+    for key in params.keys() {
+        errors.push(ConfigValidationError::new(
+            format!("{base}.{key}"),
+            "RNNoise does not accept configuration parameters",
+        ));
+    }
 }
 
 fn validate_localvqe_node(
@@ -724,6 +746,57 @@ mod tests {
                 && error
                     .message
                     .contains("does not allow external noise suppression")
+        }));
+    }
+
+    #[test]
+    fn config_validation_rejects_retired_aec3_ns_parameters() {
+        let mut params = toml::Table::new();
+        params.insert("ns".into(), toml::Value::Boolean(true));
+        params.insert("ns_level".into(), toml::Value::String("high".into()));
+        let cfg = PipelineConfig {
+            chain: vec![NodeConfig {
+                kind: "aec3".into(),
+                params,
+            }],
+            ..PipelineConfig::default()
+        };
+
+        let errors = validate_pipeline_config(&cfg);
+        let paths = errors
+            .iter()
+            .map(|error| error.path.as_str())
+            .collect::<Vec<_>>();
+
+        assert!(paths.contains(&"chain[0].ns"));
+        assert!(paths.contains(&"chain[0].ns_level"));
+    }
+
+    #[test]
+    fn config_validation_rejects_rnnoise_parameters() {
+        let mut params = toml::Table::new();
+        params.insert("level".into(), toml::Value::String("high".into()));
+        let cfg = PipelineConfig {
+            chain: vec![
+                NodeConfig {
+                    kind: "aec3".into(),
+                    params: toml::Table::new(),
+                },
+                NodeConfig {
+                    kind: "rnnoise".into(),
+                    params,
+                },
+            ],
+            ..PipelineConfig::default()
+        };
+
+        let errors = validate_pipeline_config(&cfg);
+
+        assert!(errors.iter().any(|error| {
+            error.path == "chain[1].level"
+                && error
+                    .message
+                    .contains("does not accept configuration parameters")
         }));
     }
 

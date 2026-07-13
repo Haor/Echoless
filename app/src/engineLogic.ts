@@ -4,7 +4,8 @@ import type { NoiseMode, NoiseSuppressionManifest } from "./types";
 
 export function modelFileName(model: unknown): string | null {
   if (typeof model !== "string" || model.length === 0) return null;
-  return model.split(/[\\/]/).at(-1) ?? null;
+  const parts = model.split(/[\\/]/);
+  return parts[parts.length - 1] ?? null;
 }
 
 export function allowedNoiseModes(

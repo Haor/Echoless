@@ -136,13 +136,13 @@ pub(crate) struct RunArgs {
     /// Override processors; repeatable or comma-separated; aec3 is the default recommendation
     #[arg(long, value_delimiter = ',')]
     pub(crate) processor: Vec<String>,
-    /// Enable aec3 noise suppression
+    /// Append the shared WebRTC noise-suppression node
     #[arg(long)]
     pub(crate) ns: bool,
-    /// Disable aec3 noise suppression
+    /// Remove external noise-suppression nodes
     #[arg(long)]
     pub(crate) no_ns: bool,
-    /// Override aec3 noise suppression level: low/moderate/high/veryhigh
+    /// Set WebRTC noise-suppression level: low/moderate/high/veryhigh
     #[arg(long)]
     pub(crate) ns_level: Option<String>,
     /// Override aec3 echo tail length (ms)

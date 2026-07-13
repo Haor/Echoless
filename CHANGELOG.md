@@ -23,6 +23,10 @@ adheres to [Semantic Versioning](https://semver.org).
 - LocalVQE model badges now describe capability (`NS` or `AEC`), and model
   tooltips explain behavior instead of exposing filesystem paths.
 
+### Fixed
+- RNNoise buffer-backed models now initialize their file handle before cleanup,
+  preventing a Linux crash when the processor is destroyed.
+
 ## [1.1.0] — 2026-07-11
 
 A stability and polish release on top of 1.0.0: adaptive handling of audio

@@ -37,17 +37,29 @@ name fragment, or the `stable_id` from this output. Reference selectors:
 ```bash
 echoless run --mic default --reference system --output "CABLE Input"
 echoless run --config my.toml --status-json
+
+# Pick one shared NS mode: WebRTC, RNNoise, or off
+echoless run --processor aec3 --ns --ns-level moderate
+echoless run --processor aec3 --processor rnnoise
+echoless run --processor aec3 --no-ns
 ```
 
 Key flags (all override the config file): `--mic`, `--reference`,
 `--output`, `--sample-rate`, `--frame-ms`, `--reference-channels mono|stereo`,
 `--near-delay-ms`, `--output-level 0..100` (50 = unity),
-`--processor aec3|localvqe|nvidia_afx_aec|…`, `--ns/--no-ns`, `--ns-level`,
+`--processor aec3|localvqe|nvidia_afx_aec|webrtc_ns|rnnoise`,
+`--ns/--no-ns`, `--ns-level`,
 `--tail-ms`, `--verbose`, `--status-json`,
 `--diagnostics` (records until stopped), and `--diagnostic-seconds N` (records
 for a bounded duration). Diagnostics always use the managed Echoless directory.
 The config equivalents are `diagnostics.enabled = true` and the optional
 `diagnostics.max_seconds = N`.
+
+`--ns` appends the shared WebRTC NS node after the selected AEC engine, and
+`--ns-level` selects `low/moderate/high/veryhigh`; `--no-ns` removes external
+NS nodes. RNNoise has no strength parameter and can be added by repeating
+`--processor`. LocalVQE v1.2/v1.3 already contain NS and reject an extra WebRTC
+NS or RNNoise node; v1.4 supports all three modes.
 
 With `--status-json`, stdout is JSONL: first a `started` event (negotiated
 devices, `supported_controls`, resampling info), then periodic status frames

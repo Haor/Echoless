@@ -135,7 +135,11 @@ impl EchoProcessor for RnNoise {
         }
     }
 
-    fn configure(&mut self, _params: &toml::Table) -> anyhow::Result<()> {
+    fn configure(&mut self, params: &toml::Table) -> anyhow::Result<()> {
+        ensure!(
+            params.is_empty(),
+            "RNNoise does not accept configuration parameters"
+        );
         self.reset();
         ensure!(
             self.last.runtime_error_count == 0,
@@ -248,5 +252,18 @@ mod tests {
 
         assert!(out.iter().all(|sample| sample.is_finite()));
         assert_eq!(processor.stats().runtime_error_count, 0);
+    }
+
+    #[test]
+    fn rejects_synthetic_strength_parameters() {
+        let mut processor = RnNoise::try_new().unwrap();
+        let mut params = toml::Table::new();
+        params.insert("level".into(), toml::Value::String("high".into()));
+
+        let error = processor.configure(&params).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("does not accept configuration parameters"));
     }
 }

@@ -238,6 +238,7 @@ RNNModel *rnnoise_model_from_buffer(const void *ptr, int len) {
   model->blob = NULL;
   model->const_blob = ptr;
   model->blob_len = len;
+  model->file = NULL;
   return model;
 }
 

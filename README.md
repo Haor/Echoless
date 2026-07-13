@@ -39,9 +39,9 @@ virtual audio device.
   (up to ±3%) to absorb the drift, so long sessions stay aligned instead of
   accumulating glitches — the DRIFT readout on the Health page converges to
   zero as the controller locks in
-- **Noise suppression and dereverberation** — beyond echo removal, AEC3 offers
-  optional noise suppression, and LocalVQE performs echo cancellation, noise
-  suppression and dereverberation in a single pass (see [Engines](#engines))
+- **Independent noise suppression** — choose shared WebRTC NS, RNNoise, or off
+  after AEC3, NVAFX, and pure-AEC LocalVQE v1.4; LocalVQE v1.2/v1.3 keep their
+  built-in noise suppression and dereverberation (see [Engines](#engines))
 - **Power-off = bypass, not mute** — the mic path never dies; turning AEC off
   passes your voice through untouched
 - **Output gain trim** — a per-run output level (0 = mute up to ≈3×) to match
@@ -58,7 +58,8 @@ virtual audio device.
 The echo canceller from the [WebRTC](https://webrtc.googlesource.com/src/)
 audio processing module — the same algorithm family used by Chrome and Google
 Meet. Adaptive linear filtering with delay estimation, non-linear residual
-suppression, and optional noise suppression / AGC. CPU-light, 48 kHz native.
+suppression and optional AGC. CPU-light, 48 kHz native. Noise suppression is a
+separate post-AEC node, so AEC3 can use WebRTC NS, RNNoise, or neither.
 
 Echoless bundles a Rust port of AEC3 (in [`aec3/`](aec3/), BSD-3-Clause) with
 a small tweak for the open-speaker use case: the estimated delay is held once
@@ -84,8 +85,9 @@ pipeline, splicing the model transparently into the signal chain.
 | v1.4-AEC | echo removal only — keeps voice, noise and room | 203 K |
 
 The inference runtime ships inside the app; model weights are downloaded from
-Hugging Face on demand (SHA-256 verified). The overview page's NOISE switch
-maps to the model choice: **on = v1.3, off = v1.4** (pure AEC).
+Hugging Face on demand (SHA-256 verified). LocalVQE v1.2/v1.3 force external
+noise suppression off because it is already built into those models. The
+pure-AEC v1.4 model can use WebRTC NS, RNNoise, or neither.
 
 ### NVAFX / RTX AEC (Windows + RTX GPU)
 
