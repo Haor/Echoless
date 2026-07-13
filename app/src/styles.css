@@ -512,12 +512,24 @@ body {
   width: 340px;
 }
 
-/* Advanced · 延迟侦测:左列 near_delay,右列 run probe + 进度 + 结果 */
-.aprobe {
+/* Advanced 下半区:NS 与延迟侦测并排,会话区在其后独占整行。 */
+.alower {
   display: grid;
   grid-template-columns: 1fr 1fr;
   column-gap: 40px;
   align-items: start;
+}
+.anoise-section,
+.aprobe-section {
+  min-width: 0;
+}
+.alower .acols {
+  grid-template-columns: 1fr;
+}
+.aprobe {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
 }
 .aprobe .arow {
   height: 42px;
@@ -793,6 +805,9 @@ body {
 }
 .lvdef {
   flex: none;
+  width: 22px;
+  box-sizing: border-box;
+  text-align: center;
   font-style: normal;
   font-family: var(--mono);
   font-weight: 400;
@@ -800,7 +815,7 @@ body {
   letter-spacing: 0.5px; /* v18:1→0.5,同上腾预算 */
   color: var(--ink);
   background: var(--paper); /* v3:DEFAULT 徽标=纸白贴纸 */
-  padding: 1px 3px;
+  padding: 1px 0;
 }
 .lvmod.on .lvdef {
   background: var(--paper); /* v4.1:选中模型徽标=纸灰 */
@@ -1997,7 +2012,7 @@ hr.hair {
   text-align: center;
 }
 #ns .b.long-label {
-  letter-spacing: 0.08em;
+  letter-spacing: 0.06em;
 }
 
 /* signal — 三路示波(near-end MIC+REF → clean OUT) */

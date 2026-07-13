@@ -312,7 +312,7 @@ function ProbeSection({
   const initWritten = probe ? probeInitialDelay(probe, platform, kind) : null;
 
   return (
-    <>
+    <section className="aprobe-section">
       <div className="asec">{t("secProbe")}</div>
       <div className="aprobe">
         <div className="arow">
@@ -416,7 +416,7 @@ function ProbeSection({
           {probeErr && <div className="perr">{probeErr}</div>}
         </div>
       </div>
-    </>
+    </section>
   );
 }
 
@@ -598,29 +598,35 @@ export function AdvancedPage({
         {backendParams.map(([key, spec]) => arow(key, key, spec))}
       </div>
 
-      {noiseMode === "webrtc" && noiseBackendParams.length > 0 && (
-        <>
-          <div className="asec">{backendLabel("webrtc_ns", noiseProcessor)}</div>
-          <div className="acols">
-            {noiseBackendParams.map(([key, spec]) =>
-              arow(key, `NS ${key}`, spec, noiseParams, onNoiseParam),
-            )}
-          </div>
-        </>
-      )}
+      <div className="alower">
+        <section className="anoise-section">
+          {noiseMode === "webrtc" && noiseBackendParams.length > 0 && (
+            <>
+              <div className="asec">
+                {backendLabel("webrtc_ns", noiseProcessor)}
+              </div>
+              <div className="acols">
+                {noiseBackendParams.map(([key, spec]) =>
+                  arow(key, `NS ${key}`, spec, noiseParams, onNoiseParam),
+                )}
+              </div>
+            </>
+          )}
+        </section>
 
-      <ProbeSection
-        platform={platform}
-        kind={kind}
-        pipeline={pipeline}
-        onPipeline={onPipeline}
-        onParam={onParam}
-        mic={mic}
-        reference={reference}
-        output={output}
-        running={running}
-        onSetRun={onSetRun}
-      />
+        <ProbeSection
+          platform={platform}
+          kind={kind}
+          pipeline={pipeline}
+          onPipeline={onPipeline}
+          onParam={onParam}
+          mic={mic}
+          reference={reference}
+          output={output}
+          running={running}
+          onSetRun={onSetRun}
+        />
+      </div>
 
       <div className="asec">{t("secSession")}</div>
       <div className="acols">
