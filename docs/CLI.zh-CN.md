@@ -96,14 +96,19 @@ echoless probe-delay --json --mic default --reference system --output "CABLE Inp
 这些默认值。
 
 它本身不会停止任何东西——不要在另一个 `run` 正占用设备时运行它。
-Flag:`--beeps N`(12)、`--startup-delay S`(4)、`--volume 0..1`(0.35)、
+Flag:`--beeps N`(默认 12,最少 2)、`--startup-delay S`(4)、`--volume 0..1`(0.35)、
 `--keep-session`(保留本次固定目录 session)、`--keep-beep`、
 `--analyze-only <session>`。
 
-JSON 结果包含 `recommended_near_delay_ms`(实测延迟 + 8 ms 安全余量)、
-逐蜂鸣延迟、标准差/漂移和告警。在 `--json` 模式下,进度标记以 JSONL
-形式发到 stderr(`beep_train_start` 附带精确的蜂鸣节奏)。支持 macOS、
-Windows 和 Linux(Linux 会把 monitor 参考映射回其 sink 以完成播放)。
+JSON 结果包含 `quality`(`valid`、`uncertain` 或 `invalid`)和
+`quality_reasons`。`event_lag_mean_ms`、`event_lag_stddev_ms`、
+`event_lag_drift_ms` 与 `recommended_near_delay_ms` 只有在结果为 `valid`
+时才有值,否则为 `null`;桌面应用不会回填无效或不确定的结果。
+
+测量正常完成但结果为 `uncertain` / `invalid` 时仍返回退出码 0;设备、采集、
+播放、session 或解析失败才是命令错误。在 `--json` 模式下,进度标记以 JSONL
+形式发到 stderr(`beep_train_start` 附带精确的蜂鸣节奏)。支持 macOS、Windows
+和 Linux(Linux 会把 monitor 参考映射回其 sink 以完成播放)。
 
 ## offline
 
