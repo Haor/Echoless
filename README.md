@@ -201,6 +201,9 @@ cd app && pnpm tauri build
 `cargo test --workspace` runs the test suite; the AEC3 engine is a separate
 workspace (`cd aec3 && cargo test`).
 
+## AI USE
+Code and some experiments are implemented by **codex**.
+
 ## Acknowledgements & licenses
 
 - **Echoless** is MIT licensed ([LICENSE](LICENSE)).
