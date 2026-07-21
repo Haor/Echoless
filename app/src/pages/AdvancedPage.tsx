@@ -1,5 +1,11 @@
 import { useEffect, useReducer, useRef } from "react";
-import type { ParamSpec, Platform, Processor } from "../types";
+import type {
+  NoiseMode,
+  NoiseSuppressionManifest,
+  ParamSpec,
+  Platform,
+  Processor,
+} from "../types";
 import type { TrayPrefsState } from "../App";
 import {
   onProbeProgress,
@@ -10,14 +16,19 @@ import {
 import { useI18n, type Lang } from "../i18n";
 import { Hint } from "../components/Hint";
 import { Field, SegButtons } from "../components/Controls";
+import { probeAutofill } from "../probeQuality";
 
 interface Props {
   processors: Processor[];
+  noiseSuppression: NoiseSuppressionManifest | null;
   kind: string;
+  noiseMode: NoiseMode;
+  noiseParams: Record<string, unknown>;
   pipeline: PipelineCfg;
   params: Record<string, unknown>;
   onPipeline: (patch: Partial<PipelineCfg>) => void;
   onParam: (key: string, val: unknown) => void;
+  onNoiseParam: (key: string, val: unknown) => void;
   platform: Platform;
   // 延迟侦测用:当前设备 selector(透传给 probe-delay)+ 是否在跑 + 停/起引擎回调。
   mic: string;
@@ -25,17 +36,14 @@ interface Props {
   output: string;
   running: boolean;
   onSetRun: (on: boolean) => Promise<void>;
+  visible: boolean;
   // Windows 托盘偏好(SESSION 段,仅 windows 平台渲染)。
   trayPrefs: TrayPrefsState;
   onTrayPrefs: (patch: Partial<TrayPrefsState>) => void;
+  autoStartEnabled: boolean;
+  autoStartBusy: boolean;
+  onAutoStart: (enabled: boolean) => void;
 }
-
-// 蜂鸣节奏(对齐 CLI:startup 4s + pre-roll 0.5s,每声 70ms / 间隔 650ms ≈ 720ms,共 12 声)。
-// 段按钮定宽 74px(v9.2 对齐轴),枚举文案超宽会溢出 → 长值用缩写显示(提交值不变)。
-const SELECT_LABELS: Record<string, string> = {
-  moderate: "mid",
-  veryhigh: "max",
-};
 
 // C3/C5 减参:专家级/与引擎页重复的字段不在高级页暴露 ——
 //   LocalVQE:model(引擎页模型清单管理)、library/backend/device(auto 即可);
@@ -49,16 +57,15 @@ const HIDDEN_PARAMS: Record<string, Set<string>> = {
   ]),
 };
 
+const NOISE_LEVEL_LABELS: Record<string, string> = {
+  moderate: "mid",
+  veryhigh: "max",
+};
+
 const PROBE_BEEPS = 12;
-const PROBE_FIRST_MS = 4500;
 const PROBE_STEP_MS = 720;
 // afplay / cpal 输出流从 spawn 到出声的经验常量(进度灯对齐用,无需精确)。
 const PROBE_PLAYER_OPEN_MS = 150;
-// 信号判定阈值:dBFS 低于此视为没收到。
-const PROBE_SIG_DBFS = -55;
-// mac 上 near_delay 被侦测设非零时,顺带给 AEC3 一个 8ms 初始延迟 hint,
-// 减少初始 echo-path 搜索(实测有效)。仅 AEC3、仅 macOS、仅 recommended>0 时写。
-const PROBE_INIT_DELAY_MS = 8;
 
 // 参数说明(悬浮 label 时提示)。缺省键无提示。
 const DESC: Record<string, { en: string; zh: string }> = {
@@ -74,9 +81,9 @@ const DESC: Record<string, { en: string; zh: string }> = {
     en: "Whether the system-audio reference enters the AEC as mono or stereo. Mono is the stable baseline.",
     zh: "系统声音(参考)送入 AEC 时按 mono 还是 stereo。Mono 为稳定基线。",
   },
-  ns_level: {
-    en: "Noise-suppression strength. Higher suppresses more background noise.",
-    zh: "降噪强度。越高压掉的背景噪声越多。",
+  level: {
+    en: "WebRTC noise-suppression strength. Higher levels remove more background noise but may affect voice detail.",
+    zh: "WebRTC 降噪强度。档位越高，背景噪声抑制越强，但也可能影响人声细节。",
   },
   agc: {
     en: "Automatic Gain Control — auto-levels mic volume. Off by default (it can cause volume pumping).",
@@ -156,23 +163,6 @@ function probeReducer(state: ProbeState, patch: ProbePatch): ProbeState {
   return typeof patch === "function" ? patch(state) : { ...state, ...patch };
 }
 
-function probeInitialDelay(
-  r: NearDelayProbeResult,
-  platform: Platform,
-  kind: string,
-): number | null {
-  if (kind !== "aec3") return null;
-  // mac:近端延迟已做负方向偏置对齐 → init 只需一个小的安全余量。
-  if (platform === "macos") return PROBE_INIT_DELAY_MS;
-  // win/其它:不设近端延迟 → init = 实测回声延迟(冷启动对齐起点),需稳定。
-  const stable =
-    r.warnings.length === 0 &&
-    Math.abs(r.event_lag_stddev_ms) < 5 &&
-    Math.abs(r.event_lag_drift_ms) < 10;
-  const measured = Math.round(r.event_lag_mean_ms);
-  return stable && measured >= 1 ? measured : null;
-}
-
 function ProbeSection({
   platform,
   kind,
@@ -184,6 +174,7 @@ function ProbeSection({
   output,
   running,
   onSetRun,
+  visible,
 }: Pick<
   Props,
   | "platform"
@@ -196,6 +187,7 @@ function ProbeSection({
   | "output"
   | "running"
   | "onSetRun"
+  | "visible"
 >) {
   const { t, lang } = useI18n();
   const [state, updateProbe] = useReducer(probeReducer, PROBE_INITIAL_STATE);
@@ -214,6 +206,11 @@ function ProbeSection({
       if (timer.current != null) window.clearInterval(timer.current);
     };
   }, []);
+  useEffect(() => {
+    if (!visible && !probing && (probe != null || probeErr != null || lit > 0)) {
+      updateProbe(PROBE_INITIAL_STATE);
+    }
+  }, [visible, probing, probe, probeErr, lit]);
   const updateProbeIfMounted = (patch: ProbePatch) => {
     if (mounted.current) updateProbe(patch);
   };
@@ -230,31 +227,31 @@ function ProbeSection({
         if (!mounted.current) return;
       }
       updateProbeIfMounted({ phase: "probing" });
-      // 进度灯节奏:默认按墙钟估计(旧 CLI 无进度事件的回退);收到 CLI 的
-      // beep_train_start 事件后改以真实开播时刻为基准 —— 蜂鸣要等子进程起好
-      // 设备 + 4s 稳定期才响,纯墙钟估计会让灯超前声音(音画不同步)。
-      let t0 = Date.now();
-      let firstMs = PROBE_FIRST_MS;
-      let stepMs = PROBE_STEP_MS;
-      let beeps = PROBE_BEEPS;
-      if (timer.current != null) window.clearInterval(timer.current);
-      timer.current = window.setInterval(() => {
-        const el = Date.now() - t0;
-        const n = Math.max(
-          0,
-          Math.min(beeps, Math.floor((el - firstMs) / stepMs) + 1),
-        );
-        updateProbeIfMounted({ lit: n });
-      }, 100);
+      // 进度只以 CLI 的真实开播事件为时钟源。不能先按墙钟猜测再在事件到达时
+      // 重置,否则子进程启动稍慢时会出现「无声先亮两格 → 倒退 → 正常播放」。
       const unProgress = await onProbeProgress((p) => {
         if (!mounted.current) return;
         if (p.stage !== "beep_train_start") return;
-        // 首响 = 事件时刻 + WAV 前导静音 + 播放器打开的经验常量。
-        t0 = Date.now();
-        firstMs = (p.pre_roll_ms ?? 500) + PROBE_PLAYER_OPEN_MS;
-        stepMs = (p.beep_ms ?? 70) + (p.gap_ms ?? 650);
-        beeps = p.beeps ?? PROBE_BEEPS;
+        const t0 = Date.now();
+        const firstMs = (p.pre_roll_ms ?? 500) + PROBE_PLAYER_OPEN_MS;
+        const stepMs =
+          p.beep_ms != null && p.gap_ms != null
+            ? p.beep_ms + p.gap_ms
+            : PROBE_STEP_MS;
+        const beeps = p.beeps ?? PROBE_BEEPS;
         updateProbeIfMounted({ lit: 0 });
+        if (timer.current != null) window.clearInterval(timer.current);
+        timer.current = window.setInterval(() => {
+          const elapsed = Date.now() - t0;
+          const count = Math.max(
+            0,
+            Math.min(
+              beeps,
+              Math.floor((elapsed - firstMs) / stepMs) + 1,
+            ),
+          );
+          updateProbeIfMounted({ lit: count });
+        }, 100);
       });
       let r: NearDelayProbeResult;
       try {
@@ -264,13 +261,13 @@ function ProbeSection({
       }
       if (!mounted.current) return;
       updateProbeIfMounted({ probe: r });
-      // mac:近端延迟做负方向偏置(后端已含安全余量);win/其它:正 lag 无需近端延迟,不动。
-      if (platform === "macos") {
-        onPipeline({ near_delay_ms: r.recommended_near_delay_ms });
+      const fill = probeAutofill(r, platform, kind);
+      if (fill.nearDelayMs != null) {
+        onPipeline({ near_delay_ms: fill.nearDelayMs });
       }
-      // AEC3 初始延迟:mac 写 8ms 余量(near_delay 已对齐),win/其它写实测回声延迟(冷启动起点)。
-      const init = probeInitialDelay(r, platform, kind);
-      if (init != null) onParam("initial_delay_ms", init);
+      if (fill.initialDelayMs != null) {
+        onParam("initial_delay_ms", fill.initialDelayMs);
+      }
     } catch (e) {
       updateProbeIfMounted({ probeErr: String(e) });
     } finally {
@@ -293,15 +290,17 @@ function ProbeSection({
     }
   }
 
-  const probeStable =
-    !!probe &&
-    probe.warnings.length === 0 &&
-    Math.abs(probe.event_lag_stddev_ms) < 5 &&
-    Math.abs(probe.event_lag_drift_ms) < 10;
-  const initWritten = probe ? probeInitialDelay(probe, platform, kind) : null;
-
+  const probeValid = probe?.quality === "valid";
+  const fill = probe ? probeAutofill(probe, platform, kind) : null;
+  const refSignalOk = !probe?.quality_reasons.includes("ref_signal_missing");
+  const micSignalOk = !probe?.quality_reasons.includes("mic_signal_missing");
+  const qualityLabel = probeValid
+    ? t("probeStable")
+    : probe?.quality === "uncertain"
+      ? t("probeUncertain")
+      : t("probeInvalid");
   return (
-    <>
+    <section className="aprobe-section">
       <div className="asec">{t("secProbe")}</div>
       <div className="aprobe">
         <div className="arow">
@@ -333,8 +332,7 @@ function ProbeSection({
                 disabled={probing}
                 onClick={runProbe}
               >
-                {probing ? t("probing") : t("probeRun")}{" "}
-                <span className="mk">{probing ? "•••" : "↻"}</span>
+                {probing ? t("probing") : t("probeRun")}
               </button>
             </Hint>
             <span className="pnote">
@@ -361,42 +359,52 @@ function ProbeSection({
           {probe && !probeErr && (
             <div className="presult">
               <span className="pline">
-                <b className={probe.ref_dbfs >= PROBE_SIG_DBFS ? "ok" : "miss"}>
+                <b className={refSignalOk ? "ok" : "miss"}>
                   {t("probeRef")}{" "}
-                  {probe.ref_dbfs >= PROBE_SIG_DBFS ? t("probeOk") : t("probeNoSig")}
+                  {refSignalOk ? t("probeOk") : t("probeNoSig")}
                 </b>
                 <span className="psep">·</span>
-                <b className={probe.mic_dbfs >= PROBE_SIG_DBFS ? "ok" : "miss"}>
+                <b className={micSignalOk ? "ok" : "miss"}>
                   {t("probeMic")}{" "}
-                  {probe.mic_dbfs >= PROBE_SIG_DBFS ? t("probeOk") : t("probeNoSig")}
+                  {micSignalOk ? t("probeOk") : t("probeNoSig")}
                 </b>
+                {probeValid && probe.event_lag_mean_ms != null && (
+                  <>
+                    <span className="psep">·</span>
+                    <span>
+                      {t("probeEcho")}{" "}
+                      <b>{`${probe.event_lag_mean_ms >= 0 ? "+" : ""}${probe.event_lag_mean_ms.toFixed(1)}ms`}</b>
+                    </span>
+                  </>
+                )}
                 <span className="psep">·</span>
-                <span>
-                  {t("probeEcho")}{" "}
-                  <b>{`${probe.event_lag_mean_ms >= 0 ? "+" : ""}${probe.event_lag_mean_ms.toFixed(1)}ms`}</b>
-                </span>
-                <span className="psep">·</span>
-                <span className={probeStable ? "ok" : "miss"}>
-                  {probeStable ? t("probeStable") : t("probeUnstable")}
+                <span className={probeValid ? "ok" : "miss"}>
+                  {qualityLabel}
                 </span>
               </span>
               <span className="pline sub">
-                {/* 显示随平台分流,与填充逻辑一致:mac 填近端延迟,win/其它只填初始延迟。 */}
-                {platform === "macos" ? (
-                  <span className="ok">
-                    {t("probeRec")} {probe.recommended_near_delay_ms}ms · {t("probeFilled")}
-                    {initWritten != null && ` · ${t("probeInit")} ${initWritten}ms`}
-                  </span>
+                {!probeValid ? (
+                  <span className="miss">{t("probeNoFill")}</span>
+                ) : platform === "macos" ? (
+                  fill?.nearDelayMs != null ? (
+                    <span className="ok">
+                      {t("probeRec")} {fill.nearDelayMs}ms · {t("probeFilled")}
+                      {fill.initialDelayMs != null &&
+                        ` · ${t("probeInit")} ${fill.initialDelayMs}ms`}
+                    </span>
+                  ) : (
+                    <span className="miss">{t("probeNoFill")}</span>
+                  )
                 ) : (
                   <span>
                     {t("probeNoFix")}
-                    {initWritten != null && (
-                      <span className="ok"> · {t("probeInit")} {initWritten}ms</span>
+                    {fill?.initialDelayMs != null && (
+                      <span className="ok">
+                        {" "}
+                        · {t("probeInit")} {fill.initialDelayMs}ms
+                      </span>
                     )}
                   </span>
-                )}
-                {probe.warnings.length > 0 && (
-                  <span className="miss"> · {probe.warnings.join("; ")}</span>
                 )}
               </span>
             </div>
@@ -405,28 +413,42 @@ function ProbeSection({
           {probeErr && <div className="perr">{probeErr}</div>}
         </div>
       </div>
-    </>
+    </section>
   );
 }
 
 export function AdvancedPage({
   processors,
+  noiseSuppression,
   kind,
+  noiseMode,
+  noiseParams,
   pipeline,
   params,
   onPipeline,
   onParam,
+  onNoiseParam,
   platform,
   mic,
   reference,
   output,
   running,
   onSetRun,
+  visible,
   trayPrefs,
   onTrayPrefs,
+  autoStartEnabled,
+  autoStartBusy,
+  onAutoStart,
 }: Props) {
   const { t, lang, setLang } = useI18n();
   const proc = processors.find((p) => p.kind === kind);
+  const noiseProcessorKind = noiseSuppression?.modes.find(
+    (mode) => mode.id === noiseMode,
+  )?.processor_kind;
+  const noiseProcessor = processors.find(
+    (processor) => processor.kind === noiseProcessorKind,
+  );
   const desc = (k: string) => DESC[k]?.[lang];
   const pipelineDisabled = kind === "nvidia_afx_aec";
 
@@ -436,17 +458,21 @@ export function AdvancedPage({
 
   const hidden = HIDDEN_PARAMS[kind];
 
-  // 隐藏未满足 requires 的参数(如 ns 关闭时的 ns_level),而非置灰。
+  // 隐藏未满足 requires 的参数，而非置灰。
   const backendParams = Object.entries(proc?.params ?? {}).filter(
     ([k, spec]) =>
       k !== "reference_channels" &&
-      k !== "ns" &&
       !hidden?.has(k) &&
       reqMet(spec),
   );
+  const noiseBackendParams = Object.entries(noiseProcessor?.params ?? {});
 
-  const control = (key: string, spec: ParamSpec) => {
-    const val = params[key];
+  const control = (
+    key: string,
+    spec: ParamSpec,
+    val: unknown,
+    onChange: (key: string, val: unknown) => void,
+  ) => {
     if (spec.type === "bool") {
       return (
         <SegButtons
@@ -455,7 +481,7 @@ export function AdvancedPage({
             { value: "on", label: "ON" },
             { value: "off", label: "OFF" },
           ]}
-          onChange={(v) => onParam(key, v === "on")}
+          onChange={(v) => onChange(key, v === "on")}
         />
       );
     }
@@ -465,9 +491,9 @@ export function AdvancedPage({
           value={String(val ?? spec.default ?? "")}
           options={(spec.values ?? []).map((v) => ({
             value: v,
-            label: SELECT_LABELS[v] ?? v,
+            label: NOISE_LEVEL_LABELS[v] ?? v,
           }))}
-          onChange={(v) => onParam(key, v)}
+          onChange={(v) => onChange(key, v)}
         />
       );
     }
@@ -476,17 +502,23 @@ export function AdvancedPage({
         value={val}
         numeric={spec.type === "number"}
         placeholder={spec.required ? "required" : t("auto")}
-        onCommit={(v) => onParam(key, v)}
+        onCommit={(v) => onChange(key, v)}
       />
     );
   };
 
-  const arow = (key: string, label: string, spec: ParamSpec) => (
+  const arow = (
+    key: string,
+    label: string,
+    spec: ParamSpec,
+    values: Record<string, unknown> = params,
+    onChange: (key: string, val: unknown) => void = onParam,
+  ) => (
     <div className="arow" key={key}>
       <Hint text={desc(key)}>
         <span className="alabel">{label}</span>
       </Hint>
-      <span className="aval">{control(key, spec)}</span>
+      <span className="aval">{control(key, spec, values[key], onChange)}</span>
     </div>
   );
 
@@ -554,6 +586,10 @@ export function AdvancedPage({
             />
           </span>
         </div>
+        {noiseMode === "webrtc" &&
+          noiseBackendParams.map(([key, spec]) =>
+            arow(key, `NS ${key}`, spec, noiseParams, onNoiseParam),
+          )}
       </div>
 
       <div className="asec">{backendLabel(kind, proc)}</div>
@@ -564,53 +600,81 @@ export function AdvancedPage({
         {backendParams.map(([key, spec]) => arow(key, key, spec))}
       </div>
 
-      <ProbeSection
-        platform={platform}
-        kind={kind}
-        pipeline={pipeline}
-        onPipeline={onPipeline}
-        onParam={onParam}
-        mic={mic}
-        reference={reference}
-        output={output}
-        running={running}
-        onSetRun={onSetRun}
-      />
+      <div className="alower">
+        <div className="alower-left">
+          <section className="asession-section">
+            <div className="asec">{t("secSession")}</div>
+            <div className="acols">
+              <div className="arow">
+                <span className="alabel">{t("language")}</span>
+                <span className="aval">
+                  <SegButtons<Lang>
+                    value={lang}
+                    options={[
+                      { value: "en", label: "EN" },
+                      { value: "zh", label: "中文" },
+                    ]}
+                    onChange={setLang}
+                  />
+                </span>
+              </div>
 
-      <div className="asec">{t("secSession")}</div>
-      <div className="acols">
-        <div className="arow">
-          <span className="alabel">{t("language")}</span>
-          <span className="aval">
-            <SegButtons<Lang>
-              value={lang}
-              options={[
-                { value: "en", label: "EN" },
-                { value: "zh", label: "中文" },
-              ]}
-              onChange={setLang}
-            />
-          </span>
+              {/* Windows 后台启动与托盘偏好。Auto Start 读取系统注册状态;
+                  Close to Tray 仍由前端偏好同步到 Rust。 */}
+              {platform === "windows" && (
+                <>
+                  <div className="arow">
+                    <Hint text={t("autoStartHint")}>
+                      <span className="alabel">{t("autoStart")}</span>
+                    </Hint>
+                    <span className="aval">
+                      <SegButtons
+                        value={autoStartEnabled ? "on" : "off"}
+                        options={[
+                          { value: "on", label: "ON" },
+                          { value: "off", label: "OFF" },
+                        ]}
+                        disabled={autoStartBusy}
+                        onChange={(v) => onAutoStart(v === "on")}
+                      />
+                    </span>
+                  </div>
+                  <div className="arow">
+                    <Hint text={t("trayCloseHint")}>
+                      <span className="alabel">{t("trayClose")}</span>
+                    </Hint>
+                    <span className="aval">
+                      <SegButtons
+                        value={trayPrefs.closeToTray ? "on" : "off"}
+                        options={[
+                          { value: "on", label: "ON" },
+                          { value: "off", label: "OFF" },
+                        ]}
+                        onChange={(v) =>
+                          onTrayPrefs({ closeToTray: v === "on" })
+                        }
+                      />
+                    </span>
+                  </div>
+                </>
+              )}
+            </div>
+          </section>
         </div>
-        {/* P5 前端侧:托盘偏好(仅 Windows;Rust 端非 Windows 强制 false)。
-            只留「关闭到托盘」一个开关 —— 最小化到托盘退役(用户定案 2026-07-05) */}
-        {platform === "windows" && (
-          <div className="arow">
-            <Hint text={t("trayCloseHint")}>
-              <span className="alabel">{t("trayClose")}</span>
-            </Hint>
-            <span className="aval">
-              <SegButtons
-                value={trayPrefs.closeToTray ? "on" : "off"}
-                options={[
-                  { value: "on", label: "ON" },
-                  { value: "off", label: "OFF" },
-                ]}
-                onChange={(v) => onTrayPrefs({ closeToTray: v === "on" })}
-              />
-            </span>
-          </div>
-        )}
+
+        <ProbeSection
+          platform={platform}
+          kind={kind}
+          pipeline={pipeline}
+          onPipeline={onPipeline}
+          onParam={onParam}
+          mic={mic}
+          reference={reference}
+          output={output}
+          running={running}
+          onSetRun={onSetRun}
+          visible={visible}
+        />
       </div>
     </div>
   );

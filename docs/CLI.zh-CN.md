@@ -37,16 +37,26 @@ echoless devices --json --fast   # skip slow queries (GUI refresh path)
 ```bash
 echoless run --mic default --reference system --output "CABLE Input"
 echoless run --config my.toml --status-json
+
+# 通用降噪三选一:WebRTC、RNNoise 或关闭
+echoless run --processor aec3 --ns --ns-level moderate
+echoless run --processor aec3 --processor rnnoise
+echoless run --processor aec3 --no-ns
 ```
 
 主要 flag(均覆盖配置文件):`--mic`、`--reference`、
 `--output`、`--sample-rate`、`--frame-ms`、`--reference-channels mono|stereo`、
 `--near-delay-ms`、`--output-level 0..100`(50 = 原始音量)、
-`--processor aec3|localvqe|nvidia_afx_aec|…`、`--ns/--no-ns`、`--ns-level`、
+`--processor aec3|localvqe|nvidia_afx_aec|webrtc_ns|rnnoise`、`--ns/--no-ns`、`--ns-level`、
 `--tail-ms`、`--verbose`、`--status-json`、
 `--diagnostics`(持续录制到停止)、`--diagnostic-seconds N`(限时录制)。诊断文件
 始终写入 Echoless 固定目录；配置文件对应 `diagnostics.enabled = true`，并可选
 设置 `diagnostics.max_seconds = N`。
+
+`--ns` 会在所选 AEC 引擎后追加通用 WebRTC NS 节点，`--ns-level` 设置其
+`low/moderate/high/veryhigh` 强度；`--no-ns` 会移除外部 NS 节点。RNNoise
+没有强度参数，可通过重复 `--processor` 显式加入。LocalVQE v1.2/v1.3 已自带
+降噪，会拒绝额外的 WebRTC NS 或 RNNoise；v1.4 可以使用三种模式。
 
 加上 `--status-json` 后,stdout 输出 JSONL:首先是一个 `started` 事件
 (协商后的设备、`supported_controls`、重采样信息),随后是周期性的状态帧
@@ -63,7 +73,6 @@ echoless run --config my.toml --status-json
 | `set_near_delay_ms` | `{"cmd":"set_near_delay_ms","near_delay_ms":25}` | 实时 near/far 对齐 |
 | `set_bypass` | `{"cmd":"set_bypass","enabled":true}` | 跳过引擎但保持其热态(15 ms 交叉淡化) |
 | `set_initial_delay_ms` | `{"cmd":"set_initial_delay_ms","initial_delay_ms":8}` | AEC3 初始延迟提示 |
-| `set_aec3_ns` | `{"cmd":"set_aec3_ns","ns":true,"ns_level":"high"}` | AEC3 噪声抑制 |
 | `set_aec3_agc` | `{"cmd":"set_aec3_agc","agc":false}` | AEC3 AGC |
 | `set_localvqe_noise_gate` | `{"cmd":"set_localvqe_noise_gate","noise_gate":true,"noise_gate_threshold_dbfs":-45}` | LocalVQE 输出门限 |
 | `start_diagnostics` | `{"cmd":"start_diagnostics","max_seconds":30}` | 在固定诊断目录录制 mic/ref/out WAV |
@@ -87,14 +96,19 @@ echoless probe-delay --json --mic default --reference system --output "CABLE Inp
 这些默认值。
 
 它本身不会停止任何东西——不要在另一个 `run` 正占用设备时运行它。
-Flag:`--beeps N`(12)、`--startup-delay S`(4)、`--volume 0..1`(0.35)、
+Flag:`--beeps N`(默认 12,最少 2)、`--startup-delay S`(4)、`--volume 0..1`(0.35)、
 `--keep-session`(保留本次固定目录 session)、`--keep-beep`、
 `--analyze-only <session>`。
 
-JSON 结果包含 `recommended_near_delay_ms`(实测延迟 + 8 ms 安全余量)、
-逐蜂鸣延迟、标准差/漂移和告警。在 `--json` 模式下,进度标记以 JSONL
-形式发到 stderr(`beep_train_start` 附带精确的蜂鸣节奏)。支持 macOS、
-Windows 和 Linux(Linux 会把 monitor 参考映射回其 sink 以完成播放)。
+JSON 结果包含 `quality`(`valid`、`uncertain` 或 `invalid`)和
+`quality_reasons`。`event_lag_mean_ms`、`event_lag_stddev_ms`、
+`event_lag_drift_ms` 与 `recommended_near_delay_ms` 只有在结果为 `valid`
+时才有值,否则为 `null`;桌面应用不会回填无效或不确定的结果。
+
+测量正常完成但结果为 `uncertain` / `invalid` 时仍返回退出码 0;设备、采集、
+播放、session 或解析失败才是命令错误。在 `--json` 模式下,进度标记以 JSONL
+形式发到 stderr(`beep_train_start` 附带精确的蜂鸣节奏)。支持 macOS、Windows
+和 Linux(Linux 会把 monitor 参考映射回其 sink 以完成播放)。
 
 ## offline
 

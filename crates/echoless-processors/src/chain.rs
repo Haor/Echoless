@@ -158,6 +158,12 @@ pub fn chain_from_nodes(
     base_rate: u32,
     base_far_channels: u16,
 ) -> anyhow::Result<ProcessorChain> {
+    if let Some(error) = crate::validate_noise_suppression_chain(nodes)
+        .into_iter()
+        .next()
+    {
+        anyhow::bail!("chain[{}]: {}", error.node_index, error.message);
+    }
     let mut chain = ProcessorChain::new(base_rate, base_far_channels);
     for n in nodes {
         let mut p = registry::build(&n.kind)?;
@@ -789,6 +795,53 @@ mod tests {
             *seen.lock().unwrap(),
             vec![("ns".to_string(), toml::Value::Boolean(true))]
         );
+    }
+
+    #[test]
+    fn configured_chain_keeps_aec_and_webrtc_ns_as_distinct_nodes() {
+        let nodes = vec![
+            NodeConfig {
+                kind: "aec3".into(),
+                params: toml::Table::new(),
+            },
+            NodeConfig {
+                kind: "webrtc_ns".into(),
+                params: toml::Table::new(),
+            },
+        ];
+
+        let chain = chain_from_nodes(&nodes, 48_000, 1).unwrap();
+
+        assert_eq!(chain.names(), vec!["aec3", "webrtc_ns"]);
+        assert_eq!(chain.total_latency_ms(), 6.5);
+        assert_eq!(chain.stats()[1].erle_db, 0.0);
+    }
+
+    #[test]
+    fn chain_builder_rejects_external_ns_for_localvqe_with_built_in_ns() {
+        use crate::noise_suppression::LOCALVQE_V13_MODEL;
+
+        let mut params = toml::Table::new();
+        params.insert(
+            "model".into(),
+            toml::Value::String(LOCALVQE_V13_MODEL.into()),
+        );
+        let nodes = vec![
+            NodeConfig {
+                kind: "localvqe".into(),
+                params,
+            },
+            NodeConfig {
+                kind: "webrtc_ns".into(),
+                params: toml::Table::new(),
+            },
+        ];
+
+        let error = chain_from_nodes(&nodes, 48_000, 1)
+            .err()
+            .expect("invalid chain must be rejected");
+
+        assert!(error.to_string().contains("does not allow external"));
     }
 
     fn capacity_signature(chain: &ProcessorChain) -> Vec<usize> {

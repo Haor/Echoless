@@ -37,17 +37,29 @@ name fragment, or the `stable_id` from this output. Reference selectors:
 ```bash
 echoless run --mic default --reference system --output "CABLE Input"
 echoless run --config my.toml --status-json
+
+# Pick one shared NS mode: WebRTC, RNNoise, or off
+echoless run --processor aec3 --ns --ns-level moderate
+echoless run --processor aec3 --processor rnnoise
+echoless run --processor aec3 --no-ns
 ```
 
 Key flags (all override the config file): `--mic`, `--reference`,
 `--output`, `--sample-rate`, `--frame-ms`, `--reference-channels mono|stereo`,
 `--near-delay-ms`, `--output-level 0..100` (50 = unity),
-`--processor aec3|localvqe|nvidia_afx_aec|…`, `--ns/--no-ns`, `--ns-level`,
+`--processor aec3|localvqe|nvidia_afx_aec|webrtc_ns|rnnoise`,
+`--ns/--no-ns`, `--ns-level`,
 `--tail-ms`, `--verbose`, `--status-json`,
 `--diagnostics` (records until stopped), and `--diagnostic-seconds N` (records
 for a bounded duration). Diagnostics always use the managed Echoless directory.
 The config equivalents are `diagnostics.enabled = true` and the optional
 `diagnostics.max_seconds = N`.
+
+`--ns` appends the shared WebRTC NS node after the selected AEC engine, and
+`--ns-level` selects `low/moderate/high/veryhigh`; `--no-ns` removes external
+NS nodes. RNNoise has no strength parameter and can be added by repeating
+`--processor`. LocalVQE v1.2/v1.3 already contain NS and reject an extra WebRTC
+NS or RNNoise node; v1.4 supports all three modes.
 
 With `--status-json`, stdout is JSONL: first a `started` event (negotiated
 devices, `supported_controls`, resampling info), then periodic status frames
@@ -64,7 +76,6 @@ While `run` is active, write one JSON object per line to stdin:
 | `set_near_delay_ms` | `{"cmd":"set_near_delay_ms","near_delay_ms":25}` | live near/far alignment |
 | `set_bypass` | `{"cmd":"set_bypass","enabled":true}` | skip the engine, keep it warm (15 ms crossfade) |
 | `set_initial_delay_ms` | `{"cmd":"set_initial_delay_ms","initial_delay_ms":8}` | AEC3 initial delay hint |
-| `set_aec3_ns` | `{"cmd":"set_aec3_ns","ns":true,"ns_level":"high"}` | AEC3 noise suppression |
 | `set_aec3_agc` | `{"cmd":"set_aec3_agc","agc":false}` | AEC3 AGC |
 | `set_localvqe_noise_gate` | `{"cmd":"set_localvqe_noise_gate","noise_gate":true,"noise_gate_threshold_dbfs":-45}` | LocalVQE output gate |
 | `start_diagnostics` | `{"cmd":"start_diagnostics","max_seconds":30}` | record mic/ref/out WAVs in the managed diagnostics directory |
@@ -89,15 +100,28 @@ calibration rig. Portable scripts should pass `--mic`, `--reference`, and
 `--output` explicitly rather than relying on those defaults.
 
 Stops nothing by itself — don't run it while another `run` holds the devices.
-Flags: `--beeps N` (12), `--startup-delay S` (4), `--volume 0..1` (0.35),
+Flags: `--beeps N` (12, minimum 2), `--startup-delay S` (4),
+`--volume 0..1` (0.35),
 `--keep-session` (retain this run's fixed-directory session), `--keep-beep`,
 `--analyze-only <session>`.
 
-JSON result includes `recommended_near_delay_ms` (measured lag + 8 ms
-safety), per-beep lags, stddev/drift and warnings. In `--json` mode progress
-markers are emitted on stderr as JSONL (`beep_train_start` with the exact
-beep cadence). Supported on macOS, Windows and Linux (Linux maps the monitor
-reference back to its sink for playback).
+The JSON result includes `quality` (`valid`, `uncertain`, or `invalid`) and
+`quality_reasons`. Reasons are `ref_signal_missing`, `mic_signal_missing`,
+`insufficient_reference_events`, `insufficient_valid_lags`,
+`weak_correlation`, `inconsistent_lags`, and `lag_at_search_boundary`.
+Diagnostic fields include `global_lag_ms`, `global_corr`, `event_count`,
+`event_detected`, and `per_beep_lags`.
+
+`event_lag_mean_ms`, `event_lag_stddev_ms`, `event_lag_drift_ms`, and
+`recommended_near_delay_ms` are nullable. They are populated only for a
+`valid` measurement; the recommendation includes the 8 ms safety offset.
+Completed `uncertain` and `invalid` measurements still exit with status 0,
+but the desktop app does not apply their nullable recommendation. Device,
+capture, playback, session, and parse failures remain command errors.
+
+In `--json` mode progress markers are emitted on stderr as JSONL
+(`beep_train_start` with the exact beep cadence). Supported on macOS, Windows
+and Linux (Linux maps the monitor reference back to its sink for playback).
 
 ## offline
 

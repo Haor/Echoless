@@ -4,6 +4,7 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type {
   DeviceList,
   DoctorAudio,
+  NoiseMode,
   NvafxDoctor,
   Platform,
   ProcessorManifest,
@@ -13,7 +14,6 @@ import type {
 } from "./types";
 import {
   setAec3AgcControlLine,
-  setAec3NsControlLine,
   setBypassControlLine,
   setInitialDelayMsControlLine,
   setLocalvqeNoiseGateControlLine,
@@ -22,9 +22,26 @@ import {
   startDiagnosticsControlLine,
   stopDiagnosticsControlLine,
 } from "./runtimeControls";
+import type { StartupMode } from "./startupMode";
 
 export function getPlatform(): Promise<Platform> {
   return invoke<Platform>("get_platform");
+}
+
+export function getStartupMode(): Promise<Exclude<StartupMode, "unknown">> {
+  return invoke<Exclude<StartupMode, "unknown">>("get_startup_mode");
+}
+
+export function getAutostartEnabled(): Promise<boolean> {
+  return invoke<boolean>("get_autostart_enabled");
+}
+
+export function setAutostartEnabled(enabled: boolean): Promise<boolean> {
+  return invoke<boolean>("set_autostart_enabled", { enabled });
+}
+
+export function settleStartupLaunch(): Promise<void> {
+  return invoke<void>("settle_startup_launch");
 }
 
 export function listDevices(): Promise<DeviceList> {
@@ -84,6 +101,16 @@ export function downloadLocalvqeModel(filename: string): Promise<string> {
 // 主动近端延迟侦测 / AEC 链路诊断。后端 shell `echoless probe-delay --json`,通常约 15 秒;
 // 首次 macOS 权限/Process Tap 启动可能更久。会外放一串蜂鸣 —— 调用前必须先停掉主 run。
 // 字段以 CLI `probe-delay --json` 实测为准(docs/CLI.md)。
+export type ProbeQuality = "valid" | "uncertain" | "invalid";
+export type ProbeQualityReason =
+  | "ref_signal_missing"
+  | "mic_signal_missing"
+  | "insufficient_reference_events"
+  | "insufficient_valid_lags"
+  | "weak_correlation"
+  | "inconsistent_lags"
+  | "lag_at_search_boundary";
+
 export interface NearDelayProbeResult {
   session_dir: string;
   session_retained: boolean;
@@ -91,12 +118,14 @@ export interface NearDelayProbeResult {
   mic_dbfs: number;
   global_lag_ms: number;
   global_corr: number;
+  quality: ProbeQuality;
+  quality_reasons: ProbeQualityReason[];
   event_count: number;
   event_detected: number;
-  event_lag_mean_ms: number;
-  event_lag_stddev_ms: number;
-  event_lag_drift_ms: number;
-  recommended_near_delay_ms: number;
+  event_lag_mean_ms: number | null;
+  event_lag_stddev_ms: number | null;
+  event_lag_drift_ms: number | null;
+  recommended_near_delay_ms: number | null;
   per_beep_lags: Array<{ index: number; time_s: number; lag_ms: number; corr: number }>;
   warnings: string[];
 }
@@ -192,9 +221,6 @@ export function setNearDelayMs(nearDelayMs: number): Promise<void> {
 }
 export function setInitialDelayMs(initialDelayMs: number): Promise<void> {
   return sendRunControl(setInitialDelayMsControlLine(initialDelayMs));
-}
-export function setAec3Ns(ns: boolean, nsLevel: string): Promise<void> {
-  return sendRunControl(setAec3NsControlLine(ns, nsLevel));
 }
 export function setAec3Agc(agc: boolean): Promise<void> {
   return sendRunControl(setAec3AgcControlLine(agc));
@@ -310,9 +336,12 @@ export interface ConfigChoice {
   output: string;
   reference: string; // "system" | "none" | "input:<stable_id>" | ...
   kind: string; // backend kind
+  noiseMode: NoiseMode;
+  noiseParams?: Record<string, unknown>; // selected shared NS node parameters
   pipeline: PipelineCfg;
   params: Record<string, unknown>; // chain[0] 参数(不含 reference_channels)
   diagnostics?: DiagnosticsCfg | null; // 开启录制时写入 [diagnostics]
+  bypass?: boolean;
 }
 
 export function tomlString(v: string): string {
@@ -374,6 +403,7 @@ export function buildConfigToml(c: ConfigChoice): string {
     lines.push(`near_delay_ms = ${c.pipeline.near_delay_ms}`);
   // 输出电平:发原始 0-100 整数,曲线/软限幅由后端做(单一真理源,不在前端算 gain)。
   lines.push(`output_level = ${c.pipeline.output_level ?? OUTPUT_LEVEL_UNITY}`);
+  if (c.bypass) lines.push(`bypass = true`);
   lines.push(``);
   if (c.diagnostics) {
     lines.push(`[diagnostics]`);
@@ -385,9 +415,23 @@ export function buildConfigToml(c: ConfigChoice): string {
   lines.push(`[[chain]]`, `kind = ${tomlString(c.kind)}`);
   for (const [k, raw] of Object.entries(c.params)) {
     if (k === "reference_channels") continue; // 顶层管线项,不重复
+    if (k === "ns" || k === "ns_level") continue;
     if (c.kind === "nvidia_afx_aec" && k === "runtime_dir") continue;
     const val = tomlValue(raw);
     if (val !== null) lines.push(`${k} = ${val}`);
+  }
+  if (c.noiseMode === "webrtc") {
+    lines.push(``, `[[chain]]`, `kind = "webrtc_ns"`);
+  } else if (c.noiseMode === "rnnoise") {
+    lines.push(``, `[[chain]]`, `kind = "rnnoise"`);
+  }
+  // Official RNNoise exposes no suppression-strength parameter. Keep the
+  // persisted WebRTC parameter namespace from leaking into another backend.
+  if (c.noiseMode === "webrtc") {
+    for (const [key, raw] of Object.entries(c.noiseParams ?? {})) {
+      const value = tomlValue(raw);
+      if (value !== null) lines.push(`${key} = ${value}`);
+    }
   }
   return lines.join("\n") + "\n";
 }

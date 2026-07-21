@@ -60,7 +60,30 @@ export type ProcessorKind =
   | "passthrough"
   | "aec3"
   | "localvqe"
-  | "nvidia_afx_aec";
+  | "nvidia_afx_aec"
+  | "webrtc_ns"
+  | "rnnoise";
+
+export type NoiseMode = "webrtc" | "rnnoise" | "off";
+
+export interface NoiseModeManifestEntry {
+  id: NoiseMode;
+  processor_kind: "webrtc_ns" | "rnnoise" | null;
+}
+
+export interface LocalvqeNoiseCapability {
+  file: string;
+  version: string;
+  capability: "built_in_ns" | "pure_aec" | "unknown";
+  allowed_modes: NoiseMode[];
+}
+
+export interface NoiseSuppressionManifest {
+  modes: NoiseModeManifestEntry[];
+  engine_defaults: Record<string, NoiseMode[]>;
+  localvqe_models: LocalvqeNoiseCapability[];
+  unknown_localvqe_allowed_modes: NoiseMode[];
+}
 
 export interface Processor {
   kind: ProcessorKind;
@@ -70,11 +93,13 @@ export interface Processor {
   experimental: boolean;
   diagnostic?: boolean;
   requires_doctor_ok?: boolean;
+  role?: "noise_suppression";
   constraints?: Record<string, unknown>;
   params: Record<string, ParamSpec>;
 }
 
 export interface ProcessorManifest {
+  noise_suppression: NoiseSuppressionManifest;
   processors: Processor[];
 }
 
@@ -176,6 +201,7 @@ export interface StreamErrorEvent {
   stream: string;
   message: string;
   fatal: boolean;
+  recoverable?: boolean;
 }
 export type ClockSkewDirection =
   | "output_faster_than_capture"
@@ -212,11 +238,6 @@ export interface NearDelayChangedEvent {
 export interface InitialDelayChangedEvent {
   type: "initial_delay_changed";
   initial_delay_ms: number;
-}
-export interface Aec3NsChangedEvent {
-  type: "aec3_ns_changed";
-  ns: boolean;
-  ns_level: string;
 }
 export interface Aec3AgcChangedEvent {
   type: "aec3_agc_changed";
@@ -271,7 +292,6 @@ export type RunEventPayload =
   | OutputLevelChangedEvent
   | NearDelayChangedEvent
   | InitialDelayChangedEvent
-  | Aec3NsChangedEvent
   | Aec3AgcChangedEvent
   | LocalvqeNoiseGateChangedEvent
   | BypassChangedEvent;
@@ -281,6 +301,7 @@ export type RunEvent = RunEventPayload & { run_id: number };
 export interface RunExitEvent {
   run_id: number;
   intentional?: boolean;
+  recoverable?: boolean;
 }
 
 // ---- doctor audio --json(虚拟声卡检测) ----

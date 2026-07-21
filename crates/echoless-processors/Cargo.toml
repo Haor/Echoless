@@ -20,6 +20,9 @@ aec3-apm = { path = "../../aec3/crates/aec3-apm", optional = true }
 [target.'cfg(windows)'.dependencies]
 windows-sys.workspace = true
 
+[build-dependencies]
+cc.workspace = true
+
 [features]
 default = ["aec3-engine"]
 aec3-engine = ["dep:aec3-apm"]

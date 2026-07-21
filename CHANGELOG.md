@@ -4,6 +4,47 @@ All notable changes to Echoless are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org).
 
+## [Unreleased]
+
+## [1.2.0] — 2026-07-21
+
+Windows login startup, shared WebRTC and RNNoise post-AEC suppression, a safer
+delay probe, a reorganized Advanced page, and automatic recovery from Windows
+audio endpoint invalidation.
+
+### Added
+- Windows **Auto Start** option: launch hidden after sign-in and start the saved
+  Echoless audio pipeline automatically. Startup failures reveal the main window
+  instead of remaining silent in the tray.
+- Shared **Noise Suppression** selector with `WEBRTC`, `RNNOISE`, and `OFF`
+  modes for AEC3, NVAFX, and the pure-AEC LocalVQE v1.4 model. RNNoise uses a
+  pinned, statically bundled Xiph runtime and model with no runtime download.
+- WebRTC NS keeps its four strength levels in Advanced settings. RNNoise uses
+  the official fixed-strength runtime and does not expose a synthetic level.
+
+### Changed
+- WebRTC noise suppression now runs as a shared post-AEC processor instead of
+  private AEC3 state. LocalVQE v1.2/v1.3 expose their built-in NS capability
+  and lock external suppression off to prevent double processing.
+- LocalVQE model badges now describe capability (`NS` or `AEC`), and model
+  tooltips explain behavior instead of exposing filesystem paths.
+- Advanced settings now place WebRTC NS and delay probing side by side, keeping
+  the session controls clear of the status bar as the parameter set grows.
+
+### Fixed
+- Windows now recreates the audio pipeline when a WASAPI endpoint is
+  invalidated after sleep, display power transitions, or device
+  reconfiguration. Recovery uses bounded retries and preserves the current
+  runtime settings.
+- Trailing CLI errors are written to the persistent app log even when the run
+  finalizes first, so device-loss failures remain available for diagnosis.
+- RNNoise buffer-backed models now initialize their file handle before cleanup,
+  preventing a Linux crash when the processor is destroyed.
+- Delay Probe now rejects missing, weak, sparse, inconsistent, and search-limit
+  measurements instead of treating a repeatable bad match as stable. Invalid
+  results leave the existing delay untouched and give the user a short retry
+  hint instead of exposing internal correlation diagnostics.
+
 ## [1.1.0] — 2026-07-11
 
 A stability and polish release on top of 1.0.0: adaptive handling of audio

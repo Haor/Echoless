@@ -371,6 +371,12 @@ body {
   overflow-y: auto;
   overflow-x: hidden;
 }
+.persistent-view {
+  display: contents;
+}
+.persistent-view[hidden] {
+  display: none;
+}
 .enbody {
   flex: 1 1 auto;
   min-height: 0;
@@ -512,12 +518,30 @@ body {
   width: 340px;
 }
 
-/* Advanced · 延迟侦测:左列 near_delay,右列 run probe + 进度 + 结果 */
-.aprobe {
+/* Advanced 下半区是两条独立纵向流:左侧 SESSION,右侧只放延迟侦测。
+   不能把 SESSION 放在 grid 的下一行,否则 probe 结果会抬高整行并把它向下推。 */
+.alower {
   display: grid;
   grid-template-columns: 1fr 1fr;
   column-gap: 40px;
   align-items: start;
+}
+.alower-left {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+.asession-section,
+.aprobe-section {
+  min-width: 0;
+}
+.alower .acols {
+  grid-template-columns: 1fr;
+}
+.aprobe {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
 }
 .aprobe .arow {
   height: 42px;
@@ -527,8 +551,8 @@ body {
   flex-direction: column;
   gap: 10px;
   min-width: 0;
-  /* v9.1:去掉 92px 预留 —— probe 空闲时它是 LVQE 页的大片空白(用户圈出);
-     进度点/结果出现时自然撑高 */
+  /* 预留标准探测结果(进度点 + 两行读数)的高度,避免结果出现时把 SESSION 下推。 */
+  min-height: 82px;
 }
 .prow {
   display: flex;
@@ -540,6 +564,17 @@ body {
   flex: none;
   white-space: nowrap;
   padding: 0;
+  font-size: 11px;
+}
+.pbtn::before {
+  content: ">>";
+  margin-right: 3px;
+  color: var(--t-strong);
+}
+.pbtn::after {
+  content: "<<";
+  margin-left: 3px;
+  color: var(--t-strong);
 }
 .pnote {
   color: var(--t-faint);
@@ -793,6 +828,9 @@ body {
 }
 .lvdef {
   flex: none;
+  width: 22px;
+  box-sizing: border-box;
+  text-align: center;
   font-style: normal;
   font-family: var(--mono);
   font-weight: 400;
@@ -800,7 +838,7 @@ body {
   letter-spacing: 0.5px; /* v18:1→0.5,同上腾预算 */
   color: var(--ink);
   background: var(--paper); /* v3:DEFAULT 徽标=纸白贴纸 */
-  padding: 1px 3px;
+  padding: 1px 0;
 }
 .lvmod.on .lvdef {
   background: var(--paper); /* v4.1:选中模型徽标=纸灰 */
@@ -1977,22 +2015,27 @@ hr.hair {
 .segg .b:disabled {
   cursor: default;
 }
-/* v9.2:高级页双选段定宽 74px —— 各行右对齐 + 等宽段 → 中缝落在同一竖轴(用户画线)。
-   段内文案必须 ≤6 字符(如 ns_level 用 mod/v.high 缩写),超长会溢出 */
+.segg .b:disabled:not(.active) {
+  color: var(--t-faint);
+  opacity: 0.45;
+}
+/* v9.2:高级页双选段定宽 74px —— 各行右对齐 + 等宽段 → 中缝落在同一竖轴(用户画线)。 */
 .arow .segg .b {
   width: 74px;
   padding-left: 0;
   padding-right: 0;
   text-align: center;
 }
-/* 02 MODEL 三钮等宽(LOCALVQE 简写 LVQE 后可等宽);04 NOISE 双钮同宽 74px,
-   ON|OFF 接缝正对上排 AEC3|LVQE 接缝、右缘对齐 LVQE|NVAFX 接缝(用户定案 2026-07-05) */
+/* 02 MODEL 与 04 NOISE 都是三钮等宽，三条分隔线严格对齐。 */
 #models .b,
 #ns .b {
   width: 74px;
   padding-left: 0;
   padding-right: 0;
   text-align: center;
+}
+#ns .b.long-label {
+  letter-spacing: 0.06em;
 }
 
 /* signal — 三路示波(near-end MIC+REF → clean OUT) */

@@ -217,6 +217,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1e748733b7cbc798e1434b6ac524f0c1ff2ab456fe201501e6497c8417a4fc33"
 
 [[package]]
+name = "cc"
+version = "1.2.67"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e17dd265a7d0f31ef544e1b20e03add05d3b45b491b633b10d67145d2acc1a38"
+dependencies = [
+ "find-msvc-tools",
+ "shlex",
+]
+
+[[package]]
 name = "cesu8"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -462,7 +472,7 @@ dependencies = [
 
 [[package]]
 name = "echoless-audio-io"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "anyhow",
  "bitflags",
@@ -471,7 +481,7 @@ dependencies = [
 
 [[package]]
 name = "echoless-cli"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -492,7 +502,7 @@ dependencies = [
 
 [[package]]
 name = "echoless-core"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "anyhow",
  "echoless-audio-io",
@@ -503,14 +513,15 @@ dependencies = [
 
 [[package]]
 name = "echoless-paths"
-version = "1.1.0"
+version = "1.2.0"
 
 [[package]]
 name = "echoless-processors"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "aec3-apm",
  "anyhow",
+ "cc",
  "echoless-paths",
  "libloading",
  "rubato",
@@ -524,6 +535,12 @@ name = "equivalent"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "877a4ace8713b0bcf2a4e7eec82529c029f1d0619886d18145fea96c3ffe5c0f"
+
+[[package]]
+name = "find-msvc-tools"
+version = "0.1.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5baebc0774151f905a1a2cc41989300b1e6fbb29aff0ceffa1064fdd3088d582"
 
 [[package]]
 name = "flate2"
@@ -1115,6 +1132,12 @@ dependencies = [
  "cpufeatures 0.2.17",
  "digest",
 ]
+
+[[package]]
+name = "shlex"
+version = "2.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
 
 [[package]]
 name = "simd-adler32"
