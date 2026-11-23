@@ -1,6 +1,13 @@
-import { describe, it, expect } from "vitest";
-import { dash } from "./numeric";
-import { statusToLive } from "./runtimeTelemetry";
+import { describe, it, expect, vi, afterEach } from "vitest";
+import {
+  dash,
+  getRunStatusKind,
+  publishRuntimeStatus,
+  resetRuntimeLive,
+  statusToLive,
+  subscribeRunStatusKind,
+  syncRunStatusInputs,
+} from "./runtimeTelemetry";
 import type { RuntimeStatus } from "./types";
 
 // 回归:黑屏根因是 undefined 遥测值流进 .toFixed() 卸载整个 React 树。
@@ -63,5 +70,110 @@ describe("statusToLive", () => {
     const live = statusToLive({ frames: 1 } as unknown as RuntimeStatus);
     expect(() => dash(live.mic)).not.toThrow();
     expect(dash(live.mic)).toBe("—");
+  });
+});
+
+describe("statusKind subscription isolation (P-02)", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+    resetRuntimeLive(0);
+    syncRunStatusInputs(
+      { powerOn: false, refSel: "none", dev: false, bypassed: false },
+      0,
+    );
+  });
+
+  function makeStatus(patch: Partial<RuntimeStatus> = {}): RuntimeStatus {
+    return {
+      type: "status",
+      elapsed_s: 1,
+      frames: 1,
+      sample_rate: 48000,
+      frame_ms: 10,
+      backend: "aec3",
+      mic_dbfs: -20,
+      ref_dbfs: -18,
+      out_dbfs: -24,
+      mic_q_samples: 0,
+      ref_q_samples: 0,
+      out_q_samples: 0,
+      input_queue_latency_ms: 0,
+      output_queue_latency_ms: 0,
+      algorithmic_latency_ms: 10,
+      estimated_user_latency_ms: 14,
+      aec_estimated_delay_ms: 0,
+      mic_input_drops: 0,
+      ref_input_drops: 0,
+      input_drops: 0,
+      ref_underruns: 0,
+      output_underruns: 0,
+      output_overruns: 0,
+      stale_drops: 0,
+      node_process_time_ms: 1,
+      runtime_errors: 0,
+      diverged: false,
+      ...patch,
+    };
+  }
+
+  it("does not notify statusKind subscribers on steady-state 12.5Hz telemetry packets", () => {
+    vi.useFakeTimers();
+    syncRunStatusInputs(
+      { powerOn: true, refSel: "system", dev: false, bypassed: false },
+      1000,
+    );
+    expect(getRunStatusKind()).toBe("live");
+
+    const listener = vi.fn();
+    const unsub = subscribeRunStatusKind(listener);
+    try {
+      for (let i = 1; i <= 50; i++) {
+        publishRuntimeStatus(makeStatus({ frames: i, mic_dbfs: -30 + (i % 5) }), 1000 + i * 80);
+      }
+      expect(listener).not.toHaveBeenCalled();
+      expect(getRunStatusKind()).toBe("live");
+    } finally {
+      unsub();
+    }
+  });
+
+  it("debounces degradation to warn/noref and notifies immediately on recovery or bypass", () => {
+    vi.useFakeTimers();
+    syncRunStatusInputs(
+      { powerOn: true, refSel: "system", dev: false, bypassed: false },
+      1000,
+    );
+    const listener = vi.fn();
+    const unsub = subscribeRunStatusKind(listener);
+    try {
+      publishRuntimeStatus(makeStatus({ frames: 1, diverged: true }), 1080);
+      expect(getRunStatusKind()).toBe("live");
+      expect(listener).toHaveBeenCalledTimes(0);
+
+      vi.advanceTimersByTime(2500);
+      expect(getRunStatusKind()).toBe("warn");
+      expect(listener).toHaveBeenCalledTimes(1);
+
+      publishRuntimeStatus(makeStatus({ frames: 2, diverged: false }), 3600);
+      expect(getRunStatusKind()).toBe("live");
+      expect(listener).toHaveBeenCalledTimes(2);
+
+      // Sustained reference silence (> 3000ms) + status hold (2500ms) -> noref
+      publishRuntimeStatus(makeStatus({ frames: 3, ref_dbfs: -120 }), 7000);
+      expect(getRunStatusKind()).toBe("live");
+      vi.advanceTimersByTime(2500);
+      expect(getRunStatusKind()).toBe("noref");
+      expect(listener).toHaveBeenCalledTimes(3);
+
+      // Bypass toggles immediately
+      syncRunStatusInputs(
+        { powerOn: true, refSel: "system", dev: false, bypassed: true },
+        9600,
+      );
+      expect(getRunStatusKind()).toBe("bypass");
+      expect(listener).toHaveBeenCalledTimes(4);
+    } finally {
+      unsub();
+    }
   });
 });

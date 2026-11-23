@@ -74,7 +74,7 @@ export function simMicDoctor(
   const isLinux = platform === "linux";
   const { out, mic } = cables(platform);
   const base: DoctorAudio = {
-    ok: false,
+    ok: true,
     platform,
     virtual_output_detected: false,
     candidate_inputs: [],
@@ -86,14 +86,11 @@ export function simMicDoctor(
         : "blackhole-2ch",
     install_status: "missing",
     needs_reboot: false,
+    virtual_driver_present: false,
     // Windows/Linux 当前后端不暴露麦权限态;mac 才有 granted/denied/undetermined。
     permission_state: isWin || isLinux ? "unknown" : "granted",
     system_audio_permission: isLinux ? "unknown" : undefined,
     reference_sources: [],
-    virtual_route_ready: false,
-    route_status: "missing",
-    recommended_output: null,
-    recommended_app_mic: null,
   };
 
   if (isLinux && state !== "ready") return base;
@@ -102,17 +99,13 @@ export function simMicDoctor(
     case "ready":
       return {
         ...base,
-        ok: true,
         virtual_output_detected: true,
         candidate_outputs: [out],
         candidate_inputs: [mic],
         install_status: "installed",
+        virtual_driver_present: isWin,
         permission_state: isWin || isLinux ? "unknown" : "granted",
         system_audio_permission: isLinux ? "unknown" : base.system_audio_permission,
-        virtual_route_ready: true,
-        route_status: "ready",
-        recommended_output: out,
-        recommended_app_mic: mic,
       };
     case "permission":
       // Windows 无此态 → 退化为 ready;mac 显示「权限被拒」。
@@ -122,12 +115,8 @@ export function simMicDoctor(
         candidate_outputs: [out],
         candidate_inputs: [mic],
         install_status: "installed",
-        ok: isWin,
+        virtual_driver_present: isWin,
         permission_state: isWin ? "unknown" : "denied",
-        virtual_route_ready: true,
-        route_status: "ready",
-        recommended_output: out,
-        recommended_app_mic: mic,
       };
     case "incomplete":
       // 只检测到输出端(input 端缺失)→ 路由不完整。Windows 多半需重启,mac 重启 CoreAudio。
@@ -136,16 +125,13 @@ export function simMicDoctor(
         virtual_output_detected: true,
         candidate_outputs: [out],
         candidate_inputs: [],
-        install_status: "installed",
+        install_status: "unknown",
+        virtual_driver_present: isWin,
         needs_reboot: isWin,
-        virtual_route_ready: false,
-        route_status: "incomplete",
-        recommended_output: out,
-        recommended_app_mic: null,
       };
     case "reboot":
       // Windows:驱动残迹在、端点枚举不到 = 装了没重启。
-      return { ...base, needs_reboot: true };
+      return { ...base, virtual_driver_present: isWin, needs_reboot: true };
     case "missing":
     case "unknown":
     default:

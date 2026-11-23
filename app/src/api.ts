@@ -12,16 +12,6 @@ import type {
   RunExitEvent,
   ValidateResult,
 } from "./types";
-import {
-  setAec3AgcControlLine,
-  setBypassControlLine,
-  setInitialDelayMsControlLine,
-  setLocalvqeNoiseGateControlLine,
-  setNearDelayMsControlLine,
-  setOutputLevelControlLine,
-  startDiagnosticsControlLine,
-  stopDiagnosticsControlLine,
-} from "./runtimeControls";
 import type { StartupMode } from "./startupMode";
 
 export function getPlatform(): Promise<Platform> {
@@ -80,7 +70,7 @@ export interface LocalvqeModel {
   path: string;
   source: "downloaded" | string;
 }
-// native runtime 随包分发(2026-07-05 定案),不走下载;native_ready 只兜 dev 病态 case。
+// Native runtime is bundled with the app; native_ready guards dev environments with missing resources.
 export interface LocalvqeAssets {
   models_dir: string;
   models: LocalvqeModel[];
@@ -201,37 +191,34 @@ export function stopRun(): Promise<number | null> {
   return invoke<number | null>("stop_run");
 }
 
-// 向运行中的子进程 stdin 写一行 JSON 控制命令。具体能力以 started.supported_controls 为准。
-function sendRunControl(line: string): Promise<void> {
-  return invoke<void>("send_run_control", { line });
+// Send a single-line JSON runtime control command to the sidecar stdin.
+function sendRunControl(payload: Record<string, unknown>): Promise<void> {
+  return invoke<void>("send_run_control", { line: JSON.stringify(payload) });
 }
 export function startDiagnostics(maxSeconds: number | null): Promise<void> {
-  return sendRunControl(startDiagnosticsControlLine(maxSeconds));
+  return sendRunControl({ cmd: "start_diagnostics", max_seconds: maxSeconds });
 }
 export function stopDiagnostics(): Promise<void> {
-  return sendRunControl(stopDiagnosticsControlLine());
+  return sendRunControl({ cmd: "stop_diagnostics" });
 }
-// 运行中实时改输出电平(0-100),逐 buffer 生效、零掉音。仅在 run 存活时调用。
 export function setOutputLevel(level: number): Promise<void> {
-  return sendRunControl(setOutputLevelControlLine(level));
+  return sendRunControl({ cmd: "set_output_level", level });
 }
-// 运行中实时改近端对齐延迟(ms),只调整处理线程里的 delay buffer,不重启 run。
 export function setNearDelayMs(nearDelayMs: number): Promise<void> {
-  return sendRunControl(setNearDelayMsControlLine(nearDelayMs));
+  return sendRunControl({ cmd: "set_near_delay_ms", near_delay_ms: nearDelayMs });
 }
 export function setInitialDelayMs(initialDelayMs: number): Promise<void> {
-  return sendRunControl(setInitialDelayMsControlLine(initialDelayMs));
+  return sendRunControl({
+    cmd: "set_initial_delay_ms",
+    initial_delay_ms: initialDelayMs,
+  });
 }
 export function setAec3Agc(agc: boolean): Promise<void> {
-  return sendRunControl(setAec3AgcControlLine(agc));
+  return sendRunControl({ cmd: "set_aec3_agc", agc });
 }
-// P8-D1:穿透开关(OFF = mic 原样直通虚拟麦)。chain 级 bypass,AEC 保温,
-// 15ms crossfade;运行中实时生效。
 export function setBypass(enabled: boolean): Promise<void> {
-  return sendRunControl(setBypassControlLine(enabled));
+  return sendRunControl({ cmd: "set_bypass", enabled });
 }
-// Windows 托盘偏好(P5 契约):
-// 启动时与每次变更时同步到 Rust;非 Windows 平台后端忽略。
 export function setTrayPrefs(closeToTray: boolean): Promise<void> {
   return invoke("set_tray_prefs", { closeToTray });
 }
@@ -239,9 +226,11 @@ export function setLocalvqeNoiseGate(
   noiseGate: boolean,
   noiseGateThresholdDbfs: number,
 ): Promise<void> {
-  return sendRunControl(
-    setLocalvqeNoiseGateControlLine(noiseGate, noiseGateThresholdDbfs),
-  );
+  return sendRunControl({
+    cmd: "set_localvqe_noise_gate",
+    noise_gate: noiseGate,
+    noise_gate_threshold_dbfs: noiseGateThresholdDbfs,
+  });
 }
 
 // 订阅 run 的事件流(started + status 都走这个通道)。返回取消订阅函数。
@@ -328,9 +317,6 @@ export function outputLevelToGain(level: number): number {
   const v = Math.max(0, Math.min(100, level));
   return Math.pow(v / OUTPUT_LEVEL_UNITY, OUTPUT_LEVEL_EXP);
 }
-export interface DiagnosticsCfg {
-  max_seconds: number | null;
-}
 export interface ConfigChoice {
   mic: string; // selector / stable_id / "default"
   output: string;
@@ -340,7 +326,6 @@ export interface ConfigChoice {
   noiseParams?: Record<string, unknown>; // selected shared NS node parameters
   pipeline: PipelineCfg;
   params: Record<string, unknown>; // chain[0] 参数(不含 reference_channels)
-  diagnostics?: DiagnosticsCfg | null; // 开启录制时写入 [diagnostics]
   bypass?: boolean;
 }
 
@@ -405,13 +390,6 @@ export function buildConfigToml(c: ConfigChoice): string {
   lines.push(`output_level = ${c.pipeline.output_level ?? OUTPUT_LEVEL_UNITY}`);
   if (c.bypass) lines.push(`bypass = true`);
   lines.push(``);
-  if (c.diagnostics) {
-    lines.push(`[diagnostics]`);
-    lines.push(`enabled = true`);
-    if (c.diagnostics.max_seconds != null)
-      lines.push(`max_seconds = ${c.diagnostics.max_seconds}`);
-    lines.push(``);
-  }
   lines.push(`[[chain]]`, `kind = ${tomlString(c.kind)}`);
   for (const [k, raw] of Object.entries(c.params)) {
     if (k === "reference_channels") continue; // 顶层管线项,不重复

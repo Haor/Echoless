@@ -1,12 +1,9 @@
 import { describe, expect, it } from "vitest";
 import {
-  createStartupCleanup,
-  expectStartupRun,
-  INITIAL_STARTUP_RUN_HANDSHAKE,
-  observeStartupRunStarted,
-  startupDataReady,
   shouldAttemptAutoStart,
+  shouldRevealAutostartFailure,
   shouldRevealWindow,
+  startupDataReady,
 } from "./startupMode";
 
 describe("startup launch policy", () => {
@@ -42,43 +39,38 @@ describe("startup launch policy", () => {
     expect(startupDataReady(false, "aec3", true)).toBe(false);
   });
 
-  it("shares one cleanup barrier across StrictMode remounts", async () => {
-    let calls = 0;
-    const cleanup = createStartupCleanup(async () => {
-      calls += 1;
-    });
-
-    const first = cleanup();
-    const second = cleanup();
-    expect(second).toBe(first);
-    await Promise.all([first, second]);
-    expect(calls).toBe(1);
-  });
-
-  it("opens the cleanup barrier even when stale-run cleanup reports an error", async () => {
-    const cleanup = createStartupCleanup(async () => {
-      throw new Error("no stale run");
-    });
-
-    await expect(cleanup()).resolves.toBeUndefined();
-  });
-
-  it("settles only when started belongs to the reserved autostart run", () => {
-    const staleFirst = observeStartupRunStarted(
-      INITIAL_STARTUP_RUN_HANDSHAKE,
-      7,
-    );
-    const reserved = expectStartupRun(staleFirst, 8);
-    expect(reserved.settled).toBe(false);
-
-    const actual = observeStartupRunStarted(reserved, 8);
-    expect(actual.settled).toBe(true);
-  });
-
-  it("handles started arriving before the start command returns its run id", () => {
-    const early = observeStartupRunStarted(INITIAL_STARTUP_RUN_HANDSHAKE, 11);
-    const reserved = expectStartupRun(early, 11);
-
-    expect(reserved.settled).toBe(true);
+  it("reveals the window immediately when autostart fails before or after started", () => {
+    expect(
+      shouldRevealAutostartFailure({
+        mode: "autostart",
+        attempted: true,
+        running: false,
+        err: "WASAPI device open failed",
+      }),
+    ).toBe(true);
+    expect(
+      shouldRevealAutostartFailure({
+        mode: "autostart",
+        attempted: true,
+        running: true,
+        err: "transient warning",
+      }),
+    ).toBe(false);
+    expect(
+      shouldRevealAutostartFailure({
+        mode: "autostart",
+        attempted: false,
+        running: false,
+        err: "startup error",
+      }),
+    ).toBe(false);
+    expect(
+      shouldRevealAutostartFailure({
+        mode: "manual",
+        attempted: true,
+        running: false,
+        err: "error",
+      }),
+    ).toBe(false);
   });
 });

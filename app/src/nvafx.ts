@@ -18,7 +18,7 @@ export function nvafxAssetUrl(asset: string): string {
   return `${NVAFX_RELEASE_BASE}/${NVAFX_RELEASE_TAG}/${asset}`;
 }
 
-// 状态机(Codex handoff)。优先级见 deriveRtxState。
+// 安装状态机。优先级见 deriveRtxState。
 export type RtxState =
   | "unsupported_platform"
   | "missing_driver"

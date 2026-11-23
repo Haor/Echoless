@@ -82,4 +82,14 @@ describe("createAsyncListenerScope", () => {
     expect(registry.handlers.size).toBe(0);
     expect(registry.unlistenCalls).toBe(2);
   });
+
+  it("swallows registration rejection without leaking an unhandled rejection (B-25)", async () => {
+    const scope = createAsyncListenerScope();
+    scope.listen(
+      () => Promise.reject(new Error("ipc listen failed")),
+      () => {},
+    );
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    scope.dispose();
+  });
 });
