@@ -1,7 +1,7 @@
 use anyhow::{bail, Result};
 
 use crate::cli::RunArgs;
-use crate::nvafx_install::validate_nvafx_constraints;
+use crate::config_validate::ensure_valid_pipeline_config;
 #[cfg(feature = "realtime")]
 use crate::realtime;
 use echoless_core::{apply_reference_channels_to_chain, PipelineConfig};
@@ -10,7 +10,7 @@ use echoless_processors::NodeConfig;
 #[cfg(feature = "realtime")]
 pub(crate) fn cmd_run(a: RunArgs) -> Result<()> {
     let cfg = load_run_config(&a)?;
-    validate_nvafx_constraints(&cfg)?;
+    ensure_valid_pipeline_config(&cfg)?;
     let opts = runtime_options_from_args(&a)?;
     let run_config = format!(
         "realtime run config: mic={} ref={} out={}",

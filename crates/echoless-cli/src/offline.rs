@@ -1,8 +1,7 @@
-use anyhow::{bail, Result};
+use anyhow::Result;
 
 use crate::cli::OfflineArgs;
-use crate::config_validate::validate_pipeline_config;
-use crate::nvafx_install::validate_nvafx_constraints;
+use crate::config_validate::ensure_valid_pipeline_config;
 use echoless_audio_io::file::{WavFileSink, WavFileSource};
 use echoless_core::{
     default_output_level, run_offline, DiagnosticsConfig, PipelineConfig, ReferenceChannels,
@@ -46,11 +45,7 @@ pub(crate) fn cmd_offline(a: OfflineArgs) -> Result<()> {
         diagnostics: DiagnosticsConfig::default(),
         chain,
     };
-    let validation_errors = validate_pipeline_config(&cfg);
-    if let Some(error) = validation_errors.first() {
-        bail!("invalid config: {}: {}", error.path, error.message);
-    }
-    validate_nvafx_constraints(&cfg)?;
+    ensure_valid_pipeline_config(&cfg)?;
 
     let frame = cfg.frame_size();
     let mic = WavFileSource::new(&a.mic, frame)?;

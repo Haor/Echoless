@@ -267,6 +267,14 @@ fn expect_top_i64(table: &toml::Table, key: &str, errors: &mut Vec<ConfigValidat
     }
 }
 
+/// Entry-point check shared by `run`, `offline`, and `nvafx offline`.
+pub(crate) fn ensure_valid_pipeline_config(cfg: &PipelineConfig) -> Result<()> {
+    match validate_pipeline_config(cfg).first() {
+        Some(error) => bail!("invalid config: {}: {}", error.path, error.message),
+        None => Ok(()),
+    }
+}
+
 pub(crate) fn validate_pipeline_config(cfg: &PipelineConfig) -> Vec<ConfigValidationError> {
     let mut errors = Vec::new();
     if cfg.sample_rate == 0 {
@@ -480,25 +488,6 @@ fn validate_nvafx_node(
         &["silence", "bypass"],
         errors,
     );
-    match echoless_processors::nvafx::doctor_report() {
-        Ok(report) if report.ok() => {}
-        Ok(report) => {
-            let detail = report
-                .checks
-                .iter()
-                .find(|check| check.status.is_problem())
-                .map(|check| format!("{}: {}", check.name, check.detail))
-                .unwrap_or_else(|| "doctor did not pass".to_string());
-            errors.push(ConfigValidationError::new(
-                format!("{base}.doctor"),
-                format!("nvidia_afx_aec doctor failed: {detail}"),
-            ));
-        }
-        Err(err) => errors.push(ConfigValidationError::new(
-            format!("{base}.doctor"),
-            format!("nvidia_afx_aec doctor failed: {err:#}"),
-        )),
-    }
 }
 
 fn expect_bool(
@@ -943,6 +932,28 @@ mod tests {
         assert!(paths.contains(&"near_delay_ms"));
         assert!(paths.contains(&"output_level"));
         assert!(paths.contains(&"reference_channels"));
-        assert!(paths.contains(&"chain[1].doctor"));
+    }
+
+    #[test]
+    fn nvafx_validation_checks_config_only_without_running_doctor() {
+        // This machine has no NVAFX runtime; a doctor run would add a problem.
+        let mut params = toml::Table::new();
+        params.insert(
+            "model_path".into(),
+            toml::Value::String("custom.trtpkg".into()),
+        );
+        params.insert("disable_cuda_graph".into(), toml::Value::Boolean(true));
+        params.insert("use_default_gpu".into(), toml::Value::Boolean(false));
+        let cfg = PipelineConfig {
+            chain: vec![NodeConfig {
+                kind: "nvidia_afx_aec".into(),
+                params,
+            }],
+            ..PipelineConfig::default()
+        };
+
+        let errors = validate_pipeline_config(&cfg);
+
+        assert!(errors.is_empty(), "{errors:?}");
     }
 }
