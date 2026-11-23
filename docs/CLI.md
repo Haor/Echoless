@@ -94,10 +94,10 @@ speakers while recording both paths, then cross-correlating per beep
 echoless probe-delay --json --mic default --reference system --output "CABLE Input"
 ```
 
-The command accepts `default` selectors, but its clap defaults are intentionally
-macOS-oriented (`MacBook Pro...` / `BlackHole 2ch`) for the maintainer's local
-calibration rig. Portable scripts should pass `--mic`, `--reference`, and
-`--output` explicitly rather than relying on those defaults.
+`--mic` and `--output` default to `default` (the system default devices), and
+`--reference` defaults to `system`. Set `--output` to the virtual device that
+your call app uses as its microphone, so that processed audio does not go to
+the speakers.
 
 Stops nothing by itself — don't run it while another `run` holds the devices.
 Flags: `--beeps N` (12, minimum 2), `--startup-delay S` (4),

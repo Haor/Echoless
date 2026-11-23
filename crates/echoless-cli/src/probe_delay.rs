@@ -2,7 +2,7 @@ use std::env;
 use std::fs::{create_dir_all, remove_dir_all};
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Component, Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{channel, Receiver, RecvTimeoutError};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -24,13 +24,13 @@ use crate::dsp::rms_dbfs;
 #[derive(Args)]
 pub(crate) struct ProbeDelayArgs {
     /// Near-end microphone device selector
-    #[arg(long, default_value = "MacBook Pro麦克风")]
+    #[arg(long, default_value = "default")]
     mic: String,
     /// Reference selector; macOS defaults to system (Process Tap), Windows defaults to system (WASAPI loopback)
     #[arg(long, default_value = "system")]
     reference: String,
     /// Echoless output device; a virtual audio device is recommended to avoid routing processed voice back to speakers
-    #[arg(long, default_value = "BlackHole 2ch")]
+    #[arg(long, default_value = "default")]
     output: String,
     /// Keep this diagnostics session in the managed diagnostics directory after analysis
     #[arg(long)]
@@ -76,27 +76,30 @@ pub(crate) fn cmd_probe_delay(a: ProbeDelayArgs) -> Result<()> {
     })
     .context("failed to install probe-delay cancel handler")?;
 
-    let (result, cleanup_beep_dir, cleanup_session, mut session_retained) =
-        if let Some(session_dir) = &a.analyze_only {
-            (analyze_probe_session(&a, session_dir)?, None, None, true)
-        } else {
-            let (beep_path, temp_dir) = probe_beep_path(&a)?;
-            let beep_duration = write_probe_beep_train(&a, &beep_path)?;
-            probe_log(a.json, format!("beep_duration_s: {beep_duration:.2}"));
-            let session_dir = run_native_delay_probe(&a, &beep_path, beep_duration, &cancel)?;
-            let result = analyze_probe_session(&a, &session_dir)?;
-            let cleanup_session = (!a.keep_session).then_some(session_dir);
-            (result, temp_dir, cleanup_session, a.keep_session)
-        };
+    let (result, session_retained) = if let Some(session_dir) = &a.analyze_only {
+        (analyze_probe_session(&a, session_dir)?, true)
+    } else {
+        let (beep_path, beep_dir) = probe_beep_path(&a)?;
+        let _beep_dir = beep_dir.map(TempDirGuard);
+        let beep_duration = write_probe_beep_train(&a, &beep_path)?;
+        probe_log(a.json, format!("beep_duration_s: {beep_duration:.2}"));
+        let session_dir = run_native_delay_probe(&a, &beep_path, beep_duration, &cancel)?;
+        let result = analyze_probe_session(&a, &session_dir);
+        let retained = a.keep_session || cleanup_generated_probe_session(&session_dir, a.json);
+        (result?, retained)
+    };
 
-    if let Some(dir) = cleanup_beep_dir {
-        let _ = remove_dir_all(dir);
-    }
-    if let Some(session_dir) = cleanup_session {
-        session_retained = cleanup_generated_probe_session(&session_dir, a.json);
-    }
     emit_probe_result(&result, a.json, session_retained)?;
     Ok(())
+}
+
+/// Removes the generated beep directory on every exit path.
+struct TempDirGuard(PathBuf);
+
+impl Drop for TempDirGuard {
+    fn drop(&mut self) {
+        let _ = remove_dir_all(&self.0);
+    }
 }
 
 fn cleanup_generated_probe_session(session_dir: &Path, json_mode: bool) -> bool {
@@ -391,7 +394,26 @@ fn run_native_delay_probe(
     beep_duration_s: f64,
     cancel: &AtomicBool,
 ) -> Result<PathBuf> {
-    let diagnostic_seconds = (a.startup_delay + beep_duration_s + 1.0).ceil().max(1.0) as u32;
+    let mut session_dir = None;
+    let result = drive_native_delay_probe(a, beep_path, beep_duration_s, cancel, &mut session_dir);
+    // The child has been stopped by now; drop a half-recorded session unless asked to keep it.
+    if result.is_err() && !a.keep_session {
+        if let Some(dir) = session_dir.as_deref().filter(|dir| dir.is_dir()) {
+            cleanup_generated_probe_session(dir, a.json);
+        }
+    }
+    result
+}
+
+fn drive_native_delay_probe(
+    a: &ProbeDelayArgs,
+    beep_path: &Path,
+    beep_duration_s: f64,
+    cancel: &AtomicBool,
+    session_dir: &mut Option<PathBuf>,
+) -> Result<PathBuf> {
+    // Extra seconds cover stream startup jitter so the final beep is not truncated.
+    let diagnostic_seconds = (a.startup_delay + beep_duration_s + 3.0).ceil().max(1.0) as u32;
     let current_exe = env::current_exe().context("failed to locate current echoless executable")?;
     let mut command = Command::new(current_exe);
     command
@@ -420,46 +442,37 @@ fn run_native_delay_probe(
         .arg("1000")
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
-        // control reader 无条件启动(审计 B-01):stdin EOF = 优雅停机。probe spawn 的 run
-        // 子进程若继承已关闭的 stdin,会一起来就读到 EOF 自杀退出(exit 0),导致 probe 报
-        // 「run 过早退出」。给它一个常开 piped stdin(父持有、不写不关),让 run 正常跑满
-        // diagnostic 录制时长;结束时 stop_probe_child 用 SIGINT 停它。
+        // `run` stops on stdin EOF, so the child gets a pipe that stays open until
+        // the beep train has been played.
         .stdin(Stdio::piped());
     #[cfg(unix)]
     {
         command.process_group(0);
     }
-    let mut child = command
-        .spawn()
-        .context("failed to spawn echoless run probe child process")?;
+    let mut child = ProbeChild::spawn(&mut command)?;
 
     let stdout = child
+        .child
         .stdout
         .take()
         .context("probe child stdout not captured")?;
-    // 持有 run 的 stdin write end:run 期间保持打开(control reader 阻塞等待、不 EOF,run 正常录);
-    // beep 播完后关闭它 → run 收 stdin EOF 优雅停机(比进程组 SIGINT 可靠,dev/打包都稳)。
-    let mut run_stdin = child.stdin.take();
     let rx = spawn_probe_line_reader(stdout);
     let mut saw_started = false;
-    let mut session_dir: Option<PathBuf> = None;
     let mut saw_done = false;
 
     let ready_deadline = Instant::now() + PROBE_PIPELINE_READY_TIMEOUT;
-    while !probe_pipeline_ready(saw_started, &session_dir) {
+    while !probe_pipeline_ready(saw_started, session_dir) {
         if cancel.load(Ordering::SeqCst) {
-            stop_probe_child(&mut child)?;
             bail!("probe-delay cancelled");
         }
-        drain_probe_output(&rx, &mut saw_started, &mut session_dir, &mut saw_done);
-        if let Some(status) = child.try_wait()? {
+        drain_probe_output(&rx, &mut saw_started, session_dir, &mut saw_done);
+        if let Some(status) = child.child.try_wait()? {
             bail!("echoless run probe exited before the pipeline became ready: {status}");
         }
-        if probe_pipeline_ready(saw_started, &session_dir) {
+        if probe_pipeline_ready(saw_started, session_dir) {
             break;
         }
         if Instant::now() >= ready_deadline {
-            stop_probe_child(&mut child)?;
             bail!(
                 "echoless run probe did not emit started and diagnostics_started within {} seconds",
                 PROBE_PIPELINE_READY_TIMEOUT.as_secs()
@@ -473,11 +486,10 @@ fn run_native_delay_probe(
     let startup_deadline = Instant::now() + Duration::from_secs_f64(a.startup_delay);
     while Instant::now() < startup_deadline {
         if cancel.load(Ordering::SeqCst) {
-            stop_probe_child(&mut child)?;
             bail!("probe-delay cancelled");
         }
-        drain_probe_output(&rx, &mut saw_started, &mut session_dir, &mut saw_done);
-        if let Some(status) = child.try_wait()? {
+        drain_probe_output(&rx, &mut saw_started, session_dir, &mut saw_done);
+        if let Some(status) = child.child.try_wait()? {
             bail!("echoless run probe exited prematurely: {status}");
         }
         thread::sleep(Duration::from_millis(50));
@@ -487,8 +499,7 @@ fn run_native_delay_probe(
         a.json,
         format!("playing beep train: {}", beep_path.display()),
     );
-    // GUI 同步点:蜂鸣列车即将开播。stdout 只留最终 JSON,进度走 stderr JSONL,
-    // 前端据此把 12 点进度灯对齐到真实播放时刻(此前按墙钟猜,音画不同步)。
+    // GUI sync point: stdout carries only the final JSON, progress goes to stderr JSONL.
     if a.json {
         eprintln!(
             "{}",
@@ -502,24 +513,21 @@ fn run_native_delay_probe(
             })
         );
     }
-    play_probe_beep(a, beep_path)?;
+    play_probe_beep(a, beep_path, cancel)?;
 
-    // beep 播完 = run 已录够诊断。关闭 stdin 触发 run 优雅停机(flush diagnostic、输出
-    // 「诊断录制完成」后退出),不再靠 finish loop 空等 deadline + SIGINT —— dev sidecar 下
-    // 进程组 SIGINT 停不干净,run 会常驻 R 态、把 probe 拖到外层超时(前端一直 PROBING)。
-    drop(run_stdin.take());
+    // The beep train is fully recorded: closing stdin lets `run` flush diagnostics and exit.
+    child.close_stdin();
 
     let finish_deadline = Instant::now() + Duration::from_secs(u64::from(diagnostic_seconds) + 2);
     while Instant::now() < finish_deadline {
         if cancel.load(Ordering::SeqCst) {
-            stop_probe_child(&mut child)?;
             bail!("probe-delay cancelled");
         }
-        drain_probe_output(&rx, &mut saw_started, &mut session_dir, &mut saw_done);
+        drain_probe_output(&rx, &mut saw_started, session_dir, &mut saw_done);
         if saw_done {
             break;
         }
-        if let Some(status) = child.try_wait()? {
+        if let Some(status) = child.child.try_wait()? {
             if !status.success() {
                 bail!("echoless run probe failed: {status}");
             }
@@ -528,35 +536,107 @@ fn run_native_delay_probe(
         thread::sleep(Duration::from_millis(50));
     }
 
-    stop_probe_child(&mut child)?;
-    drain_probe_output(&rx, &mut saw_started, &mut session_dir, &mut saw_done);
+    child.stop();
+    drain_probe_output(&rx, &mut saw_started, session_dir, &mut saw_done);
     drain_probe_output_until_closed(
         &rx,
         &mut saw_started,
-        &mut session_dir,
+        session_dir,
         &mut saw_done,
         Duration::from_secs(1),
     );
 
     session_dir
+        .clone()
         .filter(|path| path.is_dir())
         .context("diagnostics_started did not return an accessible session directory")
 }
 
-#[cfg(all(feature = "realtime", target_os = "macos"))]
-fn play_probe_beep(_a: &ProbeDelayArgs, beep_path: &Path) -> Result<()> {
-    let status = Command::new("afplay")
-        .arg(beep_path)
-        .status()
-        .context("failed to play beep WAV (requires macOS afplay)")?;
-    if !status.success() {
-        bail!("failed to play beep WAV: {status}");
+/// Owns the `echoless run` probe child. Dropping it closes stdin and stops the
+/// child, so every error or cancel path releases the audio devices.
+struct ProbeChild {
+    child: Child,
+    stdin: Option<ChildStdin>,
+}
+
+impl ProbeChild {
+    fn spawn(command: &mut Command) -> Result<Self> {
+        let mut child = command
+            .spawn()
+            .context("failed to spawn echoless run probe child process")?;
+        let stdin = child.stdin.take();
+        Ok(Self { child, stdin })
     }
-    Ok(())
+
+    fn close_stdin(&mut self) {
+        drop(self.stdin.take());
+    }
+
+    fn stop(&mut self) {
+        // stdin EOF is the graceful stop request on every platform.
+        self.close_stdin();
+        if !matches!(self.child.try_wait(), Ok(None)) {
+            return;
+        }
+        #[cfg(unix)]
+        let grace = {
+            let _ = Command::new("kill")
+                .arg("-INT")
+                .arg(format!("-{}", self.child.id()))
+                .status();
+            Duration::from_secs(5)
+        };
+        #[cfg(not(unix))]
+        let grace = Duration::from_secs(1);
+
+        let deadline = Instant::now() + grace;
+        while Instant::now() < deadline {
+            if !matches!(self.child.try_wait(), Ok(None)) {
+                return;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        #[cfg(unix)]
+        let _ = Command::new("kill")
+            .arg("-KILL")
+            .arg(format!("-{}", self.child.id()))
+            .status();
+        #[cfg(not(unix))]
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+impl Drop for ProbeChild {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+#[cfg(all(feature = "realtime", target_os = "macos"))]
+fn play_probe_beep(_a: &ProbeDelayArgs, beep_path: &Path, cancel: &AtomicBool) -> Result<()> {
+    let mut player = Command::new("afplay")
+        .arg(beep_path)
+        .spawn()
+        .context("failed to play beep WAV (requires macOS afplay)")?;
+    loop {
+        if let Some(status) = player.try_wait()? {
+            if !status.success() {
+                bail!("failed to play beep WAV: {status}");
+            }
+            return Ok(());
+        }
+        if cancel.load(Ordering::SeqCst) {
+            let _ = player.kill();
+            let _ = player.wait();
+            bail!("probe-delay cancelled");
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
 }
 
 #[cfg(all(feature = "realtime", windows))]
-fn play_probe_beep(a: &ProbeDelayArgs, beep_path: &Path) -> Result<()> {
+fn play_probe_beep(a: &ProbeDelayArgs, beep_path: &Path, _cancel: &AtomicBool) -> Result<()> {
     let selector = reference_playback_output_selector(&a.reference)?;
     let samples = read_probe_beep_samples(beep_path)?;
     crate::realtime::play_mono_samples_to_output(selector, PROBE_SAMPLE_RATE, samples)
@@ -569,7 +649,7 @@ fn play_probe_beep(a: &ProbeDelayArgs, beep_path: &Path) -> Result<()> {
 // 映射失败时回退默认输出(常见场景 monitor 的就是默认 sink)——beep 只要从被
 // 监听的 sink 出声,分析就成立;彻底播错设备时 probe 会以 ref silent 告警收场。
 #[cfg(all(feature = "realtime", target_os = "linux"))]
-fn play_probe_beep(a: &ProbeDelayArgs, beep_path: &Path) -> Result<()> {
+fn play_probe_beep(a: &ProbeDelayArgs, beep_path: &Path, _cancel: &AtomicBool) -> Result<()> {
     let samples = read_probe_beep_samples(beep_path)?;
     if let Some(stem) = monitor_reference_output_stem(&a.reference)? {
         match crate::realtime::play_mono_samples_to_output(
@@ -610,12 +690,12 @@ fn monitor_reference_output_stem(reference: &str) -> Result<Option<String>> {
     feature = "realtime",
     not(any(target_os = "macos", windows, target_os = "linux"))
 ))]
-fn play_probe_beep(_a: &ProbeDelayArgs, _beep_path: &Path) -> Result<()> {
+fn play_probe_beep(_a: &ProbeDelayArgs, _beep_path: &Path, _cancel: &AtomicBool) -> Result<()> {
     bail!("no probe-delay beep playback implementation for the current platform");
 }
 
 #[cfg(not(feature = "realtime"))]
-fn play_probe_beep(_a: &ProbeDelayArgs, _beep_path: &Path) -> Result<()> {
+fn play_probe_beep(_a: &ProbeDelayArgs, _beep_path: &Path, _cancel: &AtomicBool) -> Result<()> {
     bail!("probe-delay beep playback requires the realtime feature (cpal)");
 }
 
@@ -670,9 +750,7 @@ where
 {
     let (sender, receiver) = channel();
     thread::spawn(move || {
-        // 显式处理读取错误(ROB-4):不要用 lines().flatten()/map_while(Result::ok)
-        // 静默吞掉 IO 错误/非 UTF-8 行——出错时打印一条 stderr 警告再停止读取,
-        // 以免 probe 子进程输出异常时无声丢失。
+        // Report read errors instead of silently dropping child output.
         for line in BufReader::new(reader).lines() {
             match line {
                 Ok(line) => {
@@ -742,46 +820,6 @@ fn handle_probe_output_line(
 
 fn probe_pipeline_ready(saw_started: bool, session_dir: &Option<PathBuf>) -> bool {
     saw_started && session_dir.is_some()
-}
-
-fn stop_probe_child(child: &mut std::process::Child) -> Result<()> {
-    if child.try_wait()?.is_some() {
-        return Ok(());
-    }
-    let _ = Command::new("kill")
-        .arg("-INT")
-        .arg(probe_child_signal_target(child))
-        .status();
-
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while Instant::now() < deadline {
-        if child.try_wait()?.is_some() {
-            return Ok(());
-        }
-        thread::sleep(Duration::from_millis(50));
-    }
-    #[cfg(unix)]
-    {
-        let _ = Command::new("kill")
-            .arg("-KILL")
-            .arg(probe_child_signal_target(child))
-            .status();
-    }
-    #[cfg(not(unix))]
-    child.kill().context("failed to stop probe child process")?;
-    let _ = child.wait();
-    Ok(())
-}
-
-fn probe_child_signal_target(child: &std::process::Child) -> String {
-    #[cfg(unix)]
-    {
-        format!("-{}", child.id())
-    }
-    #[cfg(not(unix))]
-    {
-        child.id().to_string()
-    }
 }
 
 fn analyze_probe_session(a: &ProbeDelayArgs, session_dir: &Path) -> Result<ProbeResult> {
@@ -1220,7 +1258,8 @@ fn estimate_probe_lag(reference: &[f64], mic: &[f64], step_ms: f64, max_lag_ms: 
             &reference[ref_start..ref_start + len],
             &mic[mic_start..mic_start + len],
         );
-        if corr.abs() > best_corr.abs() {
+        // Both envelopes are non-negative, so a real echo is a positive peak.
+        if corr > best_corr {
             best_corr = corr;
             best_lag = lag;
         }
@@ -1236,9 +1275,22 @@ fn find_ref_events(reference: &[f64], step_ms: f64, expected: usize) -> Vec<usiz
     sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let median = sorted[sorted.len() / 2];
     let peak = reference.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-    let threshold = median + (peak - median) * 0.35;
     let min_gap = (180.0 / step_ms).round().max(1.0) as usize;
-    let mut events = Vec::new();
+    // A single loud transient (e.g. a system alert) must not set the beep threshold:
+    // take the level reached by at least `expected` candidate events instead of the peak.
+    let mut candidate_peaks = threshold_events(reference, median + (peak - median) * 0.1, min_gap)
+        .into_iter()
+        .map(|index| reference[index])
+        .collect::<Vec<_>>();
+    candidate_peaks.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+    let event_level = candidate_peaks.get(expected - 1).copied().unwrap_or(peak);
+    threshold_events(reference, median + (event_level - median) * 0.35, min_gap)
+}
+
+/// Peak index of each above-threshold run, merging runs closer than `min_gap`.
+/// Scans the whole envelope so early transients cannot use up the event budget.
+fn threshold_events(reference: &[f64], threshold: f64, min_gap: usize) -> Vec<usize> {
+    let mut events: Vec<usize> = Vec::new();
     let mut i = 0usize;
     while i < reference.len() {
         if reference[i] < threshold {
@@ -1259,11 +1311,8 @@ fn find_ref_events(reference: &[f64], step_ms: f64, expected: usize) -> Vec<usiz
             .is_none_or(|last| best_i.saturating_sub(*last) >= min_gap)
         {
             events.push(best_i);
-        } else if reference[best_i] > reference[*events.last().unwrap()] {
-            *events.last_mut().unwrap() = best_i;
-        }
-        if events.len() >= expected {
-            break;
+        } else if let Some(last) = events.last_mut().filter(|last| best_v > reference[**last]) {
+            *last = best_i;
         }
     }
     events
@@ -1301,7 +1350,7 @@ fn per_event_lags(
                 }
                 let corr =
                     normalized_correlation(template, &mic[mic_start as usize..mic_end as usize]);
-                if corr.abs() > best_corr.abs() {
+                if corr > best_corr {
                     best_corr = corr;
                     best_lag = lag;
                 }
@@ -1752,6 +1801,53 @@ mod tests {
     }
 
     #[test]
+    fn stronger_negative_correlation_does_not_replace_the_positive_echo_peak() {
+        let len = 800usize;
+        let source = deterministic_noise(len + 20)
+            .into_iter()
+            .map(|value| (value - 0.03) * 50.0)
+            .collect::<Vec<_>>();
+        let reference = source[10..10 + len].to_vec();
+        // Weak echo 3 steps late plus a strong inverted copy 2 steps early.
+        let mic = (0..len)
+            .map(|i| 0.4 * source[10 + i - 3] - source[10 + i + 2])
+            .collect::<Vec<_>>();
+        let step_ms = 1.0;
+
+        let (lag_ms, corr) = estimate_probe_lag(&reference, &mic, step_ms, 10.0);
+        assert_eq!(lag_ms, 3.0);
+        assert!(corr > 0.0, "global corr {corr}");
+
+        let lags = per_event_lags(&reference, &mic, &[len / 2], step_ms, 10.0);
+        assert_eq!(lags[0].1, 3.0);
+        assert!(lags[0].2 > 0.0, "event corr {}", lags[0].2);
+    }
+
+    #[test]
+    fn ref_event_search_survives_a_loud_startup_transient() {
+        let step_ms = 1.0;
+        let mut reference = vec![0.001; 12_000];
+        // A 0 dBFS system alert well before the beep train.
+        reference[500..800].fill(1.0);
+        let beeps = (0..12).map(|i| 2_000 + i * 720).collect::<Vec<_>>();
+        for start in &beeps {
+            reference[*start..*start + 70].fill(0.12);
+        }
+
+        let events = find_ref_events(&reference, step_ms, beeps.len());
+
+        let beep_hits = beeps
+            .iter()
+            .filter(|start| {
+                events
+                    .iter()
+                    .any(|event| (**start..**start + 70).contains(event))
+            })
+            .count();
+        assert_eq!(beep_hits, beeps.len(), "events: {events:?}");
+    }
+
+    #[test]
     fn native_probe_event_search_reaches_the_configured_boundary() {
         let mut reference = vec![0.0; 3_000];
         let mut mic = vec![0.0; 3_000];
@@ -1823,7 +1919,6 @@ mod tests {
         let analysis = analyze_probe_envelopes(&reference, &mic, SYNTHETIC_BEEPS, -6.0, -6.0);
 
         assert_ne!(analysis.quality, ProbeQuality::Valid);
-        assert!(analysis.per_beep_lags.iter().all(|lag| lag.corr <= 0.0));
         assert_eq!(analysis.recommended_near_delay_ms, None);
     }
 

@@ -90,10 +90,9 @@ echoless run --processor aec3 --no-ns
 echoless probe-delay --json --mic default --reference system --output "CABLE Input"
 ```
 
-该命令接受 `default` 选择符,但其 clap 默认值是刻意面向 macOS 的
-(`MacBook Pro...` / `BlackHole 2ch`),用于维护者本地的校准装置。
-可移植脚本应显式传入 `--mic`、`--reference` 和 `--output`,而不要依赖
-这些默认值。
+`--mic` 与 `--output` 默认为 `default`(系统默认设备),`--reference` 默认为
+`system`。请把 `--output` 设为通话软件用作麦克风的虚拟设备,避免处理后的声音
+送到扬声器。
 
 它本身不会停止任何东西——不要在另一个 `run` 正占用设备时运行它。
 Flag:`--beeps N`(默认 12,最少 2)、`--startup-delay S`(4)、`--volume 0..1`(0.35)、
