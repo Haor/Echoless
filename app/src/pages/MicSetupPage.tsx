@@ -1,8 +1,9 @@
 import { useState } from "react";
-import type { DoctorAudio, DoctorCandidate, Platform } from "../types";
+import type { DeviceList, DoctorAudio, Platform } from "../types";
 import { openUrl } from "../api";
 import { useI18n } from "../i18n";
 import { MIC_DEV_STATES, type MicState } from "../mic";
+import { resolveVirtualRoute } from "../virtualRoute";
 
 // 虚拟麦克风路由诊断/向导。后端 doctor audio 缺增强字段时,从现有字段派生。
 // 路由模型:Echoless 输出 → 虚拟设备 input 端(如 CABLE Input);
@@ -23,6 +24,8 @@ const LINUX_MONITOR_MIC = "Monitor of Echoless-Output";
 
 interface Props {
   doctor: DoctorAudio | null;
+  devices: DeviceList | null;
+  selectedOutput: string;
   platform: Platform;
   dev: boolean;
   devState: MicState;
@@ -30,22 +33,10 @@ interface Props {
   onRecheck: () => void;
 }
 
-// 别名容错(D4):候选已由后端按厂牌关键词过滤(vb-audio/cable/blackhole…),
-// 这里只负责分端 —— CABLE-A/B、Hi-Fi Cable 等变体都带 Input/Output 字样,
-// 不再认死「CABLE Input」全名。
-function pickOutput(d: DoctorAudio): DoctorCandidate | null {
-  if (d.recommended_output) return d.recommended_output;
-  const outs = d.candidate_outputs ?? [];
-  return outs.find((o) => /input/i.test(o.name)) ?? outs[0] ?? null;
-}
-function pickAppMic(d: DoctorAudio): DoctorCandidate | null {
-  if (d.recommended_app_mic) return d.recommended_app_mic;
-  const ins = d.candidate_inputs ?? [];
-  return ins.find((i) => /output|blackhole/i.test(i.name)) ?? ins[0] ?? null;
-}
-
 export function MicSetupPage({
   doctor,
+  devices,
+  selectedOutput,
   platform,
   dev,
   devState,
@@ -66,47 +57,54 @@ export function MicSetupPage({
   }
 
   const driver = doctor?.recommended_driver ?? "vb-cable";
-  const outDev = doctor ? pickOutput(doctor) : null;
-  const micDev = doctor ? pickAppMic(doctor) : null;
+  const route = resolveVirtualRoute({
+    selectedOutput,
+    devices,
+    doctor,
+    platform,
+  });
+  const outDev = route.output;
+  const micDev = route.appMic;
+  const routeReady = route.ready;
 
-  const routeReady =
-    platform === "linux"
-      ? Boolean(doctor?.virtual_output_detected)
-      : (doctor?.virtual_route_ready ??
-        ((doctor?.candidate_outputs.length ?? 0) > 0 &&
-          (doctor?.candidate_inputs.length ?? 0) > 0));
   const installed = doctor
     ? platform === "linux"
-      ? doctor.virtual_output_detected
+      ? doctor.virtual_output_detected || route.output != null
       : doctor.install_status !== "missing" ||
-        (doctor.candidate_outputs.length + doctor.candidate_inputs.length > 0)
-    : false;
+        doctor.candidate_outputs.length + doctor.candidate_inputs.length > 0 ||
+        route.output != null
+    : route.output != null;
   const isMac = platform === "macos";
   const isLinux = platform === "linux";
   const permDenied = isMac && doctor?.permission_state === "denied";
   const permUndet = isMac && doctor?.permission_state === "undetermined";
-  const micName = isLinux ? (micDev?.name ?? LINUX_MONITOR_MIC) : (micDev?.name ?? "—");
+  const micName =
+    micDev?.name ?? (isLinux && !route.counterpartMissing ? LINUX_MONITOR_MIC : "—");
   const devStates = isLinux
     ? MIC_DEV_STATES.filter((s) => s === "missing" || s === "ready")
     : MIC_DEV_STATES;
 
-  // 显式状态机(D4):检测 → 引导下载(missing)→ 装后未生效提示重启(reboot)
+  // 状态机:检测 → 引导下载(missing)→ 装后未生效提示重启(reboot)
   // → 路由不完整(incomplete)→ 权限(mac)→ 完成。
   const state: MicState = !doctor
     ? "unknown"
     : isLinux
       ? routeReady
         ? "ready"
-        : "missing"
+        : route.counterpartMissing
+          ? "incomplete"
+          : "missing"
       : routeReady
         ? permDenied
           ? "permission"
           : "ready"
-        : doctor.needs_reboot
-          ? "reboot"
-          : !installed
-            ? "missing"
-            : "incomplete";
+        : route.counterpartMissing && route.selectedIsVirtual
+          ? "incomplete"
+          : doctor.needs_reboot
+            ? "reboot"
+            : !installed
+              ? "missing"
+              : "incomplete";
 
   // 阶梯节点状态
   const node = (key: "driver" | "route" | "perm" | "ready"): string => {
@@ -178,11 +176,13 @@ export function MicSetupPage({
         <div className="wzcard">
           <div className="wzh warn">{t("micIncomplete")}</div>
           <div className="wznote">
-            {isMac
-              ? t("micMacRestartHint")
-              : doctor?.needs_reboot
-                ? t("micReboot")
-                : t("micIncompleteHint")}
+            {route.selectedIsVirtual && route.counterpartMissing && outDev
+              ? `${outDev.name}: ${t("micCounterpartMissing")}`
+              : isMac
+                ? t("micMacRestartHint")
+                : doctor?.needs_reboot
+                  ? t("micReboot")
+                  : t("micIncompleteHint")}
           </div>
           {isMac && (
             <div className="wzcmd">

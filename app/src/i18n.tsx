@@ -201,6 +201,10 @@ const D: Record<string, { en: string; zh: string }> = {
     en: "Only one side detected. Reopen the driver installer or finish setup.",
     zh: "只检测到一端。重开驱动安装器或完成安装。",
   },
+  micCounterpartMissing: {
+    en: "paired mic input is missing or disabled",
+    zh: "配对的虚拟麦输入端缺失或已禁用",
+  },
   micMacRestartHint: {
     en: "Only one side detected. Restart CoreAudio, then recheck:",
     zh: "只检测到一端。重启 CoreAudio 后重检:",

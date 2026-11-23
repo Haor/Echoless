@@ -1,10 +1,11 @@
 import type { Health } from "../runtimeTelemetry";
-import type { DoctorAudio, Platform } from "../types";
+import type { DeviceList, DoctorAudio, Platform } from "../types";
 import { openDiagnosticsDir, openPath, openUrl } from "../api";
 import { useI18n } from "../i18n";
 import { Field } from "../components/Controls";
 import { Hint } from "../components/Hint";
 import { Toggle } from "../components/Toggle";
+import { resolveVirtualRoute } from "../virtualRoute";
 
 // macOS 隐私设置深链。麦克风有专属锚点;系统录音(14.4+ Audio Capture)无稳定
 // 专属锚点,回退到隐私根面板。
@@ -20,6 +21,8 @@ export interface DiagnosticsPageProps {
   running: boolean;
   health: Health;
   doctor: DoctorAudio | null;
+  devices: DeviceList | null;
+  selectedOutput: string;
   platform: Platform;
   onMicSetup: () => void;
   onRequestSystemAudio: () => void;
@@ -35,6 +38,8 @@ export function DiagnosticsPage({
   running,
   health,
   doctor,
+  devices,
+  selectedOutput,
   platform,
   onMicSetup,
   onRequestSystemAudio,
@@ -46,16 +51,15 @@ export function DiagnosticsPage({
   const active = rec && running;
   const isMac = platform === "macos";
 
-  // 虚拟麦路由摘要(诊断行):就绪? 通话软件该选哪个 mic?
-  const routeReady =
-    doctor?.virtual_route_ready ??
-    ((doctor?.candidate_outputs.length ?? 0) > 0 &&
-      (doctor?.candidate_inputs.length ?? 0) > 0);
-  const appMic =
-    doctor?.recommended_app_mic ??
-    doctor?.candidate_inputs.find((i) => /cable output|blackhole/i.test(i.name)) ??
-    doctor?.candidate_inputs[0] ??
-    null;
+  // 虚拟麦路由摘要(诊断行):基于当前选中 OUTPUT 与设备列表做确定性配对。
+  const route = resolveVirtualRoute({
+    selectedOutput,
+    devices,
+    doctor,
+    platform,
+  });
+  const routeReady = route.ready;
+  const appMic = route.appMic;
 
   // macOS 权限态(麦克风 + 系统录音)。缺字段 → unknown;非 mac 不渲染此区块。
   type PermState = "granted" | "denied" | "undetermined" | "unknown";
@@ -114,7 +118,11 @@ export function DiagnosticsPage({
         <span className="dk">ROUTE</span>
         <span className={`dpath ${routeReady ? "live" : ""}`}>
           {routeReady ? t("micReadyShort") : t("micSetupShort")}
-          {appMic ? ` · ${t("micPickShort")}: ${appMic.name}` : ""}
+          {appMic
+            ? ` · ${t("micPickShort")}: ${appMic.name}`
+            : route.counterpartMissing && route.output
+              ? ` · ${route.output.name} (${t("micCounterpartMissing")})`
+              : ""}
         </span>
         <button type="button" className="dopen" onClick={onMicSetup}>
           {t("setupBtn")} <span className="mk">&raquo;</span>

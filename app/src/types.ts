@@ -51,6 +51,7 @@ export interface ParamSpec {
   default?: unknown;
   values?: string[];
   min?: number;
+  max?: number;
   required?: boolean;
   advanced?: boolean;
   requires?: Record<string, unknown>;
@@ -321,6 +322,7 @@ export interface DoctorAudio {
   recommended_driver: string; // "vb-cable" | "blackhole-2ch" | "vb-cable-mac" ...
   install_status: "installed" | "missing" | "unknown";
   needs_reboot: boolean;
+  virtual_driver_present?: boolean;
   // 非 macOS 当前返回 "unknown";macOS 返回 granted/denied/undetermined。
   permission_state: "granted" | "denied" | "undetermined" | "unknown";
   // 系统音频录制权限(mac Process Tap reference 用)。helper 可发现=undetermined;
@@ -335,12 +337,6 @@ export interface DoctorAudio {
   } | null;
   hint?: string;
   reference_sources: ReferenceSource[];
-
-  // ↓ 后端建议补的字段(见 RTX/虚拟麦 handoff)。前端向后兼容:缺省时从上面字段派生。
-  virtual_route_ready?: boolean; // 同时检测到可输出虚拟设备 + 对应可作 mic 的输入端
-  route_status?: "ready" | "incomplete" | "missing" | string;
-  recommended_output?: DoctorCandidate | null; // Echoless 应输出到的设备(如 CABLE Input)
-  recommended_app_mic?: DoctorCandidate | null; // 通话软件里应选的麦(如 CABLE Output)
 }
 
 // ---- nvafx doctor --json(RTX AEC 引擎就绪探针) ----

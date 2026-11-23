@@ -45,7 +45,6 @@ import {
   type PipelineCfg,
 } from "./api";
 import type {
-  AudioDevice,
   DeviceList,
   DoctorAudio,
   NvafxDoctor,
@@ -146,6 +145,18 @@ import {
   settleAutostart,
   type AutostartPreference,
 } from "./autostartPreference";
+import {
+  initialActiveSelection,
+  readPreferredDeviceSelection,
+  resolveDeviceSelection,
+  selectUserInput,
+  selectUserOutput,
+  selectUserReference,
+  writePreferredDeviceSelection,
+  type ActiveDeviceSelection,
+  type PreferredDeviceSelection,
+} from "./deviceSelection";
+import { isSelfLoopReference, resolveVirtualRoute } from "./virtualRoute";
 
 const appWindow = getCurrentWindow();
 const ensureStartupRuntimeCleanup = createStartupCleanup(stopRun);
@@ -158,11 +169,6 @@ function revealMainWindow(): void {
     .catch(() => {});
 }
 
-const DEVICE_SELECTION_KEY = "echoless.deviceSelection.v1";
-
-// Windows 托盘偏好(P5 契约):持久化在前端,启动/变更时推给 Rust。
-// UI 只留「关闭到托盘」一个开关(用户定案 2026-07-05:符合一般使用习惯);
-// 最小化到托盘退役,Rust 端恒收 false(旧存档里的 minimizeToTray 忽略)。
 const TRAY_PREFS_KEY = "echoless.trayPrefs.v1";
 export type TrayPrefsState = { closeToTray: boolean };
 function readTrayPrefs(): TrayPrefsState {
@@ -173,71 +179,6 @@ function readTrayPrefs(): TrayPrefsState {
   } catch {
     return { closeToTray: false };
   }
-}
-
-// 设备选择值统一用 stable_id(跨重启稳定;mic/output 配置直接吃它)。
-// 选默认输出:优先虚拟声卡(VB-CABLE / BlackHole),否则系统默认。
-function pickDefaultOutput(outs: AudioDevice[]): string {
-  const virt = outs.find((d) => /cable|blackhole|vb-?audio|echoless|null/i.test(d.name));
-  if (virt) return virt.stable_id;
-  return (
-    outs.find((d) => d.is_default)?.stable_id ?? outs[0]?.stable_id ?? "default"
-  );
-}
-function pickDefaultInput(ins: AudioDevice[]): string {
-  return ins.find((d) => d.is_default)?.stable_id ?? ins[0]?.stable_id ?? "default";
-}
-
-type SavedDeviceSelection = {
-  input?: string;
-  output?: string;
-  reference?: string;
-};
-
-function readSavedDeviceSelection(): SavedDeviceSelection {
-  try {
-    const raw = localStorage.getItem(DEVICE_SELECTION_KEY);
-    if (!raw) return {};
-    const parsed = JSON.parse(raw);
-    if (!parsed || typeof parsed !== "object") return {};
-    return {
-      input: typeof parsed.input === "string" ? parsed.input : undefined,
-      output: typeof parsed.output === "string" ? parsed.output : undefined,
-      reference: typeof parsed.reference === "string" ? parsed.reference : undefined,
-    };
-  } catch {
-    return {};
-  }
-}
-
-function saveDeviceSelection(selection: SavedDeviceSelection) {
-  try {
-    localStorage.setItem(DEVICE_SELECTION_KEY, JSON.stringify(selection));
-  } catch {
-    // Best-effort preference cache; failing to persist must not block audio.
-  }
-}
-
-function deviceSelectionStillExists(devices: AudioDevice[], value: string): boolean {
-  if (value === "default" || value === "") return false;
-  return devices.some((d) => d.stable_id === value || d.selector === value);
-}
-
-function referenceSelectionStillExists(devices: DeviceList, value: string): boolean {
-  return devices.reference_sources.some(
-    (r) => r.available && (r.selector ?? r.id) === value,
-  );
-}
-
-function pickReference(devices: DeviceList, current: string): string {
-  if (referenceSelectionStillExists(devices, current)) return current;
-  const sys = devices.reference_sources.find((r) => r.id === "system");
-  if (sys?.available) return "system";
-  const monitor = devices.reference_sources.find(
-    (r) => r.available && r.kind === "input" && /monitor/i.test(r.label),
-  );
-  if (monitor) return monitor.selector ?? monitor.id;
-  return "none";
 }
 
 function parseDevPlatform(value: string | null): Platform | null {
@@ -337,12 +278,6 @@ type AppState = {
   bypassPending: boolean | null;
   diagSeconds: number | null;
   diagDir: string;
-};
-
-type SelectionState = {
-  selInput: string;
-  selOutput: string;
-  reference: string;
 };
 
 type EngineState = {
@@ -485,17 +420,6 @@ function initEngineState(): EngineState {
   };
 }
 
-function initSelection(): SelectionState {
-  const saved = readSavedDeviceSelection();
-  return {
-    selInput: saved.input ?? "default",
-    selOutput: saved.output ?? "default",
-    reference: saved.reference ?? "system",
-  };
-}
-
-// 浏览器预览直达(设计稿 hash 直链的 app 版):?view=advanced&dev=1&os=linux。
-// Tauri 里没有 query,恒回落初始值。
 function initAppState(): AppState {
   try {
     const q = new URLSearchParams(window.location.search);
@@ -520,6 +444,7 @@ function initAppState(): AppState {
 }
 
 type DeviceEnumerationDeps = {
+  platformRef: MutableRefObject<Platform>;
   doctorRef: MutableRefObject<DoctorAudio | null>;
   powerOnRef: MutableRefObject<boolean>;
   telRef: MutableRefObject<Telemetry>;
@@ -529,6 +454,7 @@ type DeviceEnumerationDeps = {
 };
 
 function useDeviceEnumeration({
+  platformRef,
   doctorRef,
   powerOnRef,
   telRef,
@@ -536,37 +462,100 @@ function useDeviceEnumeration({
   updateApp,
   noteError,
 }: DeviceEnumerationDeps) {
+  const preferredRef = useRef<PreferredDeviceSelection | null>(null);
+  if (preferredRef.current === null) {
+    preferredRef.current = readPreferredDeviceSelection();
+  }
   const [selection, updateSelection] = useReducer(
-    patchReducer<SelectionState>,
+    patchReducer<ActiveDeviceSelection>,
     undefined,
-    initSelection,
+    () => initialActiveSelection(preferredRef.current!),
   );
   const selectionRef = useRef(selection);
   selectionRef.current = selection;
+  const devicesRef = useRef<DeviceList>(EMPTY_DEVICES);
+
+  const chooseInput = useCallback(
+    (v: string) => {
+      if (v === selectionRef.current.selInput) return;
+      const nextPreferred = selectUserInput(
+        preferredRef.current!,
+        devicesRef.current,
+        v,
+      );
+      preferredRef.current = nextPreferred;
+      writePreferredDeviceSelection(nextPreferred);
+      const next = { ...selectionRef.current, selInput: v };
+      selectionRef.current = next;
+      updateSelection(next);
+      applyChangeRef.current({ mic: v });
+    },
+    [applyChangeRef],
+  );
+
+  const chooseOutput = useCallback(
+    (v: string) => {
+      if (v === selectionRef.current.selOutput) return;
+      const res = selectUserOutput(
+        preferredRef.current!,
+        selectionRef.current,
+        devicesRef.current,
+        v,
+      );
+      preferredRef.current = res.preferred;
+      writePreferredDeviceSelection(res.preferred);
+      selectionRef.current = res.active;
+      updateSelection(res.active);
+      applyChangeRef.current(
+        res.referenceReset
+          ? { output: v, reference: res.active.reference }
+          : { output: v },
+      );
+    },
+    [applyChangeRef],
+  );
+
+  const chooseReference = useCallback(
+    (v: string) => {
+      if (v === selectionRef.current.reference) return;
+      const nextPreferred = selectUserReference(
+        preferredRef.current!,
+        devicesRef.current,
+        v,
+      );
+      preferredRef.current = nextPreferred;
+      writePreferredDeviceSelection(nextPreferred);
+      const next = { ...selectionRef.current, reference: v };
+      selectionRef.current = next;
+      updateSelection(next);
+      applyChangeRef.current({ reference: v });
+    },
+    [applyChangeRef],
+  );
 
   // 返回 promise 供就绪门等待首次枚举完成(后续热插拔刷新忽略返回值即可)。
   const refreshDevices = useCallback(() => {
     return listDevices()
       .then((d) => {
+        devicesRef.current = d;
         updateApp({ devices: d });
         const cur = selectionRef.current;
-        const next: SelectionState = {
-          selInput: deviceSelectionStillExists(d.inputs, cur.selInput)
-            ? cur.selInput
-            : pickDefaultInput(d.inputs),
-          selOutput: deviceSelectionStillExists(d.outputs, cur.selOutput)
-            ? cur.selOutput
-            : pickDefaultOutput(d.outputs),
-          // 默认 reference:system 可用就用 system,否则退到 none;用户改过则保留。
-          reference: pickReference(d, cur.reference),
-        };
+        const resolved = resolveDeviceSelection({
+          devices: d,
+          preferred: preferredRef.current!,
+          currentActive: cur,
+          platform: platformRef.current,
+        });
+        if (resolved.preferredChanged) {
+          preferredRef.current = resolved.preferred;
+          writePreferredDeviceSelection(resolved.preferred);
+        }
+        const next = resolved.active;
         // 立即同步 ref:一次插拔常连发多个 devicechange,防止后续 refresh
         // 用陈旧选择重复判定、重复重启。
         selectionRef.current = next;
         updateSelection(next);
-        // 运行中设备被拔,选择被迫回退 → 把新设备真正应用到管线(重启 run)。
-        // 只改选中值不重启的话,sidecar 仍抱着已死的输入流:波形冻结、
-        // 采样率徽标停留在旧设备,直到用户手动重选。
+        // 运行中设备被拔或偏好设备重新上线 → 把新设备应用到管线(重启 run)。
         const override: Override = {};
         if (next.selInput !== cur.selInput) override.mic = next.selInput;
         if (next.selOutput !== cur.selOutput) override.output = next.selOutput;
@@ -574,18 +563,14 @@ function useDeviceEnumeration({
           override.reference = next.reference;
         if (Object.keys(override).length > 0) applyChangeRef.current(override);
 
-        // 系统音频权限是外部可变状态(用户随时可在系统设置里改;dev 下 TCC 把授权
-        // 记在 responsible process 头上,终端/Cursor 更新即被重置)——doctor 只在
-        // mount 查一次会让「授予权限」按钮在授予后仍挂着。未授予期间搭设备刷新的
-        // 车重查;已授予则零开销。
+        // 未授予系统音频权限期间搭设备刷新的车重查;已授予则零开销。
         const perm = doctorRef.current?.system_audio_permission;
         if (perm === "denied" || perm === "undetermined") {
           doctorAudio()
             .then((doc) => {
               updateApp({ doctor: doc });
-              // 授权前创建的 Process Tap 永远输出静音(CoreAudio 不给旧 tap 补活),
-              // 而 P8 电源开关只是 bypass 不重建管线 —— 刚授予 + 正在跑 + 参考静音
-              // 就自动重启一次管线,让 tap 带着新权限重建。
+              // 授权前创建的 Process Tap 永远输出静音:刚授予 + 正在跑 + 参考静音
+              // 时自动重启一次管线,让 tap 带着新权限重建。
               if (
                 doc.system_audio_permission === "granted" &&
                 powerOnRef.current &&
@@ -599,17 +584,24 @@ function useDeviceEnumeration({
         }
       })
       .catch((e) => noteError(String(e)));
-  }, [applyChangeRef, doctorRef, noteError, powerOnRef, telRef, updateApp]);
+  }, [
+    applyChangeRef,
+    doctorRef,
+    noteError,
+    platformRef,
+    powerOnRef,
+    telRef,
+    updateApp,
+  ]);
 
-  useEffect(() => {
-    saveDeviceSelection({
-      input: selection.selInput,
-      output: selection.selOutput,
-      reference: selection.reference,
-    });
-  }, [selection.selInput, selection.selOutput, selection.reference]);
-
-  return { selection, updateSelection, refreshDevices };
+  return {
+    selection,
+    selectionRef,
+    chooseInput,
+    chooseOutput,
+    chooseReference,
+    refreshDevices,
+  };
 }
 
 type EngineConfigDeps = {
@@ -1522,7 +1514,6 @@ function useRunLifecycle({
     if (powerOnRef.current && recRef.current) startDiag();
   }, [startDiag, updateApp]);
   return {
-    applyChange,
     start,
     runtimeCleanupReady,
     setRunForProbe,
@@ -1637,13 +1628,22 @@ function AppShell() {
   const stopForEngineSetupRef = useRef<() => void>(() => {});
   const doctorRef = useRef(doctor);
   doctorRef.current = doctor;
+  const platformRef = useRef(platform);
+  platformRef.current = platform;
   const { t } = useI18n();
 
   const noteError = useCallback((err: string | null) => {
     updateApp({ err });
   }, []);
 
-  const { selection, updateSelection, refreshDevices } = useDeviceEnumeration({
+  const {
+    selection,
+    chooseInput,
+    chooseOutput,
+    chooseReference,
+    refreshDevices,
+  } = useDeviceEnumeration({
+    platformRef,
     doctorRef,
     powerOnRef,
     telRef,
@@ -1708,7 +1708,6 @@ function AppShell() {
   const { kind, noiseMode, noiseParamsByMode, pipeline, params } = engineState;
 
   const {
-    applyChange,
     start,
     runtimeCleanupReady,
     setRunForProbe,
@@ -1790,7 +1789,10 @@ function AppShell() {
   // 平台 + 设备/处理器枚举 + 设备热插拔
   useEffect(() => {
     const platformReady = getPlatform()
-      .then((platform) => updateApp({ platform }))
+      .then((platform) => {
+        platformRef.current = platform;
+        updateApp({ platform });
+      })
       .catch(() => {});
     const devicesReady = refreshDevices();
     const processorsReady = listProcessors()
@@ -2115,20 +2117,10 @@ function AppShell() {
   //   (BlackHole / VB-CABLE)。隐藏物理麦克风等(选它们当参考无意义)。
   const VIRTUAL_REF =
     /blackhole|vb-?cable|vb-?audio|cable|loopback|stereo\s*mix|soundflower|monitor|echoless|null/i;
-  // A2:排除自环 —— Echoless 自己的输出设备(及其同名输入侧,如 BlackHole 的 in 口)
-  // 作参考会把处理后的输出再喂回来,形成回授;从候选里剔掉。
-  const selOutDevName = devices?.outputs.find(
-    (d) => d.stable_id === selOutput,
-  )?.name;
-  const isSelfLoop = (r: (typeof refSources)[number]) =>
-    (r.kind === "output" || r.kind === "input") &&
-    ((r.selector ?? r.id) === selOutput ||
-      r.stable_id === selOutput ||
-      (selOutDevName != null && r.label === selOutDevName));
   const availRefs = refSources.filter(
     (r) =>
       r.available &&
-      !isSelfLoop(r) &&
+      !isSelfLoopReference(r, selOutput, devices) &&
       (r.kind === "system" ||
         r.kind === "none" ||
         r.kind === "output" ||
@@ -2175,13 +2167,21 @@ function AppShell() {
         : noiseMode === "rnnoise"
           ? t("noiseRnnoiseHint")
           : t("noiseOffHint");
-  // 通话 app 里要选的"麦克风"名:由所选输出设备名推导(CABLE Input→CABLE Output;其余同名)。
+  const doctorView = dev ? simMicDoctor(devMicState, platformView) : doctor;
+  const liveDevicesForRoute = dev ? null : devices;
+  const outputRoute = resolveVirtualRoute({
+    selectedOutput: selOutput,
+    devices: liveDevicesForRoute,
+    doctor: doctorView,
+    platform: platformView,
+  });
   const outDev = devices?.outputs.find((d) => d.stable_id === selOutput);
-  const cableName = outDev
-    ? /cable input/i.test(outDev.name)
-      ? outDev.name.replace(/input/i, "Output")
-      : outDev.name
-    : "CABLE Output";
+  const cableName =
+    outputRoute.selectedIsVirtual && outputRoute.appMic
+      ? outputRoute.appMic.name
+      : outDev
+        ? outDev.name
+        : (outputRoute.appMic?.name ?? "CABLE Output");
   // footer 规格徽章随 pipeline 实时变。
   const stamp = `${pipeline.reference_channels.toUpperCase()} · ${
     pipeline.sample_rate / 1000
@@ -2203,8 +2203,6 @@ function AppShell() {
   const activeReady = engineReady(kind);
   // dev:用模拟 doctor 驱动 Engine 卡片 + RTX 向导,让 mac 也能逐屏走流程。
   const nvafxView = dev ? simNvafxDoctor(devRtxState) : nvafx;
-  // dev:同样用模拟 doctor 驱动诊断行 + 虚拟麦向导,逐屏走 missing→ready(随模拟平台切换)。
-  const doctorView = dev ? simMicDoctor(devMicState, platformView) : doctor;
 
   // 系统音频录制权限引导:仅 mac + 用 system(Process Tap)reference 时相关。
   // denied → 可点去隐私设置;undetermined → 提示首次运行会请求(OS 届时弹窗)。
@@ -2401,10 +2399,7 @@ function AppShell() {
                   value: d.stable_id,
                   label: d.name,
                 }))}
-                onChange={(v) => {
-                  updateSelection({ selInput: v });
-                  applyChange({ mic: v });
-                }}
+                onChange={chooseInput}
               />
             </span>
             <span className="sp" />
@@ -2458,10 +2453,7 @@ function AppShell() {
                 value={referenceView}
                 onOpen={refreshDevices}
                 options={refOptions}
-                onChange={(v) => {
-                  updateSelection({ reference: v });
-                  applyChange({ reference: v });
-                }}
+                onChange={chooseReference}
               />
             </span>
             <span className="ico">
@@ -2481,17 +2473,18 @@ function AppShell() {
                   value: d.stable_id,
                   label: d.name,
                 }))}
-                onChange={(v) => {
-                  updateSelection({ selOutput: v });
-                  applyChange({ output: v });
-                }}
+                onChange={chooseOutput}
               />
             </span>
             <span className="sp" />
-            {doctor && !doctor.virtual_output_detected ? (
+            {doctorView && !doctorView.virtual_output_detected ? (
               <span className="meta" style={{ color: "var(--warn)" }}>
                 <span className="mk">!!!</span> {t("installCable")}:{" "}
-                <b>{doctor.recommended_driver}</b>
+                <b>{doctorView.recommended_driver}</b>
+              </span>
+            ) : outputRoute.selectedIsVirtual && outputRoute.counterpartMissing ? (
+              <span className="meta" style={{ color: "var(--warn)" }}>
+                <span className="mk">!!!</span> {t("micCounterpartMissing")}
               </span>
             ) : (
               <span className="meta">
@@ -2637,6 +2630,8 @@ function AppShell() {
             diagDir={diagDir}
             running={powerOn}
             doctor={doctorView}
+            devices={liveDevicesForRoute}
+            selectedOutput={selOutput}
             platform={platformView}
             onMicSetup={() => gotoView("micsetup")}
             onRequestSystemAudio={probeSystemAudio}
@@ -2648,6 +2643,8 @@ function AppShell() {
         {view === "micsetup" && (
           <MicSetupPage
             doctor={doctorView}
+            devices={liveDevicesForRoute}
+            selectedOutput={selOutput}
             platform={platformView}
             dev={dev}
             devState={devMicState}
