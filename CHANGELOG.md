@@ -6,6 +6,28 @@ adheres to [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
+## [1.2.1-rc.2] — 2026-11-24
+
+### Fixed
+- **Localized Windows VB-CABLE pairing & self-loop filtering:** Allowed virtual
+  drivers with companion playback pins (such as localized `扬声器 / VB-Audio
+  Virtual Cable` alongside `CABLE In 16 Ch / VB-Audio Virtual Cable`) to pair
+  with `CABLE Output` without false "missing or disabled" warnings, preferred
+  standard endpoints over multichannel `16/32/64 Ch` pins by default, and
+  filtered both `CABLE Output` and sibling output pins out of Reference
+  self-loops.
+- **Health panel cumulative metrics & live status:** Added run-cumulative
+  `*_total` counters to CLI status JSON so the Diagnostics Health panel shows
+  total lost audio duration (in ms) across the full session instead of only the
+  last 80 ms interval, added a live `STATUS` summary row showing monitored
+  uptime and last-issue age, and prevented transient `diverged`/`last_error`
+  flicker between node-stats samples.
+- **Relaxed unmatched virtual-route guidance:** When a virtual output is
+  selected and virtual mic inputs exist on the system but cannot be matched
+  automatically by name, Overview, Diagnostics, and Mic Setup now show calm
+  manual-selection guidance (and list available virtual mics) instead of
+  flagging the route as broken or prompting to reinstall the driver.
+
 ## [1.2.1-rc.1] — 2026-11-23
 
 A comprehensive reliability, device-routing, and security maintenance release
