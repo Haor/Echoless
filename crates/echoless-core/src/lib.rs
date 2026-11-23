@@ -58,9 +58,6 @@ pub fn default_output_level() -> u32 {
 pub fn default_bypass() -> bool {
     false
 }
-pub fn default_output_rate_match() -> bool {
-    true
-}
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -130,12 +127,6 @@ pub struct PipelineConfig {
     /// Start realtime run in mic passthrough mode; processors may stay warm in realtime.
     #[serde(default = "default_bypass")]
     pub bypass: bool,
-    /// Adaptive output/reference rate matching (T3): track the output-ring water
-    /// level and trim the resampling ratio (±3%) so the mic-clock producer stays
-    /// aligned with the device consumer clock. Disable to fall back to fixed-ratio
-    /// passthrough (pre-T3 behaviour).
-    #[serde(default = "default_output_rate_match")]
-    pub output_rate_match: bool,
     /// Optional realtime diagnostic recordings.
     #[serde(default)]
     pub diagnostics: DiagnosticsConfig,
@@ -156,7 +147,6 @@ impl Default for PipelineConfig {
             near_delay_ms: default_near_delay_ms(),
             output_level: default_output_level(),
             bypass: default_bypass(),
-            output_rate_match: default_output_rate_match(),
             diagnostics: DiagnosticsConfig::default(),
             chain: Vec::new(),
         }
@@ -394,6 +384,12 @@ mod tests {
         .unwrap();
         assert!(bounded.diagnostics.recording_enabled());
         assert_eq!(bounded.diagnostics.max_seconds, Some(30));
+    }
+
+    #[test]
+    fn retired_output_rate_match_key_is_ignored() {
+        let cfg: PipelineConfig = toml::from_str("output_rate_match = false\n").unwrap();
+        assert_eq!(cfg.sample_rate, 48_000);
     }
 
     #[test]

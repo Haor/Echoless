@@ -2,7 +2,6 @@ use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use ringbuf::traits::Consumer;
-use rubato::{FftFixedOut, Resampler};
 
 use super::frame_ring::try_pop_frame;
 
@@ -121,190 +120,6 @@ impl InterleavedLinearResampler {
     }
 }
 
-pub(super) struct OutputDeviceResampler {
-    in_rate: u32,
-    out_rate: u32,
-    configured_output_frames: usize,
-    input_planes: Vec<Vec<f32>>,
-    output_planes: Vec<Vec<f32>>,
-    output: Vec<f32>,
-    resampler: Option<FftFixedOut<f32>>,
-    linear_fallback: OutputLinearFallback,
-}
-
-impl OutputDeviceResampler {
-    pub(super) fn new(in_rate: u32, out_rate: u32) -> Self {
-        Self {
-            in_rate,
-            out_rate,
-            configured_output_frames: 0,
-            input_planes: Vec::new(),
-            output_planes: Vec::new(),
-            output: Vec::new(),
-            resampler: None,
-            linear_fallback: OutputLinearFallback::new(in_rate, out_rate),
-        }
-    }
-
-    pub(super) fn next_chunk<C>(
-        &mut self,
-        output_frames: usize,
-        consumer: &mut C,
-        underruns: &AtomicU64,
-    ) -> &[f32]
-    where
-        C: Consumer<Item = f32>,
-    {
-        self.output.clear();
-        if output_frames == 0 {
-            return &self.output;
-        }
-        if self.in_rate == self.out_rate {
-            self.output.resize(output_frames, 0.0);
-            fill_from_consumer(&mut self.output, consumer, underruns);
-            return &self.output;
-        }
-
-        self.ensure_layout(output_frames);
-        if let Some(resampler) = self.resampler.as_mut() {
-            let input_frames = resampler.input_frames_next();
-            resize_planes(&mut self.input_planes, 1, input_frames);
-            fill_from_consumer(&mut self.input_planes[0], consumer, underruns);
-            if let Ok((_, out_frames)) =
-                resampler.process_into_buffer(&self.input_planes, &mut self.output_planes, None)
-            {
-                self.output
-                    .extend_from_slice(&self.output_planes[0][..out_frames.min(output_frames)]);
-                self.output.resize(output_frames, 0.0);
-                return &self.output;
-            }
-            self.output.resize(output_frames, 0.0);
-            return &self.output;
-        }
-
-        let missing_device_frames =
-            self.linear_fallback
-                .fill_chunk(output_frames, consumer, &mut self.output);
-        let missing_pipeline_frames =
-            scaled_frames(missing_device_frames, self.out_rate, self.in_rate);
-        underruns.fetch_add(missing_pipeline_frames as u64, Ordering::Relaxed);
-        &self.output
-    }
-
-    fn ensure_layout(&mut self, output_frames: usize) {
-        if self.configured_output_frames == output_frames {
-            return;
-        }
-        self.configured_output_frames = output_frames;
-        self.resampler = FftFixedOut::<f32>::new(
-            self.in_rate as usize,
-            self.out_rate as usize,
-            output_frames,
-            1,
-            1,
-        )
-        .ok();
-        let input_frames = self
-            .resampler
-            .as_ref()
-            .map(Resampler::input_frames_next)
-            .unwrap_or_else(|| scaled_frames(output_frames, self.out_rate, self.in_rate));
-        let output_frames_max = self
-            .resampler
-            .as_ref()
-            .map(Resampler::output_frames_max)
-            .unwrap_or(output_frames);
-        resize_planes(&mut self.input_planes, 1, input_frames);
-        resize_planes(&mut self.output_planes, 1, output_frames_max);
-        self.output.resize(output_frames, 0.0);
-        self.output.clear();
-    }
-}
-
-struct OutputLinearFallback {
-    step: f64,
-    pos: f64,
-    buffer: VecDeque<f32>,
-}
-
-impl OutputLinearFallback {
-    fn new(in_rate: u32, out_rate: u32) -> Self {
-        let step = if out_rate == 0 {
-            1.0
-        } else {
-            in_rate as f64 / out_rate as f64
-        };
-        Self {
-            step,
-            pos: 0.0,
-            buffer: VecDeque::new(),
-        }
-    }
-
-    fn fill_chunk<C>(
-        &mut self,
-        output_frames: usize,
-        consumer: &mut C,
-        output: &mut Vec<f32>,
-    ) -> usize
-    where
-        C: Consumer<Item = f32>,
-    {
-        output.resize(output_frames, 0.0);
-        let mut missing_device_frames = 0;
-        for sample in output.iter_mut() {
-            match self.next_sample(consumer) {
-                Some(value) => *sample = value,
-                None => {
-                    *sample = 0.0;
-                    missing_device_frames += 1;
-                }
-            }
-        }
-        missing_device_frames
-    }
-
-    fn next_sample<C>(&mut self, consumer: &mut C) -> Option<f32>
-    where
-        C: Consumer<Item = f32>,
-    {
-        let needed = (self.pos.floor() as usize).saturating_add(2);
-        while self.buffer.len() < needed {
-            let sample = consumer.try_pop()?;
-            self.buffer.push_back(sample.clamp(-1.0, 1.0));
-        }
-
-        let i0 = self.pos.floor() as usize;
-        let frac = (self.pos - i0 as f64) as f32;
-        let a = self.buffer.get(i0).copied().unwrap_or(0.0);
-        let b = self.buffer.get(i0 + 1).copied().unwrap_or(a);
-        let sample = (a + (b - a) * frac).clamp(-1.0, 1.0);
-
-        self.pos += self.step;
-        let consumed = self.pos.floor() as usize;
-        for _ in 0..consumed {
-            let _ = self.buffer.pop_front();
-        }
-        self.pos -= consumed as f64;
-        Some(sample)
-    }
-}
-
-fn fill_from_consumer<C>(output: &mut [f32], consumer: &mut C, underruns: &AtomicU64)
-where
-    C: Consumer<Item = f32>,
-{
-    for sample in output.iter_mut() {
-        *sample = match consumer.try_pop() {
-            Some(v) => v.clamp(-1.0, 1.0),
-            None => {
-                underruns.fetch_add(1, Ordering::Relaxed);
-                0.0
-            }
-        };
-    }
-}
-
 /// 水位反馈速率控制器:PI + 软死区 + 抗饱和钳位。输出侧与参考侧共用。
 ///
 /// 输出 trim = 有效重采样比率相对基线的偏移(正=多消费拉低水位,负=少消费抬高水位)。
@@ -370,14 +185,14 @@ impl RateController {
     }
 }
 
-/// T3 输出侧自适应速率匹配。
+/// 输出侧自适应速率匹配。
 ///
 /// 生产端锁 mic 时钟(处理循环每帧恒 push frame_size),消费端是设备/虚拟端点时钟。
 /// 二者节奏不一致时 out_ring 水位会单调漂移 → 周期性 underrun(听感断续)。本重采样器
 /// 在**输出回调线程**里读 out_ring 占用量,经 [`RateController`] 把有效消费比率朝设定点微调:
 /// 水位偏高→多消费(step 略增),水位偏低→少消费(step 略减)。有效 trim 钳位 ±3%,
 /// 稳态漂移(实测 Voicemeeter 残留 2.2%)被完全吸收且不净变调;配置级大错配(如 22%)
-/// 会钳到边界后自然 underrun,交由 T1 的 clock_skew 检测告警,不硬追以免明显变调。
+/// 会钳到边界后自然 underrun,交由 clock_skew 检测告警,不硬追以免明显变调。
 /// 正常设备(仅 ppm 漂移)几乎一直落在软死区内,trim=0 = 精确直通。
 ///
 /// 线性插值 + 持久 `pos`/`buffer` 保证跨回调相位连续。稳态无堆分配(buffer 容量收敛),
@@ -492,7 +307,7 @@ impl AdaptiveOutputResampler {
     }
 }
 
-/// T3 参考侧连续重采样。
+/// 参考侧连续重采样。
 ///
 /// 修复前 ref 流靠 `skip_stale` **硬丢帧**控制积压:每次积压超阈值就直接 `skip` 掉一段样本,
 /// 使参考时间轴出现周期性缺口。AEC 依赖 near/far 的连续对齐,ref 时间轴碎片化会直接毁掉
@@ -600,22 +415,6 @@ impl AdaptiveReferenceResampler {
     }
 }
 
-fn resize_planes(planes: &mut Vec<Vec<f32>>, channels: usize, frames: usize) {
-    if planes.len() != channels {
-        planes.resize_with(channels, Vec::new);
-    }
-    for plane in planes.iter_mut() {
-        plane.resize(frames, 0.0);
-    }
-}
-
-fn scaled_frames(input_frames: usize, in_rate: u32, out_rate: u32) -> usize {
-    if in_rate == 0 {
-        return input_frames;
-    }
-    ((input_frames as f64) * out_rate as f64 / in_rate as f64).round() as usize
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::AtomicU64;
@@ -673,63 +472,6 @@ mod tests {
         let right_avg = right_sum / frames as f32;
         assert!(left_avg > 0.2, "left channel collapsed: {left_avg}");
         assert!(right_avg < -0.2, "right channel collapsed: {right_avg}");
-    }
-
-    #[test]
-    fn output_resampler_returns_requested_device_chunk() {
-        let drops = AtomicU64::new(0);
-        let (mut prod, mut cons) = HeapRb::<f32>::new(4096).split();
-        let input = sine_block(960, 440.0, 48_000);
-        assert_eq!(prod.push_slice(&input), input.len());
-        let mut resampler = OutputDeviceResampler::new(48_000, 24_000);
-
-        let output = resampler.next_chunk(240, &mut cons, &drops);
-
-        assert_eq!(output.len(), 240);
-        assert!(output.iter().all(|sample| sample.is_finite()));
-        assert_eq!(drops.load(Ordering::Relaxed), 0);
-    }
-
-    #[test]
-    fn output_resampler_passthrough_pulls_pipeline_samples() {
-        let drops = AtomicU64::new(0);
-        let (mut prod, mut cons) = HeapRb::<f32>::new(8).split();
-        assert_eq!(prod.push_slice(&[0.0, 0.25, 0.5, 0.75]), 4);
-        let mut resampler = OutputDeviceResampler::new(48_000, 48_000);
-
-        let output = resampler.next_chunk(4, &mut cons, &drops);
-
-        assert_eq!(output, &[0.0, 0.25, 0.5, 0.75]);
-        assert_eq!(drops.load(Ordering::Relaxed), 0);
-    }
-
-    #[test]
-    fn output_resampler_underruns_count_pipeline_frames_with_fft() {
-        let underruns = AtomicU64::new(0);
-        let (_producer, mut consumer) = HeapRb::<f32>::new(1024).split();
-        let mut resampler = OutputDeviceResampler::new(48_000, 44_100);
-
-        let output_frames = resampler.next_chunk(441, &mut consumer, &underruns).len();
-
-        assert_eq!(output_frames, 441);
-        assert!(resampler.resampler.is_some());
-        assert_eq!(underruns.load(Ordering::Relaxed), 480);
-    }
-
-    #[test]
-    fn output_resampler_underruns_count_pipeline_frames_with_linear_fallback() {
-        let underruns = AtomicU64::new(0);
-        let (_producer, mut consumer) = HeapRb::<f32>::new(1024).split();
-        let mut resampler = OutputDeviceResampler::new(48_000, 44_100);
-        resampler.ensure_layout(441);
-        assert!(resampler.resampler.is_some());
-        resampler.resampler = None;
-
-        let output_frames = resampler.next_chunk(441, &mut consumer, &underruns).len();
-
-        assert_eq!(output_frames, 441);
-        assert!(resampler.resampler.is_none());
-        assert_eq!(underruns.load(Ordering::Relaxed), 480);
     }
 
     fn sine_block(frames: usize, hz: f32, rate: u32) -> Vec<f32> {
@@ -898,7 +640,7 @@ mod tests {
         }
     }
 
-    // ── T3 输出侧自适应速率匹配回归 ──────────────────────────────────────────────
+    // ── 输出侧自适应速率匹配回归 ──────────────────────────────────────────────
     //
     // 模型:生产端锁 mic 时钟,每 tick 恰好 push `frame_size` 个样本。消费端锁设备时钟,
     // 设备比 mic 快 `skew` → 每 tick 索取 `round(frame_size*(1+skew))` 个样本。跑足够多
@@ -1194,7 +936,7 @@ mod tests {
     #[test]
     fn t3_clamps_on_config_level_skew() {
         // 8.8% / 22% 配置级错配:设备快到需要的拉伸超出 -3% 钳位边界,trim 钳到 -3%,
-        // 不硬追(避免变调),后半程持续钳位(交由 T1 clock_skew 告警)。
+        // 不硬追(避免变调),后半程持续钳位(交由 clock_skew 告警)。
         for skew in [0.088_f64, 0.224] {
             let (_steady, trim, clamp_ratio, _) = run_output_skew(skew, 480, 2000);
             assert!(
@@ -1203,7 +945,7 @@ mod tests {
             );
             assert!(
                 clamp_ratio > 0.5,
-                "skew={skew}: clamp_ratio {clamp_ratio:.3} 应长期钳位(触发 T1 告警域)"
+                "skew={skew}: clamp_ratio {clamp_ratio:.3} 应长期钳位(触发时钟错配告警域)"
             );
         }
     }

@@ -471,7 +471,6 @@ dependencies = [
  "echoless-processors",
  "hound",
  "ringbuf",
- "rubato",
  "serde_json",
  "sha2",
  "toml",
