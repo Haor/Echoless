@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { useI18n } from "../i18n";
 import { ScrambleText } from "./ScrambleText";
 
 export interface DropdownOption {
@@ -24,6 +25,7 @@ export function Dropdown({
   compact?: boolean;
   warn?: boolean;
 }) {
+  const { t } = useI18n();
   const [open, setOpen] = useState(false);
   const rootRef = useRef<HTMLDivElement>(null);
   const cur = options.find((o) => o.value === value);
@@ -61,7 +63,7 @@ export function Dropdown({
       </button>
       {open && (
         <div className={`dd-panel ${align === "right" ? "right" : ""}`}>
-          {options.length === 0 && <div className="dd-empty">no devices</div>}
+          {options.length === 0 && <div className="dd-empty">{t("noDevices")}</div>}
           {options.map((o) => (
             <button
               key={o.value}

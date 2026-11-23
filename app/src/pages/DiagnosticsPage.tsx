@@ -4,15 +4,12 @@ import { openDiagnosticsDir, openPath, openUrl } from "../api";
 import { useI18n } from "../i18n";
 import { Field } from "../components/Controls";
 import { Hint } from "../components/Hint";
+import { SYS_AUDIO_PRIVACY_URL } from "../components/RuntimeStatusStrip";
 import { Toggle } from "../components/Toggle";
 import { resolveVirtualRoute } from "../virtualRoute";
 
-// macOS 隐私设置深链。麦克风有专属锚点;系统录音(14.4+ Audio Capture)无稳定
-// 专属锚点,回退到隐私根面板。
 const MIC_PRIVACY_URL =
   "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone";
-const SYS_AUDIO_PRIVACY_URL =
-  "x-apple.systempreferences:com.apple.preference.security?Privacy";
 
 export interface DiagnosticsPageProps {
   rec: boolean;
@@ -211,7 +208,7 @@ export function DiagnosticsPage({
       <div className="drow">
         <span className="dk">{t("recordDir")}</span>
         <span className="dpath" title={diagDir}>
-          {diagDir || t("choose")}
+          {diagDir || "—"}
         </span>
         <button type="button" className="dopen" onClick={() => openDiagnosticsDir()}>
           {t("openFolder")} <span className="mk">&raquo;</span>

@@ -46,9 +46,9 @@ interface Props {
   onAutoStart: (enabled: boolean) => void;
 }
 
-// C3/C5 减参:专家级/与引擎页重复的字段不在高级页暴露 ——
-//   LocalVQE:model(引擎页模型清单管理)、library/backend/device(auto 即可);
-//   NVAFX:model_path/use_default_gpu/disable_cuda_graph(专家字段,走配置文件)。
+// 专家级/与引擎页重复的字段不在高级页暴露:
+//   LocalVQE: model(引擎页管理)、library/backend/device(auto 即可);
+//   NVAFX: model_path/use_default_gpu/disable_cuda_graph(走配置文件)。
 const HIDDEN_PARAMS: Record<string, Set<string>> = {
   localvqe: new Set(["model", "library", "backend", "device"]),
   nvidia_afx_aec: new Set([
@@ -515,7 +515,7 @@ export function AdvancedPage({
         numeric={spec.type === "number"}
         min={spec.min}
         max={spec.max}
-        placeholder={spec.required ? "required" : t("auto")}
+        placeholder={spec.required ? t("required") : t("auto")}
         onCommit={(v) => onChange(key, v)}
       />
     );
@@ -609,7 +609,7 @@ export function AdvancedPage({
       <div className="asec">{backendLabel(kind, proc)}</div>
       <div className="acols">
         {backendParams.length === 0 && (
-          <div className="pnote">no parameters</div>
+          <div className="pnote">{t("noParameters")}</div>
         )}
         {backendParams.map(([key, spec]) => arow(key, key, spec))}
       </div>

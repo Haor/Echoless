@@ -326,7 +326,7 @@ export function MicSetupPage({
         )}
         <span className={`wznode ${node("ready")}`}>
           <i className="d" />
-          ready
+          {t("micNodeReady")}
         </span>
       </div>
 

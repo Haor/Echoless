@@ -89,7 +89,7 @@ const PROFILES: Profile[] = [
     echo: 9,
     voice: 5,
     cost: "CPU · neural",
-    sr: "48k (src) / 16k", // 模型原生 16k;48k 管线经 SRC 重采样进出(A6)
+    sr: "48k (src) / 16k", // 模型原生 16k;48k 管线经 SRC 重采样进出
     os: "Win · mac · Linux",
   },
   {
@@ -99,7 +99,7 @@ const PROFILES: Profile[] = [
     echo: 7,
     voice: 9,
     cost: "GPU · Tensor Core",
-    sr: "48k / 16k",
+    sr: "48k",
     os: "Win only",
   },
 ];
@@ -148,9 +148,14 @@ interface Props {
   onSetup: () => void;
 }
 
-// 本机系统信息整段会话不变:模块级缓存,避免每次进 Engine 页 NvafxCard 重挂载都
-// 异步重取致「空 → 延迟 pop」的闪现。首取后缓存,重进用缓存同步初始化 state。
 let macSysInfoCache: MacSystemInfo | null = null;
+const DEV_MAC_SYS_INFO: MacSystemInfo = {
+  model: "MacBook Pro",
+  os_version: "26.5.1",
+  chip: "Apple M4",
+  memory_gb: 24,
+  cores: 10,
+};
 
 function NvafxCard({
   kind,
@@ -179,30 +184,21 @@ function NvafxCard({
   const nv = doctor?.report;
   const active = kind === "nvidia_afx_aec";
 
-  // 不可用态(仅 macOS)拉本机系统信息填充右栏。dev 模拟给一份样例。
-  const [sysInfo, setSysInfo] = useState<MacSystemInfo | null>(macSysInfoCache);
+  // 不可用态(仅 macOS)拉本机系统信息填充右栏;dev 模拟使用临时样例,不污染真实缓存。
+  const [realSysInfo, setRealSysInfo] = useState<MacSystemInfo | null>(
+    macSysInfoCache,
+  );
   useEffect(() => {
-    if (nvSupported || platform !== "macos") return;
-    if (sysInfo) return; // 缓存命中,已同步渲染,无需再取
-    if (dev) {
-      const info: MacSystemInfo = {
-        model: "MacBook Pro",
-        os_version: "26.5.1",
-        chip: "Apple M4",
-        memory_gb: 24,
-        cores: 10,
-      };
-      macSysInfoCache = info;
-      setSysInfo(info);
-      return;
-    }
+    if (nvSupported || platform !== "macos" || dev) return;
+    if (realSysInfo) return;
     macSystemInfo()
       .then((info) => {
         macSysInfoCache = info;
-        setSysInfo(info);
+        setRealSysInfo(info);
       })
       .catch(() => {});
-  }, [nvSupported, platform, dev, sysInfo]);
+  }, [nvSupported, platform, dev, realSysInfo]);
+  const sysInfo = dev ? DEV_MAC_SYS_INFO : realSysInfo;
 
   return (
     <div
@@ -455,8 +451,7 @@ export function EnginePage({
           {t("lvqeOpenDir")} <span className="mk">↗</span>
         </button>
       </div>
-      {/* native runtime 随包分发(2026-07-05 定案),正常永远就绪;
-          这条 warn 只兜 dev 环境资源缺失的病态 case,不提供下载按钮 */}
+      {/* Native runtime is bundled with the app; warn only if missing in dev environments. */}
       {lvAssets && !lvAssets.native_ready && (
         <div className="cdetail warn" title={lvAssets.native_dir ?? undefined}>
           {t("lvqeRuntimeMissing")}
@@ -476,7 +471,7 @@ export function EnginePage({
     const rdy = ready(p.kind);
     const isLvqe = p.kind === "localvqe";
     const status = !sup
-      ? "UNAVAILABLE"
+      ? t("unavailable")
       : rdy
         ? active
           ? t("active")

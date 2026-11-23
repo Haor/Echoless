@@ -262,7 +262,7 @@ type AppState = {
   devPlatform: Platform | null;
   io: IoResamplingState;
   rec: boolean;
-  // P8-D1:穿透中(sidecar 活着,mic 直通,AEC 保温)。UI 的「电源 OFF」= 此态。
+  // 穿透中(sidecar 活着,mic 直通,AEC 保温)。UI 的「电源 OFF」= 此态。
   bypassed: boolean;
   bypassPending: boolean | null;
   diagSeconds: number | null;
@@ -1024,6 +1024,7 @@ type RunLifecycleDeps = {
   noteError: (err: string | null) => void;
   gotoView: (view: View) => void;
   onRunStarted: () => void;
+  tRef: MutableRefObject<(k: string) => string>;
 };
 
 function useRunLifecycle({
@@ -1052,6 +1053,7 @@ function useRunLifecycle({
   noteError,
   gotoView,
   onRunStarted,
+  tRef,
 }: RunLifecycleDeps) {
   const [runtimeCleanupReady, setRuntimeCleanupReady] = useState(false);
   // 当前 run 实际生效的参考源(由 started 给出),供 status 判断是否 Process Tap。
@@ -1308,7 +1310,7 @@ function useRunLifecycle({
           if (ev.intentional) return;
           if (runIntentRef.current.wantsRun()) {
             const fallbackErr =
-              lastLogRef.current || "运行已停止:子进程意外退出";
+              lastLogRef.current || tRef.current("unexpectedExit");
             if (ev.recoverable || streamRecoveryRef.current.recovering) {
               scheduleRecoveryRetry(fallbackErr);
               return;
@@ -1339,6 +1341,7 @@ function useRunLifecycle({
     runStartedRef,
     scheduleRecoveryRetry,
     startDiag,
+    tRef,
     updateApp,
   ]);
 
@@ -1469,11 +1472,7 @@ function useRunLifecycle({
     if (probeBorrowedRunRef.current) await stop();
   }
 
-  // P8-D1 语义(用户拍板 2026-07-04):电源 OFF = 穿透,mic 绝不变哑。
-  //   sidecar 未跑 → 启动(AEC on);
-  //   AEC on     → set_bypass(true):mic 直通,引擎保温,15ms crossfade;
-  //   穿透中     → set_bypass(false):瞬时恢复 AEC(零重收敛)。
-  // 「完全停机」不是用户级操作(退出应用 = 停);stop() 只服务重启/probe/错误路径。
+  // 电源 OFF = 穿透(mic 直通虚拟麦,引擎保温);完全停机只服务重启/probe/错误路径。
   async function togglePower() {
     if (busy || probing) return;
     if (powerOn) {
@@ -1495,16 +1494,11 @@ function useRunLifecycle({
       gotoView("engine");
       return;
     }
-    // A5 后:tap 采样率由 helper 上报并在后端重采样,系统参考不再要求 48k。
     await start();
   }
 
-  // Applies changes that still require rebuilding the sidecar runtime.
-  // Hot controls bypass this path to avoid an audio dropout.
-  // 审计 B-04:手动切换与热插拔自动刷新(devicechange → applyChangeRef)可
-  // 重叠,交错的 stop→start 可能终态「UI 显示 OFF 但 sidecar 仍在采集」。
-  // 串行队列合并 delta、只跑最后一次;run 经 ref 读最新 doApplyChange 避免闭包过期,
-  // 电源态在真正执行的时刻判定(排队期间可能已被关掉)。
+  // Serializes structural stop->start restarts so manual switches and hotplug
+  // refreshes coalesce into a single final restart.
   const doApplyRef = useRef<(next: Override) => Promise<void>>(async () => {});
   doApplyRef.current = doApplyChange;
   const applyQueueRef = useRef(
@@ -1714,6 +1708,8 @@ export default function App() {
   const platformRef = useRef(platform);
   platformRef.current = platform;
   const { t } = useI18n();
+  const tRef = useRef(t);
+  tRef.current = t;
 
   const noteError = useCallback((err: string | null) => {
     updateApp({ err });
@@ -1847,6 +1843,7 @@ export default function App() {
     noteError,
     gotoView,
     onRunStarted: handleRunStarted,
+    tRef,
   });
   const autoStartRunRef = useRef(start);
   autoStartRunRef.current = start;
@@ -1867,7 +1864,7 @@ export default function App() {
     autoStartAttemptedRef.current = true;
     if (!engineReady(kind)) {
       gotoView(kind === "nvidia_afx_aec" ? "rtxsetup" : "engine");
-      noteError("Auto Start could not run because the selected engine is not ready.");
+      noteError(tRef.current("autoStartEngineUnready"));
       revealMainWindow();
       settleStartupOnce();
       return;
@@ -1909,43 +1906,43 @@ export default function App() {
           noiseSuppression: m.noise_suppression,
         });
         // manifest defaults 打底 + 持久化参数覆盖:新版本新增参数时老存档不缺键。
-        updateEngine((cur) => {
-          const proc = m.processors.find((p) => p.kind === cur.kind);
-          const mergedParams = {
-            ...defaultParams(proc),
-            ...(Object.keys(cur.params).length
-              ? cur.params
-              : (paramsByKind.current[cur.kind] ?? {})),
-          };
-          const normalizedNoiseMode = normalizeNoiseMode(
-            m.noise_suppression,
-            cur.kind,
-            mergedParams,
-            cur.noiseMode,
+        const activeKind = kindRef.current;
+        const proc = m.processors.find((p) => p.kind === activeKind);
+        const curParams = paramsRef.current;
+        const mergedParams = {
+          ...defaultParams(proc),
+          ...(Object.keys(curParams).length
+            ? curParams
+            : (paramsByKind.current[activeKind] ?? {})),
+        };
+        const normalizedNoiseMode = normalizeNoiseMode(
+          m.noise_suppression,
+          activeKind,
+          mergedParams,
+          noiseModeRef.current,
+        );
+        const curNoiseParams = noiseParamsByModeRef.current;
+        const mergedNoiseParamsByMode = {
+          ...curNoiseParams,
+        };
+        for (const mode of m.noise_suppression.modes) {
+          if (!mode.processor_kind) continue;
+          const noiseProcessor = m.processors.find(
+            (processor) => processor.kind === mode.processor_kind,
           );
-          const mergedNoiseParamsByMode = {
-            ...cur.noiseParamsByMode,
+          mergedNoiseParamsByMode[mode.id] = {
+            ...defaultParams(noiseProcessor),
+            ...(curNoiseParams[mode.id] ?? {}),
           };
-          for (const mode of m.noise_suppression.modes) {
-            if (!mode.processor_kind) continue;
-            const noiseProcessor = m.processors.find(
-              (processor) => processor.kind === mode.processor_kind,
-            );
-            mergedNoiseParamsByMode[mode.id] = {
-              ...defaultParams(noiseProcessor),
-              ...(cur.noiseParamsByMode[mode.id] ?? {}),
-            };
-          }
-          paramsRef.current = mergedParams;
-          paramsByKind.current[cur.kind] = mergedParams;
-          noiseModeRef.current = normalizedNoiseMode;
-          noiseParamsByModeRef.current = mergedNoiseParamsByMode;
-          return {
-            ...cur,
-            noiseMode: normalizedNoiseMode,
-            noiseParamsByMode: mergedNoiseParamsByMode,
-            params: mergedParams,
-          };
+        }
+        paramsRef.current = mergedParams;
+        paramsByKind.current[activeKind] = mergedParams;
+        noiseModeRef.current = normalizedNoiseMode;
+        noiseParamsByModeRef.current = mergedNoiseParamsByMode;
+        updateEngine({
+          noiseMode: normalizedNoiseMode,
+          noiseParamsByMode: mergedNoiseParamsByMode,
+          params: mergedParams,
         });
       })
       .catch((e) => noteError(String(e)));
@@ -2023,15 +2020,6 @@ export default function App() {
     return () => window.removeEventListener("keydown", onKey);
   }, [gotoView, view]);
 
-  // 桌面 app:禁用 Tab 键焦点移动(避免按钮出现键盘选中框)。
-  useEffect(() => {
-    const onTab = (e: KeyboardEvent) => {
-      if (e.key === "Tab") e.preventDefault();
-    };
-    window.addEventListener("keydown", onTab);
-    return () => window.removeEventListener("keydown", onTab);
-  }, []);
-
   // 桌面 app:禁用 WebView 默认右键菜单(重新加载/检查元素等网页项)。
   // 输入框/文本域放行,保留右键粘贴;dev 构建放行,保留调试菜单。
   useEffect(() => {
@@ -2094,7 +2082,6 @@ export default function App() {
   }
 
   // 用户主动请求系统音频录制权限:helper 显式调 TCCAccessRequest 弹窗,回传更新 doctor。
-  // 未授予时不再自动跳设置(用户否决 2026-07-05),把 CLI 的失败原因如实显示。
   const probeSystemAudio = useCallback(() => {
     noteError(null);
     requestSystemAudio()
@@ -2102,7 +2089,7 @@ export default function App() {
         updateApp({ doctor });
         if (doctor.system_audio_permission !== "granted") {
           const detail = doctor.system_audio_permission_probe?.detail;
-          noteError(detail || "system audio permission was not granted");
+          noteError(detail || tRef.current("sysAudioNotGranted"));
         }
       })
       .catch((e) => noteError(String(e)));
@@ -2321,7 +2308,7 @@ export default function App() {
   // 但字标熄灭 + 控制件调暗(AEC 不在工作)。
   const uiOn = powerOn && !bypassed;
 
-  // 运行五态(含 A4 防抖):状态盒 / srail 状态字 / zsub 共用同一判定。
+  // 运行五态(带劣化防抖):状态盒 / srail 状态字 / zsub 共用同一判定。
   const statusKind = useRunStatusKind(powerOn, refSel, dev, bypassed);
 
   // Windows 托盘偏好:持久化 + 每次变更(含首个渲染 = 启动同步)推给 Rust。
@@ -2389,8 +2376,7 @@ export default function App() {
       .catch(() => {});
   }, []);
 
-  // v14/v17:字标随电源亮灭 —— 熄→亮播 crton(磷光渐暖),亮→熄播 crtoff(衰减)。
-  // render 期 prev 比较(不走 useEffect):首帧不播动画,切换帧同 commit 内定类名。
+  // 字标随电源亮灭:熄→亮播 crton(磷光渐暖),亮→熄播 crtoff(衰减)。
   const [wordAnim, setWordAnim] = useState("");
   const prevPowerRef = useRef(uiOn);
   if (prevPowerRef.current !== uiOn) {
@@ -2433,7 +2419,6 @@ export default function App() {
       {/* ---- content ---- */}
       <main className="content">
         {view === "overview" && (
-        // v12:铭牌分格 plate —— A 铭牌 / B 电源格 / C 信号链 / D 仪器区
         <div className="plate">
         <section className="zone za">
           <div className="kick">
@@ -2444,13 +2429,11 @@ export default function App() {
             </span>{" "}
             {t("kicker")}
           </div>
-          {/* v6.1/v14:半调点阵字标,随电源亮灭 */}
           <div className="word">
             <span className={`wtxt ${uiOn ? "lit" : ""} ${wordAnim}`}>
               ECHOLESS
             </span>
           </div>
-          {/* v14:zmeta = 真实运行参数(引擎/管线/采集后端/版本) */}
           <div className="zmeta">
             ENGINE{" "}
             <b>
@@ -2814,7 +2797,7 @@ export default function App() {
             invertWheel={isMac}
           />
           {err ? (
-            <Hint text={`${err} · 点击关闭`} pos="top" attach>
+            <Hint text={`${err} · ${t("clickToDismiss")}`} pos="top" attach>
               <button
                 type="button"
                 className="stamp err plainbtn"
@@ -2829,7 +2812,6 @@ export default function App() {
               <span className="fdot">·</span>
               <span className="stamp">{stamp}</span>
               <span className="fdot">·</span>
-              {/* v3:UPTIME 走表(动效只证明系统活着) */}
               <UptimeStamp powerOn={powerOn} />
             </>
           )}

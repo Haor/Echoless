@@ -70,7 +70,7 @@ export interface LocalvqeModel {
   path: string;
   source: "downloaded" | string;
 }
-// native runtime 随包分发(2026-07-05 定案),不走下载;native_ready 只兜 dev 病态 case。
+// Native runtime is bundled with the app; native_ready guards dev environments with missing resources.
 export interface LocalvqeAssets {
   models_dir: string;
   models: LocalvqeModel[];

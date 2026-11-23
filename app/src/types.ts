@@ -142,7 +142,7 @@ export interface RuntimeStatus {
   output_underruns: number;
   output_overruns: number;
   stale_drops: number;
-  // 时钟漂移(2026-07 起 status 常驻):输出/参考时钟相对麦克风的偏差百分比。
+  // Clock drift of output/reference relative to microphone (%).
   // 旧 CLI 无此字段,须按可选处理。
   output_skew_pct?: number;
   ref_skew_pct?: number;
@@ -155,7 +155,7 @@ export interface RuntimeStatus {
   last_backend_error?: string | null;
   diagnostics_session_dir?: string | null;
 
-  // P8-D1:穿透中(OFF = mic 直通虚拟麦,AEC 保温)。status 常驻,默认 false。
+  // 穿透中(OFF = mic 直通虚拟麦,AEC 保温)。status 常驻,默认 false。
   bypassed?: boolean;
 
   // 诊断录制实时态(后端 2026-06 起):录制中为 true + 已录帧/秒 + writer 丢帧。
@@ -249,7 +249,7 @@ export interface LocalvqeNoiseGateChangedEvent {
   noise_gate: boolean;
   noise_gate_threshold_dbfs: number;
 }
-// set_bypass 实时生效后的回执(P8-D1:OFF = 穿透,mic 直通虚拟麦)。
+// set_bypass 实时生效后的回执(OFF = 穿透,mic 直通虚拟麦)。
 export interface BypassChangedEvent {
   type: "bypass_changed";
   bypassed: boolean;

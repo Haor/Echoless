@@ -31,7 +31,7 @@ const BOX_CLASS: Record<RunStatusKind, string> = {
   stopped: "box stopped",
 };
 
-// 状态盒(zb 电源格内的灯行;v12 起格子即容器,盒子褪框)。
+// 状态盒(电源格内的状态灯行)。
 export const RuntimeStatusStrip = memo(function RuntimeStatusStrip({
   statusKind,
 }: {
@@ -60,7 +60,7 @@ export const RuntimeStatusStrip = memo(function RuntimeStatusStrip({
   );
 });
 
-// 电源格注脚(zsub):PIPELINE 延迟 + 右侧状态字/引导动作(v7 层级调低)。
+// 电源格注脚:PIPELINE 延迟 + 右侧状态字/引导动作。
 export const RuntimeSubline = memo(function RuntimeSubline({
   statusKind,
   activeReady,

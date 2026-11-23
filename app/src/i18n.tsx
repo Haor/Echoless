@@ -2,6 +2,7 @@ import {
   createContext,
   useCallback,
   useContext,
+  useEffect,
   useMemo,
   useState,
   type ReactNode,
@@ -23,13 +24,27 @@ const D: Record<string, { en: string; zh: string }> = {
 
   removingEcho: { en: "Removing Echo", zh: "正在消除回声" },
   echoStopped: { en: "Echo Stopped", zh: "已停止" },
-  // P8-D1:OFF = 穿透 —— 强调 mic 仍然活着,只是 AEC 旁路。
+  // OFF = 穿透:强调 mic 仍然活着,只是 AEC 旁路。
   bypassLive: { en: "Bypass · Mic Live", zh: "直通 · 麦克风在线" },
   unstable: { en: "Unstable", zh: "不稳定" },
   noReference: { en: "No Reference", zh: "无参考信号" },
   ms: { en: "MS", zh: "毫秒" },
   stable: { en: "Stable", zh: "稳定" },
   checkSetup: { en: "Check Setup", zh: "检查设置" },
+  noDevices: { en: "no devices", zh: "无设备" },
+  unexpectedExit: {
+    en: "Run stopped: engine exited unexpectedly",
+    zh: "运行已停止:子进程意外退出",
+  },
+  clickToDismiss: { en: "click to dismiss", zh: "点击关闭" },
+  autoStartEngineUnready: {
+    en: "Auto Start could not run because the selected engine is not ready.",
+    zh: "开机自启未能运行:所选引擎尚未就绪。",
+  },
+  sysAudioNotGranted: {
+    en: "System audio permission was not granted",
+    zh: "未授予系统音频录制权限",
+  },
 
   input: { en: "Input", zh: "输入" },
   model: { en: "Model", zh: "模型" },
@@ -72,6 +87,7 @@ const D: Record<string, { en: string; zh: string }> = {
   rdyReady: { en: "READY", zh: "就绪" },
   rdySetup: { en: "SET UP", zh: "待配置" },
   rdyIssues: { en: "ISSUES", zh: "项待处理" },
+  unavailable: { en: "UNAVAILABLE", zh: "不可用" },
   engPair: {
     en: "pair with NVIDIA Broadcast",
     zh: "pair with NVIDIA Broadcast",
@@ -102,7 +118,6 @@ const D: Record<string, { en: string; zh: string }> = {
     en: "Smaller AEC model with built-in noise suppression.",
     zh: "体积更小、内置降噪的回声消除模型。",
   },
-  lvqeDownload: { en: "download", zh: "下载" },
   lvqeGet: { en: "GET", zh: "下载" },
   lvqeOpenDir: { en: "open model folder", zh: "打开模型目录" },
   lvqeRuntimeMissing: {
@@ -163,6 +178,13 @@ const D: Record<string, { en: string; zh: string }> = {
   wzDl: { en: "downloading", zh: "下载中" },
   wzUseEngine: { en: "use this engine", zh: "使用该引擎" },
   wzNoGpuArch: { en: "fix GPU / driver detection first", zh: "请先修复 GPU / 驱动检测" },
+  rtxNodePlatform: { en: "platform", zh: "平台" },
+  rtxNodeDriver: { en: "driver", zh: "驱动" },
+  rtxNodeGpu: { en: "gpu", zh: "显卡" },
+  rtxNodeVc: { en: "vc++", zh: "vc++" },
+  rtxNodeRuntime: { en: "runtime", zh: "运行时" },
+  rtxNodeModel: { en: "model", zh: "模型" },
+  rtxNodeReady: { en: "ready", zh: "就绪" },
 
   // 虚拟麦克风诊断 / 向导
   micSetup: { en: "MIC SETUP", zh: "虚拟麦配置" },
@@ -177,6 +199,7 @@ const D: Record<string, { en: string; zh: string }> = {
   micNodeDriver: { en: "driver", zh: "驱动" },
   micNodeRoute: { en: "route", zh: "路由" },
   micNodePerm: { en: "mic perm", zh: "麦权限" },
+  micNodeReady: { en: "ready", zh: "就绪" },
   // 状态摘要(Diagnostics 行)
   micReadyShort: { en: "route ready", zh: "路由就绪" },
   micSetupShort: { en: "set up", zh: "待配置" },
@@ -240,6 +263,8 @@ const D: Record<string, { en: string; zh: string }> = {
   referenceChannels: { en: "Reference Channels", zh: "参考声道" },
   language: { en: "Language", zh: "语言" },
   auto: { en: "auto", zh: "自动" },
+  required: { en: "required", zh: "必填" },
+  noParameters: { en: "no parameters", zh: "无参数" },
   // Advanced · 延迟侦测 / AEC 链路诊断
   secProbe: { en: "Delay Probe", zh: "延迟侦测" },
   nearDelay: { en: "Near Delay", zh: "近端延迟" },
@@ -265,12 +290,11 @@ const D: Record<string, { en: string; zh: string }> = {
   probeOk: { en: "OK", zh: "OK" },
   probeNoSig: { en: "no beep", zh: "未检测到蜂鸣" },
   probeStable: { en: "stable", zh: "稳定" },
-  probeUnstable: { en: "unstable", zh: "不稳定" },
   probeUncertain: { en: "not measured", zh: "未测出" },
   probeInvalid: { en: "not measured", zh: "未测出" },
   probeRec: { en: "set", zh: "建议" },
   probeNoFix: {
-    // v8/C6:去掉「no fix needed」歧义 —— 正 lag 由 AEC3 自行追踪,near_delay 不动。
+    // 正 lag 由 AEC3 自行追踪,near_delay 保持 0ms。
     en: "aligned · near_delay kept at 0ms",
     zh: "已对齐 · 近端延迟保持 0ms",
   },
@@ -353,7 +377,6 @@ const D: Record<string, { en: string; zh: string }> = {
     zh: "点按:静音/恢复 · 滚轮:调节",
   },
   recordDir: { en: "Output Dir", zh: "输出目录" },
-  choose: { en: "choose…", zh: "选择…" },
   recording: { en: "recording…", zh: "录制中…" },
   notRunning: { en: "turn ON to record", zh: "开启后开始录制" },
 };
@@ -379,6 +402,9 @@ export function LangProvider({ children }: { children: ReactNode }) {
       return "en";
     }
   });
+  useEffect(() => {
+    document.documentElement.lang = lang;
+  }, [lang]);
   const setLang = useCallback((l: Lang) => {
     setLangState(l);
     try {
