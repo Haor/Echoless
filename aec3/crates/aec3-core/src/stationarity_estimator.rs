@@ -205,8 +205,8 @@ impl StationarityEstimator {
         let num_render_channels = spectrum_buffer.buffer[0].len();
         let one_by_num_channels = 1.0 / num_render_channels as f32;
         for &idx in indexes {
-            for ch in 0..num_render_channels {
-                acum_power += spectrum_buffer.buffer[idx][ch][band] * one_by_num_channels;
+            for spectrum in spectrum_buffer.buffer[idx].iter().take(num_render_channels) {
+                acum_power += spectrum[band] * one_by_num_channels;
             }
         }
         acum_power += average_reverb[band];

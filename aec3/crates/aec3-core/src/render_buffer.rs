@@ -193,10 +193,8 @@ mod tests {
         let block_buffer = BlockBuffer::new(size, 1, num_channels);
         let fft_buffer = FftBuffer::new(size, num_channels);
 
-        for slot in 0..3 {
-            for k in 0..FFT_LENGTH_BY_2_PLUS_1 {
-                spectrum_buffer.buffer[slot][0][k] = (slot + 1) as f32;
-            }
+        for (slot, entry) in spectrum_buffer.buffer.iter_mut().enumerate().take(3) {
+            entry[0][..FFT_LENGTH_BY_2_PLUS_1].fill((slot + 1) as f32);
         }
 
         let rb = RenderBuffer::new(&block_buffer, &spectrum_buffer, &fft_buffer);

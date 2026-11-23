@@ -94,15 +94,16 @@ impl HighPassFilter {
     /// Process audio through the high-pass filter using an AudioBuffer.
     pub(crate) fn process(&mut self, audio: &mut AudioBuffer, use_split_band_data: bool) {
         debug_assert_eq!(self.filters.len(), audio.num_channels());
+        let num_channels = audio.num_channels();
         if use_split_band_data {
-            for k in 0..audio.num_channels() {
+            for (k, filter) in self.filters.iter_mut().enumerate().take(num_channels) {
                 let data = audio.split_band_mut(k, 0);
-                self.filters[k].process_in_place(data);
+                filter.process_in_place(data);
             }
         } else {
-            for k in 0..audio.num_channels() {
+            for (k, filter) in self.filters.iter_mut().enumerate().take(num_channels) {
                 let data = audio.channel_mut(k);
-                self.filters[k].process_in_place(data);
+                filter.process_in_place(data);
             }
         }
     }

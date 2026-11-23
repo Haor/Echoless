@@ -161,8 +161,8 @@ impl AlignmentMixer {
         // Normalize energies to allow smoothing-based computation.
         if self.block_counter == num_blocks_before_energy_smoothing {
             let scale = 1.0 / num_blocks_before_energy_smoothing as f32;
-            for ch in 0..num_ch_to_analyze {
-                self.cumulative_energies[ch] *= scale;
+            for energy in self.cumulative_energies.iter_mut().take(num_ch_to_analyze) {
+                *energy *= scale;
             }
         }
 

@@ -206,10 +206,14 @@ impl EarlyReverbLengthEstimator {
             .fold(f32::INFINITY, f32::min);
 
         let mut early_reverb_size_minus_1 = 0;
-        for k in 0..NUM_SECTIONS_TO_ANALYZE {
-            if (self.numerators_smooth[k] > numerator_11)
-                || (self.numerators_smooth[k] < numerator_08
-                    && self.numerators_smooth[k] < 0.9 * min_numerator_tail)
+        for (k, &numerator) in self
+            .numerators_smooth
+            .iter()
+            .enumerate()
+            .take(NUM_SECTIONS_TO_ANALYZE)
+        {
+            if (numerator > numerator_11)
+                || (numerator < numerator_08 && numerator < 0.9 * min_numerator_tail)
             {
                 early_reverb_size_minus_1 = k;
             }

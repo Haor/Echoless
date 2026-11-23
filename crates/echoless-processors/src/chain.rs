@@ -368,8 +368,8 @@ impl BoundaryAdapter {
                     frame_samples.iter().copied().sum::<f32>() / in_channels as f32;
             } else if in_channels == 1 {
                 let sample = frame_samples[0];
-                for channel in 0..out_channels {
-                    self.planes[channel][frame] = sample;
+                for plane in self.planes.iter_mut().take(out_channels) {
+                    plane[frame] = sample;
                 }
             } else {
                 for channel in 0..out_channels {
@@ -731,7 +731,7 @@ mod tests {
         let captured = far_seen.lock().unwrap().clone();
         assert_eq!(captured.len(), 160 * 2);
         let (mut left_sum, mut right_sum) = (0.0f32, 0.0f32);
-        for frame in captured.chunks_exact(2).skip(8).take(144) {
+        for frame in captured.as_chunks::<2>().0.iter().skip(8).take(144) {
             left_sum += frame[0];
             right_sum += frame[1];
         }

@@ -156,7 +156,7 @@ impl EchoProcessor for RnNoise {
         let requested_frames = frames as usize;
         while offset < requested_frames {
             let block_len = (requested_frames - offset).min(FRAME_SAMPLES);
-            for index in 0..FRAME_SAMPLES {
+            for (index, slot) in self.input.iter_mut().enumerate().take(FRAME_SAMPLES) {
                 let normalized = if index < block_len {
                     near.get(offset + index)
                         .copied()
@@ -166,7 +166,7 @@ impl EchoProcessor for RnNoise {
                 } else {
                     0.0
                 };
-                self.input[index] = normalized * PCM_SCALE;
+                *slot = normalized * PCM_SCALE;
             }
 
             self.native.process(&mut self.output, &self.input);

@@ -1849,7 +1849,7 @@ mod tests {
             source[2] = f32::NEG_INFINITY;
 
             let mut mapped = Vec::with_capacity(441 * channels);
-            for frame in source.chunks_exact(2) {
+            for frame in source.as_chunks::<2>().0 {
                 map_input_frame(frame, channel_mode, &mut mapped);
             }
             assert!(mapped.iter().all(|sample| sample.is_finite()));

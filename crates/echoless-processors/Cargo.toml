@@ -2,6 +2,7 @@
 name = "echoless-processors"
 edition.workspace = true
 version.workspace = true
+rust-version.workspace = true
 license.workspace = true
 description = "统一回声处理节点:EchoProcessor trait + ProcessorChain(可单开/串联/组合/扩展)+ aec3/localvqe 节点"
 

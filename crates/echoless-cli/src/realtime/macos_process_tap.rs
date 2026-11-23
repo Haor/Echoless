@@ -354,9 +354,9 @@ where
                 let frame_bytes = 4 * source_channels;
                 let complete = pending.len() / frame_bytes * frame_bytes;
                 samples.clear();
-                for chunk in pending[..complete].chunks_exact(4) {
+                for chunk in pending[..complete].as_chunks::<4>().0 {
                     samples.push(super::sanitize_input_sample(f32::from_bits(
-                        u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]),
+                        u32::from_le_bytes(*chunk),
                     )));
                 }
                 if complete > 0 {
