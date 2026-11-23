@@ -25,6 +25,7 @@ const STARTUP_READY_POLL: Duration = Duration::from_millis(100);
 const PROCESS_TAP_HEADER_DEADLINE: Duration = Duration::from_secs(25);
 
 const HELPER_ENV: &str = "ECHOLESS_PROCESS_TAP_HELPER";
+#[cfg(debug_assertions)]
 const DEV_HELPER: &str = "tools/macos-process-tap-poc/.build/echoless-process-tap-poc";
 
 pub struct MacProcessTapStream {
