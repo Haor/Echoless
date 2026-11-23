@@ -232,6 +232,17 @@ const D: Record<string, { en: string; zh: string }> = {
     en: "pick the matching virtual mic in your call app",
     zh: "请在通话软件中选择对应的虚拟麦克风",
   },
+  micCounterpartMissingHint: {
+    en: "no matching virtual mic input detected. If the driver is installed, make sure its recording device is enabled in the system sound settings; otherwise reinstall the driver.",
+    zh: "未检测到对应的虚拟麦输入端。若驱动已安装，请到系统声音设置的「录制」页确认它没有被禁用；否则重新安装驱动。",
+  },
+  micManualShort: { en: "virtual output set", zh: "已选虚拟输出" },
+  micManualTitle: { en: "Virtual output set", zh: "虚拟输出已就绪" },
+  micManualMicName: { en: "matching virtual mic", zh: "对应的虚拟麦克风" },
+  micManualCandidates: {
+    en: "Virtual mics on this system:",
+    zh: "本机可选的虚拟麦克风:",
+  },
   micUnmatchedSetupHint: {
     en: "Could not auto-match a recording device for this output. Verify its recording endpoint is enabled, or select the matching virtual mic in your call app.",
     zh: "未自动匹配到该输出对应的录音端。请确认其录音设备已启用，或在通话软件中手动选择对应的虚拟麦克风。",
@@ -334,29 +345,40 @@ const D: Record<string, { en: string; zh: string }> = {
   secHealth: { en: "Health", zh: "健康" },
   // Health · clock skew 悬停提示(不点名任何具体虚拟音频软件)
   clockSkewHint: {
-    en: "Output clock drift vs. the microphone clock. High or unstable drift usually means a device in the audio chain runs at a mismatched sample rate — set every input/output device (including virtual audio devices) to the same rate, e.g. 48000 Hz.",
-    zh: "输出时钟相对麦克风时钟的漂移。漂移偏高或不稳定,通常说明音频链路中有设备采样率不一致——请把所有输入/输出设备(含虚拟音频设备)统一为同一采样率,如 48000 Hz。",
+    en: "Output clock drift vs. the microphone clock that automatic rate matching could not absorb. 0.0% is normal: small drift is corrected silently. High or unstable drift usually means a device in the audio chain runs at a mismatched sample rate — set every input/output device (including virtual audio devices) to the same rate, e.g. 48000 Hz.",
+    zh: "自动速率匹配吸收不了、残留下来的输出时钟相对麦克风时钟的漂移。0.0% 是正常读数:小幅漂移会被静默校正。漂移偏高或不稳定,通常说明音频链路中有设备采样率不一致——请把所有输入/输出设备(含虚拟音频设备)统一为同一采样率,如 48000 Hz。",
   },
-  // Health · 其余计数器悬停提示
+  // Health · 运行摘要
+  healthIdle: { en: "not running", zh: "未运行" },
+  healthWaiting: { en: "waiting for data…", zh: "等待数据…" },
+  healthOk: {
+    en: "OK · monitored {t} · no dropouts",
+    zh: "正常 · 已监测 {t} · 未发现断续或丢帧",
+  },
+  healthIssue: {
+    en: "check · last dropout or error {t} ago — see the counters below",
+    zh: "注意 · 最近一次断续或错误在 {t} 前——见下方计数",
+  },
+  // Health · 其余计数器悬停提示(计数均为本次启动以来的累计值,按丢失的音频时长显示)
   hInputDrops: {
-    en: "Microphone/reference frames dropped before processing — the capture side couldn't keep up. Occasional drops are harmless; a steadily growing count means CPU pressure or a misbehaving input device.",
-    zh: "进入处理前被丢弃的麦克风/参考帧——采集侧没跟上。偶发丢帧无碍;持续增长说明 CPU 吃紧或输入设备异常。",
+    en: "Microphone/reference audio dropped before processing since start — the capture side couldn't keep up. Occasional drops are harmless; a steadily growing total means CPU pressure or a misbehaving input device.",
+    zh: "本次启动以来进入处理前被丢弃的麦克风/参考音频——采集侧没跟上。偶发丢帧无碍;持续增长说明 CPU 吃紧或输入设备异常。",
   },
   hRefUnderruns: {
-    en: "The echo canceller needed reference audio (system playback) but none had arrived yet. Frequent underruns weaken echo cancellation — often a sign of reference capture stalling.",
-    zh: "回声消除需要参考音频(系统播放声)时参考还没到。频繁欠载会削弱回声消除效果——常见原因是参考采集卡顿。",
+    en: "Total time since start that the echo canceller needed reference audio (system playback) but none had arrived yet. Frequent underruns weaken echo cancellation — often a sign of reference capture stalling.",
+    zh: "本次启动以来,回声消除需要参考音频(系统播放声)时参考还没到的累计时长。频繁欠载会削弱回声消除效果——常见原因是参考采集卡顿。",
   },
   hOutputUnderruns: {
-    en: "The output device asked for audio but the processed stream wasn't ready — heard as clicks or dropouts. Usually clock drift or CPU pressure.",
-    zh: "输出设备要数据时处理后的音频还没就绪——听感为咔哒/断续。通常是时钟漂移或 CPU 吃紧。",
+    en: "Total time since start that the output device asked for audio but the processed stream wasn't ready — heard as clicks or dropouts. Usually clock drift or CPU pressure.",
+    zh: "本次启动以来,输出设备要数据时处理后的音频还没就绪的累计时长——听感为咔哒/断续。通常是时钟漂移或 CPU 吃紧。",
   },
   hMicStale: {
-    en: "Microphone frames discarded for arriving too late to be useful. Growing count points at input-side stalls (device sleep, USB hiccups, scheduling).",
-    zh: "因到得太晚而被丢弃的麦克风帧。持续增长指向输入侧卡顿(设备休眠、USB 抖动、系统调度)。",
+    en: "Microphone audio discarded since start for arriving too late to be useful. A growing total points at input-side stalls (device sleep, USB hiccups, scheduling).",
+    zh: "本次启动以来因到得太晚而被丢弃的麦克风音频。持续增长指向输入侧卡顿(设备休眠、USB 抖动、系统调度)。",
   },
   hRefStale: {
-    en: "Reference frames discarded for arriving too late to align with the microphone. Growing count degrades echo cancellation — check reference capture stability.",
-    zh: "因到得太晚、无法与麦克风对齐而被丢弃的参考帧。持续增长会劣化回声消除——检查参考采集是否稳定。",
+    en: "Reference audio discarded since start for arriving too late to align with the microphone. A growing total degrades echo cancellation — check reference capture stability.",
+    zh: "本次启动以来因到得太晚、无法与麦克风对齐而被丢弃的参考音频。持续增长会劣化回声消除——检查参考采集是否稳定。",
   },
   hRuntimeErrors: {
     en: "Errors thrown by the processing engine at runtime. Any non-zero value is worth a look — check the session log for details.",

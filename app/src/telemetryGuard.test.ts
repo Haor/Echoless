@@ -1,8 +1,13 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
 import {
   dash,
+  formatLostAudio,
+  formatRunClock,
   getRunStatusKind,
+  getRuntimeHealth,
+  healthVerdict,
   publishRuntimeStatus,
+  resetRuntimeHealth,
   resetRuntimeLive,
   statusToLive,
   subscribeRunStatusKind,
@@ -175,5 +180,57 @@ describe("statusKind subscription isolation (P-02)", () => {
     } finally {
       unsub();
     }
+  });
+});
+
+describe("health panel totals", () => {
+  const status = (patch: Partial<RuntimeStatus>): RuntimeStatus =>
+    ({
+      type: "status",
+      elapsed_s: 1,
+      frames: 1,
+      sample_rate: 48000,
+      input_drops: 0,
+      ref_underruns: 0,
+      output_underruns: 0,
+      stale_drops: 0,
+      runtime_errors: 0,
+      diverged: false,
+      ...patch,
+    }) as RuntimeStatus;
+
+  afterEach(() => resetRuntimeHealth());
+
+  it("shows run totals and remembers the last audible issue after the interval clears", () => {
+    resetRuntimeHealth();
+    expect(healthVerdict(getRuntimeHealth(), true)).toBe("waiting");
+
+    publishRuntimeStatus(
+      status({ elapsed_s: 10, output_underruns: 480, output_underruns_total: 480 }),
+      1000,
+    );
+    // Next interval is clean, but the backend total keeps the dropout.
+    publishRuntimeStatus(
+      status({ elapsed_s: 70, output_underruns: 0, output_underruns_total: 480 }),
+      1080,
+    );
+
+    const health = getRuntimeHealth();
+    expect(health.output_underruns).toBe(480);
+    expect(health.last_issue_s).toBe(10);
+    expect(healthVerdict(health, true)).toBe("issue");
+    expect(formatLostAudio(health.output_underruns, health.sample_rate)).toBe("10 ms");
+  });
+
+  it("reports ok while data arrives without problems and idle when stopped", () => {
+    resetRuntimeHealth();
+    publishRuntimeStatus(status({ elapsed_s: 1490, ref_underruns_total: 0 }), 1000);
+    const health = getRuntimeHealth();
+    expect(healthVerdict(health, true)).toBe("ok");
+    expect(healthVerdict(health, false)).toBe("idle");
+    expect(formatRunClock(health.elapsed_s ?? 0)).toBe("24:50");
+    expect(formatRunClock(3725)).toBe("1:02:05");
+    expect(formatLostAudio(0, 48000)).toBe("0 ms");
+    expect(formatLostAudio(5, 48000)).toBe("<1 ms");
   });
 });

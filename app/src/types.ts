@@ -142,6 +142,13 @@ export interface RuntimeStatus {
   output_underruns: number;
   output_overruns: number;
   stale_drops: number;
+  // Totals since the run started. The fields above are per status interval
+  // (default 80 ms) and reset on every line. Older CLIs omit these fields.
+  input_drops_total?: number;
+  mic_stale_drops_total?: number;
+  ref_stale_drops_total?: number;
+  ref_underruns_total?: number;
+  output_underruns_total?: number;
   // Clock drift of output/reference relative to microphone (%).
   // 旧 CLI 无此字段,须按可选处理。
   output_skew_pct?: number;

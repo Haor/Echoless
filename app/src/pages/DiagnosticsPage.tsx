@@ -1,4 +1,10 @@
-import { dash, type Health } from "../runtimeTelemetry";
+import {
+  dash,
+  formatLostAudio,
+  formatRunClock,
+  healthVerdict,
+  type Health,
+} from "../runtimeTelemetry";
 import type { DeviceList, DoctorAudio, Platform } from "../types";
 import { openDiagnosticsDir, openPath, openUrl } from "../api";
 import { useI18n } from "../i18n";
@@ -57,6 +63,11 @@ export function DiagnosticsPage({
   });
   const routeReady = route.ready;
   const appMic = route.appMic;
+  // A virtual output is selected and virtual mic inputs exist; only the
+  // automatic name match failed. The route works once the user picks the
+  // mic in the call app, so this is guidance, not "set up".
+  const routeManual =
+    !routeReady && route.selectedIsVirtual && route.hasVirtualInput;
 
   // macOS 权限态(麦克风 + 系统录音)。缺字段 → unknown;非 mac 不渲染此区块。
   type PermState = "granted" | "denied" | "undetermined" | "unknown";
@@ -71,6 +82,22 @@ export function DiagnosticsPage({
           ? t("permUndet")
           : t("permUnknown");
 
+  const lost = (frames: number) => formatLostAudio(frames, health.sample_rate);
+  const verdict = healthVerdict(health, running);
+  const verdictText =
+    verdict === "idle"
+      ? t("healthIdle")
+      : verdict === "waiting"
+        ? t("healthWaiting")
+        : verdict === "ok"
+          ? t("healthOk").replace("{t}", formatRunClock(health.elapsed_s ?? 0))
+          : t("healthIssue").replace(
+              "{t}",
+              formatRunClock(
+                Math.max(0, (health.elapsed_s ?? 0) - (health.last_issue_s ?? 0)),
+              ),
+            );
+
   // pos:"top" = 提示往上弹。列表按两列网格排布,最下两排(后 4 项)贴近窗口
   // 底缘,向下弹会被视口截掉。
   const counters: {
@@ -80,11 +107,11 @@ export function DiagnosticsPage({
     hint: string;
     pos?: "top";
   }[] = [
-    { label: "input drops", value: health.input_drops, warn: health.input_drops > 0, hint: t("hInputDrops") },
-    { label: "ref underruns", value: health.ref_underruns, warn: health.ref_underruns > 0, hint: t("hRefUnderruns") },
-    { label: "output underruns", value: health.output_underruns, warn: health.output_underruns > 0, hint: t("hOutputUnderruns") },
-    { label: "mic stale", value: health.mic_stale_drops, warn: health.mic_stale_drops > 0, hint: t("hMicStale") },
-    { label: "ref stale", value: health.ref_stale_drops, warn: health.ref_stale_drops > 0, hint: t("hRefStale"), pos: "top" },
+    { label: "input drops", value: lost(health.input_drops), warn: health.input_drops > 0, hint: t("hInputDrops") },
+    { label: "ref underruns", value: lost(health.ref_underruns), warn: health.ref_underruns > 0, hint: t("hRefUnderruns") },
+    { label: "output underruns", value: lost(health.output_underruns), warn: health.output_underruns > 0, hint: t("hOutputUnderruns") },
+    { label: "mic stale", value: lost(health.mic_stale_drops), warn: health.mic_stale_drops > 0, hint: t("hMicStale") },
+    { label: "ref stale", value: lost(health.ref_stale_drops), warn: health.ref_stale_drops > 0, hint: t("hRefStale"), pos: "top" },
     // stale drops(= mic stale + ref stale 的冗余和)让位给 clock skew:
     // 时钟漂移是断续/回声残留的常见根因,比一个可心算的加总更值得占一格。
     {
@@ -117,7 +144,11 @@ export function DiagnosticsPage({
       <div className="drow">
         <span className="dk">ROUTE</span>
         <span className={`dpath ${routeReady ? "live" : ""}`}>
-          {routeReady ? t("micReadyShort") : t("micSetupShort")}
+          {routeReady
+            ? t("micReadyShort")
+            : routeManual
+              ? t("micManualShort")
+              : t("micSetupShort")}
           {appMic
             ? ` · ${t("micPickShort")}: ${appMic.name}`
             : route.counterpartMissing && route.output
@@ -248,6 +279,15 @@ export function DiagnosticsPage({
       </div>
 
       <div className="asec">{t("secHealth")}</div>
+      <div className="drow">
+        <span className="dk">STATUS</span>
+        <span
+          className={`dpath ${verdict === "ok" ? "live" : ""}`}
+          style={verdict === "issue" ? { color: "var(--warn)" } : undefined}
+        >
+          {verdictText}
+        </span>
+      </div>
       <div className={`acols ${running ? "" : "dim-soft"}`}>
         {counters.map((c) => (
           <div className="arow" key={c.label}>

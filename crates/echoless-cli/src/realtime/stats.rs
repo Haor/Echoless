@@ -365,6 +365,20 @@ pub(super) fn ref_pace_loss(ref_stale_drops: u64, ref_input_drops: u64) -> u64 {
     ref_stale_drops.saturating_add(ref_input_drops)
 }
 
+/// Health counters accumulated since the run started.
+///
+/// The per-interval counters in [`RealtimeStats`] reset on every status line
+/// (default 80 ms), so they only show whether the last window had a problem.
+/// These totals are never reset during a run and back the health panel.
+#[derive(Clone, Copy, Debug, Default)]
+struct RunTotals {
+    input_drops: u64,
+    mic_stale_drops: u64,
+    ref_stale_drops: u64,
+    ref_underruns: u64,
+    output_underruns: u64,
+}
+
 pub(super) struct RealtimeStats {
     interval: Duration,
     started: Instant,
@@ -403,6 +417,7 @@ pub(super) struct RealtimeStats {
     output_underruns: u64,
     clock_frames: u64,
     clock_skew: ClockSkewDetector,
+    totals: RunTotals,
     node_process_time_ms: f32,
     node_runtime_errors: u64,
     aec_estimated_delay_ms: i32,
@@ -466,6 +481,7 @@ impl RealtimeStats {
             output_underruns: 0,
             clock_frames: 0,
             clock_skew: ClockSkewDetector::new(config.sample_rate),
+            totals: RunTotals::default(),
             node_process_time_ms: 0.0,
             node_runtime_errors: 0,
             aec_estimated_delay_ms: 0,
@@ -520,6 +536,21 @@ impl RealtimeStats {
         self.ref_underruns += sample.ref_underruns;
         self.output_overruns += sample.output_overruns;
         self.output_underruns += sample.output_underruns;
+        let totals = &mut self.totals;
+        totals.input_drops = totals
+            .input_drops
+            .saturating_add(sample.mic_input_drops)
+            .saturating_add(sample.ref_input_drops);
+        totals.mic_stale_drops = totals
+            .mic_stale_drops
+            .saturating_add(sample.mic_stale_drops);
+        totals.ref_stale_drops = totals
+            .ref_stale_drops
+            .saturating_add(sample.ref_stale_drops);
+        totals.ref_underruns = totals.ref_underruns.saturating_add(sample.ref_underruns);
+        totals.output_underruns = totals
+            .output_underruns
+            .saturating_add(sample.output_underruns);
         self.clock_frames = self.clock_frames.saturating_add(sample.frame_size as u64);
         // Node stats are collected only on frames that print or record diagnostics.
         if !sample.node_stats.is_empty() {
@@ -583,8 +614,12 @@ impl RealtimeStats {
         self.output_underruns = 0;
         self.clock_frames = 0;
         self.node_process_time_ms = 0.0;
-        self.node_diverged = false;
-        self.node_last_error = None;
+        // Keep node_diverged / node_last_error: the processing loop samples
+        // chain stats when `print_due()` is true, but `maybe_print` re-reads
+        // the clock after processing. When the interval elapses between the
+        // two reads, a line prints without fresh node stats; resetting here
+        // made that line report diverged=false and no error (flicker).
+        // Fresh node stats overwrite both values on the next sampled frame.
     }
 
     fn text_line(&self, now: Instant) -> String {
@@ -728,6 +763,11 @@ impl RealtimeStats {
             "ref_underruns": self.ref_underruns,
             "output_underruns": self.output_underruns,
             "output_overruns": self.output_overruns,
+            "input_drops_total": self.totals.input_drops,
+            "mic_stale_drops_total": self.totals.mic_stale_drops,
+            "ref_stale_drops_total": self.totals.ref_stale_drops,
+            "ref_underruns_total": self.totals.ref_underruns,
+            "output_underruns_total": self.totals.output_underruns,
             "output_skew_pct": self.clock_skew.snapshot.output_skew_pct,
             "ref_skew_pct": self.clock_skew.snapshot.ref_skew_pct,
             "clock_skew_warning": self.clock_skew.warning,
@@ -877,6 +917,103 @@ mod tests {
         stats.set_bypassed(false);
         let value = stats.status_value(stats.started + Duration::from_secs(4));
         assert_eq!(value["bypassed"], false);
+    }
+
+    #[test]
+    fn run_totals_survive_per_interval_resets() {
+        let mut stats = RealtimeStats::new(RealtimeStatsConfig {
+            interval: Duration::ZERO,
+            sample_rate: 48_000,
+            frame_ms: 10,
+            near_delay_ms: 0,
+            output_level: 100,
+            bypassed: false,
+            backend: "aec3".into(),
+            algorithmic_latency_ms: 0.0,
+            status_json: true,
+            diagnostics_session_dir: None,
+            diagnostics_status: None,
+        });
+        let frame = [0.0f32; 480];
+        let sample = |output_underruns, ref_underruns, mic_input_drops| StatsSample {
+            algorithmic_latency_ms: 0.0,
+            near_delay_ms: 0,
+            near_delay_buffered_samples: 0,
+            frame_size: 480,
+            near: &frame,
+            far: &frame,
+            out: &frame,
+            mic_q: 0,
+            ref_q: 0,
+            out_q: 0,
+            mic_input_drops,
+            ref_input_drops: 1,
+            mic_stale_drops: 2,
+            ref_stale_drops: 0,
+            ref_underruns,
+            output_overruns: 0,
+            output_underruns,
+            node_stats: &[],
+        };
+
+        // Interval zero: every observe prints a status line and resets the
+        // per-interval counters.
+        stats.observe(&sample(480, 0, 1));
+        stats.observe(&sample(0, 240, 0));
+        stats.observe(&sample(0, 0, 0));
+
+        let value = stats.status_value(Instant::now());
+        assert_eq!(value["output_underruns"], 0);
+        assert_eq!(value["ref_underruns"], 0);
+        assert_eq!(value["output_underruns_total"], 480);
+        assert_eq!(value["ref_underruns_total"], 240);
+        assert_eq!(value["input_drops_total"], 4);
+        assert_eq!(value["mic_stale_drops_total"], 6);
+        assert_eq!(value["ref_stale_drops_total"], 0);
+    }
+
+    #[test]
+    fn node_state_is_kept_when_a_status_line_has_no_fresh_node_stats() {
+        let mut stats = RealtimeStats::new(RealtimeStatsConfig {
+            interval: Duration::ZERO,
+            sample_rate: 48_000,
+            frame_ms: 10,
+            near_delay_ms: 0,
+            output_level: 100,
+            bypassed: false,
+            backend: "aec3".into(),
+            algorithmic_latency_ms: 0.0,
+            status_json: true,
+            diagnostics_session_dir: None,
+            diagnostics_status: None,
+        });
+        stats.node_diverged = true;
+        stats.node_last_error = Some("boom".into());
+        let frame = [0.0f32; 480];
+        stats.observe(&StatsSample {
+            algorithmic_latency_ms: 0.0,
+            near_delay_ms: 0,
+            near_delay_buffered_samples: 0,
+            frame_size: 480,
+            near: &frame,
+            far: &frame,
+            out: &frame,
+            mic_q: 0,
+            ref_q: 0,
+            out_q: 0,
+            mic_input_drops: 0,
+            ref_input_drops: 0,
+            mic_stale_drops: 0,
+            ref_stale_drops: 0,
+            ref_underruns: 0,
+            output_overruns: 0,
+            output_underruns: 0,
+            node_stats: &[],
+        });
+
+        let value = stats.status_value(Instant::now());
+        assert_eq!(value["diverged"], true);
+        assert_eq!(value["last_backend_error"], "boom");
     }
 
     #[test]

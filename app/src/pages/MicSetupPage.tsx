@@ -3,7 +3,7 @@ import type { DeviceList, DoctorAudio, Platform } from "../types";
 import { openUrl } from "../api";
 import { useI18n } from "../i18n";
 import { MIC_DEV_STATES, type MicState } from "../mic";
-import { resolveVirtualRoute } from "../virtualRoute";
+import { isVirtualAudioInput, resolveVirtualRoute } from "../virtualRoute";
 
 // 虚拟麦克风路由诊断/向导。后端 doctor audio 缺增强字段时,从现有字段派生。
 // 路由模型:Echoless 输出 → 虚拟设备 input 端(如 CABLE Input);
@@ -78,8 +78,24 @@ export function MicSetupPage({
   const isLinux = platform === "linux";
   const permDenied = isMac && doctor?.permission_state === "denied";
   const permUndet = isMac && doctor?.permission_state === "undetermined";
+  // Virtual output selected and virtual mic inputs exist, but the automatic
+  // name match failed (renamed/localized endpoints, uncommon drivers). The
+  // driver is installed and the route works once the user picks the mic in
+  // the call app, so treat it as ready with manual guidance.
+  const routeManual =
+    !routeReady && route.selectedIsVirtual && route.hasVirtualInput;
+  const virtualInputNames = routeManual
+    ? (devices?.inputs ?? [])
+        .filter((d) => isVirtualAudioInput(d.name, platform))
+        .map((d) => d.name)
+    : [];
   const micName =
-    micDev?.name ?? (isLinux && !route.counterpartMissing ? LINUX_MONITOR_MIC : "—");
+    micDev?.name ??
+    (routeManual
+      ? t("micManualMicName")
+      : isLinux && !route.counterpartMissing
+        ? LINUX_MONITOR_MIC
+        : "—");
   const devStates = isLinux
     ? MIC_DEV_STATES.filter((s) => s === "missing" || s === "ready")
     : MIC_DEV_STATES;
@@ -88,6 +104,10 @@ export function MicSetupPage({
   // → 路由不完整(incomplete)→ 权限(mac)→ 完成。
   const state: MicState = !doctor
     ? "unknown"
+    : routeManual
+      ? permDenied
+        ? "permission"
+        : "ready"
     : isLinux
       ? routeReady
         ? "ready"
@@ -125,6 +145,31 @@ export function MicSetupPage({
   };
 
   function action() {
+    if (state === "ready" && routeManual) {
+      return (
+        <div className="wzcard">
+          <div className="wzh ok">✓ {t("micManualTitle")}</div>
+          <div className="wznote">{t("micUnmatchedSetupHint")}</div>
+          {virtualInputNames.length > 0 && (
+            <div className="wznote">
+              {t("micManualCandidates")}{" "}
+              {virtualInputNames.map((name, i) => (
+                <span key={`${i}:${name}`}>
+                  {i > 0 ? " · " : ""}
+                  <b style={{ color: "var(--live)" }}>{name}</b>
+                </span>
+              ))}
+            </div>
+          )}
+          {permUndet && <div className="wznote">{t("micPermUndet")}</div>}
+          <div className="wzgo">
+            <button type="button" className="dopen" onClick={onRecheck}>
+              {t("recheck")} <span className="mk">↻</span>
+            </button>
+          </div>
+        </div>
+      );
+    }
     if (state === "ready") {
       return (
         <div className="wzcard">
@@ -177,11 +222,7 @@ export function MicSetupPage({
           <div className="wzh warn">{t("micIncomplete")}</div>
           <div className="wznote">
             {route.selectedIsVirtual && route.counterpartMissing && outDev
-              ? `${outDev.name}: ${
-                  route.hasVirtualInput
-                    ? t("micUnmatchedSetupHint")
-                    : t("micCounterpartMissing")
-                }`
+              ? `${outDev.name}: ${t("micCounterpartMissingHint")}`
               : isMac
                 ? t("micMacRestartHint")
                 : doctor?.needs_reboot

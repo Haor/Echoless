@@ -5,6 +5,31 @@ import type { RuntimeStatus } from "./types";
 export const dash = (v: number | null | undefined, d = 1): string =>
   v == null || !Number.isFinite(v) ? "—" : v.toFixed(d);
 
+// Lost audio in pipeline sample frames -> "12 ms". Unknown rate -> raw frames.
+export function formatLostAudio(frames: number, sampleRate: number | null): string {
+  if (!sampleRate) return String(frames);
+  const ms = (frames / sampleRate) * 1000;
+  if (frames > 0 && ms < 1) return "<1 ms";
+  return `${Math.round(ms)} ms`;
+}
+
+// Seconds -> "m:ss" or "h:mm:ss".
+export function formatRunClock(seconds: number): string {
+  const total = Math.max(0, Math.floor(seconds));
+  const h = Math.floor(total / 3600);
+  const m = Math.floor((total % 3600) / 60);
+  const s = String(total % 60).padStart(2, "0");
+  return h > 0 ? `${h}:${String(m).padStart(2, "0")}:${s}` : `${m}:${s}`;
+}
+
+export type HealthVerdict = "idle" | "waiting" | "ok" | "issue";
+
+export function healthVerdict(health: Health, running: boolean): HealthVerdict {
+  if (!running) return "idle";
+  if (health.elapsed_s == null) return "waiting";
+  return health.last_issue_s == null && !health.diverged ? "ok" : "issue";
+}
+
 export type RunStatusKind = "live" | "noref" | "warn" | "bypass" | "stopped";
 
 export interface RunStatusInputs {
@@ -23,6 +48,7 @@ export interface Live {
   seq: number;
 }
 
+// Drop/underrun counters are run totals in pipeline sample frames.
 export interface Health {
   input_drops: number;
   ref_underruns: number;
@@ -31,6 +57,13 @@ export interface Health {
   ref_stale_drops: number;
   stale_drops: number;
   runtime_errors: number;
+  // Backend run clock and pipeline rate from the latest status line;
+  // null until the first status line of a run arrives.
+  elapsed_s: number | null;
+  sample_rate: number | null;
+  // Run clock (elapsed_s) of the latest status interval with an audible
+  // problem: mic/output dropouts, runtime errors or divergence.
+  last_issue_s: number | null;
   diverged: boolean;
   // 时钟漂移:输出时钟相对麦克风时钟的偏差百分比 + 后端告警位(带滞回)。
   clock_skew_pct: number | null;
@@ -59,6 +92,9 @@ const ZERO_HEALTH: Health = {
   ref_stale_drops: 0,
   stale_drops: 0,
   runtime_errors: 0,
+  elapsed_s: null,
+  sample_rate: null,
+  last_issue_s: null,
   diverged: false,
   clock_skew_pct: null,
   clock_skew_warning: false,
@@ -218,14 +254,30 @@ export function publishRuntimeStatus(
   nowMs = performance.now(),
 ) {
   liveSnapshot = statusToLive(s);
+  // Per-interval counters reset on every status line; the *_total fields are
+  // run totals. Older CLIs only send the per-interval values.
+  const micStale = s.mic_stale_drops_total ?? s.mic_stale_drops ?? 0;
+  const refStale = s.ref_stale_drops_total ?? s.ref_stale_drops ?? 0;
+  const runtimeErrors = s.runtime_errors ?? 0;
+  const elapsed = Number.isFinite(s.elapsed_s) ? s.elapsed_s : null;
+  const audibleIssue =
+    (s.input_drops ?? 0) > 0 ||
+    (s.mic_stale_drops ?? 0) > 0 ||
+    (s.output_underruns ?? 0) > 0 ||
+    runtimeErrors > healthSnapshot.runtime_errors ||
+    Boolean(s.diverged);
   healthSnapshot = {
-    input_drops: s.input_drops ?? 0,
-    ref_underruns: s.ref_underruns ?? 0,
-    output_underruns: s.output_underruns ?? 0,
-    mic_stale_drops: s.mic_stale_drops ?? 0,
-    ref_stale_drops: s.ref_stale_drops ?? 0,
-    stale_drops: s.stale_drops ?? 0,
-    runtime_errors: s.runtime_errors ?? 0,
+    input_drops: s.input_drops_total ?? s.input_drops ?? 0,
+    ref_underruns: s.ref_underruns_total ?? s.ref_underruns ?? 0,
+    output_underruns: s.output_underruns_total ?? s.output_underruns ?? 0,
+    mic_stale_drops: micStale,
+    ref_stale_drops: refStale,
+    stale_drops: micStale + refStale,
+    runtime_errors: runtimeErrors,
+    elapsed_s: elapsed,
+    sample_rate:
+      Number.isFinite(s.sample_rate) && s.sample_rate > 0 ? s.sample_rate : null,
+    last_issue_s: audibleIssue ? (elapsed ?? 0) : healthSnapshot.last_issue_s,
     diverged: Boolean(s.diverged),
     clock_skew_pct: Number.isFinite(s.output_skew_pct as number)
       ? (s.output_skew_pct as number)
@@ -245,8 +297,12 @@ export function useRuntimeLive(): Live {
   return useSyncExternalStore(subscribe, () => liveSnapshot, () => ZERO_LIVE);
 }
 
+export function getRuntimeHealth(): Health {
+  return healthSnapshot;
+}
+
 export function useRuntimeHealth(): Health {
-  return useSyncExternalStore(subscribe, () => healthSnapshot, () => ZERO_HEALTH);
+  return useSyncExternalStore(subscribe, getRuntimeHealth, () => ZERO_HEALTH);
 }
 
 export function useRunStatusKind(
