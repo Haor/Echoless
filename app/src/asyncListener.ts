@@ -15,13 +15,15 @@ export function createAsyncListenerScope() {
     ): void {
       void register((...args) => {
         if (alive) handler(...args);
-      }).then((unlisten) => {
-        if (!alive) {
-          unlisten();
-          return;
-        }
-        unlisteners.push(unlisten);
-      });
+      })
+        .then((unlisten) => {
+          if (!alive) {
+            unlisten();
+            return;
+          }
+          unlisteners.push(unlisten);
+        })
+        .catch(() => {});
     },
     dispose(): void {
       if (!alive) return;

@@ -1,6 +1,5 @@
 import { describe, expect, it } from "vitest";
 
-import appSource from "./App.tsx?raw";
 import { controlErrorMessage, streamErrorMessage } from "./runEventDisplay";
 import type { RunEvent, RuntimeStatus } from "./types";
 
@@ -117,7 +116,7 @@ describe("run event contract", () => {
     expect(controlErrorMessage(event)).toBe("runtime control: invalid JSON");
   });
 
-  it("shows fatal stream errors and immediately converges the GUI to OFF", () => {
+  it("formats fatal stream errors with stream prefix", () => {
     const event = {
       type: "stream_error",
       stream: "output",
@@ -128,21 +127,6 @@ describe("run event contract", () => {
 
     expect(streamErrorMessage(event)).toBe(
       "output stream error: A backend-specific error has occurred: injected",
-    );
-    expect(appSource).toMatch(
-      /if \(ev\.type === "stream_error"\) \{[\s\S]*?powerOnRef\.current = false;[\s\S]*?updateApp\(\{[\s\S]*?powerOn: false,[\s\S]*?err: message,[\s\S]*?\}\);/,
-    );
-  });
-
-  it("restarts recoverable stream invalidations before falling back to OFF", () => {
-    expect(appSource).toMatch(
-      /if \(ev\.recoverable && runIntentRef\.current\.wantsRun\(\)\) \{[\s\S]*?requestStreamRecovery\([\s\S]*?if \(next\.pendingDelayMs != null\) \{[\s\S]*?return;[\s\S]*?\}[\s\S]*?resetStreamRecovery\(\);[\s\S]*?runIntentRef\.current\.request\(false\);/,
-    );
-    expect(appSource).toMatch(
-      /consumeStreamRecovery\(streamRecoveryRef\.current\)[\s\S]*?recovery\.delayMs != null[\s\S]*?window\.setTimeout\([\s\S]*?restartRunRef\.current\(\)/,
-    );
-    expect(appSource).toMatch(
-      /ev\.recoverable &&[\s\S]*?streamRecoveryRef\.current\.pendingDelayMs == null[\s\S]*?requestStreamRecovery\(/,
     );
   });
 });

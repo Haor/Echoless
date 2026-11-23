@@ -328,9 +328,6 @@ export function outputLevelToGain(level: number): number {
   const v = Math.max(0, Math.min(100, level));
   return Math.pow(v / OUTPUT_LEVEL_UNITY, OUTPUT_LEVEL_EXP);
 }
-export interface DiagnosticsCfg {
-  max_seconds: number | null;
-}
 export interface ConfigChoice {
   mic: string; // selector / stable_id / "default"
   output: string;
@@ -340,7 +337,6 @@ export interface ConfigChoice {
   noiseParams?: Record<string, unknown>; // selected shared NS node parameters
   pipeline: PipelineCfg;
   params: Record<string, unknown>; // chain[0] 参数(不含 reference_channels)
-  diagnostics?: DiagnosticsCfg | null; // 开启录制时写入 [diagnostics]
   bypass?: boolean;
 }
 
@@ -405,13 +401,6 @@ export function buildConfigToml(c: ConfigChoice): string {
   lines.push(`output_level = ${c.pipeline.output_level ?? OUTPUT_LEVEL_UNITY}`);
   if (c.bypass) lines.push(`bypass = true`);
   lines.push(``);
-  if (c.diagnostics) {
-    lines.push(`[diagnostics]`);
-    lines.push(`enabled = true`);
-    if (c.diagnostics.max_seconds != null)
-      lines.push(`max_seconds = ${c.diagnostics.max_seconds}`);
-    lines.push(``);
-  }
   lines.push(`[[chain]]`, `kind = ${tomlString(c.kind)}`);
   for (const [k, raw] of Object.entries(c.params)) {
     if (k === "reference_channels") continue; // 顶层管线项,不重复

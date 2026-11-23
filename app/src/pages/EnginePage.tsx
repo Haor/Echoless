@@ -7,16 +7,12 @@ import type {
   Processor,
 } from "../types";
 import {
-  downloadLocalvqeModel,
-  localvqeAssets,
   macSystemInfo,
-  onLocalvqeProgress,
   openPath,
   type LocalvqeAssets,
   type MacSystemInfo,
 } from "../api";
 import { useI18n } from "../i18n";
-import { createAsyncListenerScope } from "../asyncListener";
 
 // macOS 主版本号 → 代号(sw_vers 只给版本号,代号本地映射)。落不到映射时只显版本号。
 function macOsName(version?: string | null): string | null {
@@ -143,6 +139,11 @@ interface Props {
   onSelect: (kind: string) => void;
   onPickModel: (path: string) => void;
   localvqeModel: string | null;
+  lvAssets: LocalvqeAssets | null;
+  lvDl: Record<string, number | null>;
+  lvErr: string | null;
+  onDownloadModel: (file: string) => void;
+  onRefreshLvAssets: () => void;
   onRecheck: () => void;
   onSetup: () => void;
 }
@@ -358,58 +359,34 @@ export function EnginePage({
   onSelect,
   onPickModel,
   localvqeModel,
+  lvAssets,
+  lvDl,
+  lvErr,
+  onDownloadModel,
+  onRefreshLvAssets,
   onRecheck,
   onSetup,
 }: Props) {
   const { t, lang } = useI18n();
 
-  // Available LocalVQE models/native runtime.
-  const [lvAssets, setLvAssets] = useState<LocalvqeAssets | null>(null);
-  // 按文件名跟踪在下载的模型:键存在=下载中,值=百分比(null=还没进度)。
-  // 单槽会串台——点了 B 就把 A 的按钮重新启用,允许对 A 发起第二次并发下载,
-  // 两个下载写同一个 .part 互相踩,导致大小/SHA 不匹配。
-  const [lvDl, setLvDl] = useState<Record<string, number | null>>({});
-  const [lvErr, setLvErr] = useState<string | null>(null);
   useEffect(() => {
-    localvqeAssets().then(setLvAssets).catch(() => {});
-  }, []);
-  // 下载进度事件:只更新仍在下载的文件的百分比。
-  useEffect(() => {
-    const listeners = createAsyncListenerScope();
-    listeners.listen(onLocalvqeProgress, (p) => {
-      setLvDl((cur) =>
-        p.filename in cur ? { ...cur, [p.filename]: p.pct } : cur,
-      );
-    });
-    return () => listeners.dispose();
-  }, []);
-  async function downloadModel(file: string) {
-    // 同名下载进行中则忽略(按钮已 disabled,这里再兜一层快速双击竞态)。
-    if (file in lvDl) return;
-    setLvDl((cur) => ({ ...cur, [file]: null }));
-    setLvErr(null);
-    try {
-      const path = await downloadLocalvqeModel(file);
-      onPickModel(path);
-      setLvAssets(await localvqeAssets());
-    } catch (e) {
-      setLvErr(String(e));
-    } finally {
-      setLvDl((cur) => {
-        const next = { ...cur };
-        delete next[file];
-        return next;
-      });
-    }
-  }
+    onRefreshLvAssets();
+  }, [onRefreshLvAssets]);
+
   const proc = (k: string) => processors.find((p) => p.kind === k);
   // 开发态(dev)临时解开 NVAFX 平台/doctor 门槛,用于走通前端流程。
   const supported = (k: string) =>
     dev || (proc(k)?.platforms.includes(platform) ?? true);
-  // 就绪判定:AEC3 永远就绪;LocalVQE 需模型;NVAFX 需 doctor 通过(dev 跳过)。
+  // 就绪判定:AEC3 永远就绪;LocalVQE 需模型文件实际存在且 native_ready;NVAFX 需 doctor 通过(dev 跳过)。
   const ready = (k: string): boolean => {
     if (!supported(k)) return false;
-    if (k === "localvqe") return Boolean(localvqeModel && lvAssets?.native_ready);
+    if (k === "localvqe") {
+      return Boolean(
+        localvqeModel &&
+          lvAssets?.native_ready &&
+          lvAssets.models.some((m) => m.path === localvqeModel),
+      );
+    }
     if (k === "nvidia_afx_aec") return dev || Boolean(doctor?.ok);
     return true;
   };
@@ -451,7 +428,7 @@ export function EnginePage({
             onClick={(e) => {
               e.stopPropagation();
               if (selected) return;
-              found ? onPickModel(found.path) : downloadModel(m.file);
+              found ? onPickModel(found.path) : onDownloadModel(m.file);
             }}
             title={`${m.ver} · ${m.params} · ${t(m.descriptionKey)}`}
           >

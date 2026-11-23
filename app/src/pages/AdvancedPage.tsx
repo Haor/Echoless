@@ -513,6 +513,8 @@ export function AdvancedPage({
       <Field
         value={val}
         numeric={spec.type === "number"}
+        min={spec.min}
+        max={spec.max}
         placeholder={spec.required ? "required" : t("auto")}
         onCommit={(v) => onChange(key, v)}
       />

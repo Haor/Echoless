@@ -1,6 +1,7 @@
 import {
   cloneElement,
   isValidElement,
+  useEffect,
   useRef,
   useState,
   type ReactElement,
@@ -37,6 +38,7 @@ export function Hint({
     null,
   );
   const timer = useRef<number | undefined>(undefined);
+  useEffect(() => () => clearTimeout(timer.current), []);
   if (!text) return <>{children}</>;
 
   const onEnter = (e: React.MouseEvent) => {
