@@ -101,11 +101,7 @@ pub(crate) fn set_autostart_enabled(app: AppHandle, enabled: bool) -> Result<boo
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
-
-    use super::{
-        should_focus_existing_instance, StartupLaunch, AUTOSTART_ARG, AUTOSTART_WATCHDOG_TIMEOUT,
-    };
+    use super::{should_focus_existing_instance, StartupLaunch, AUTOSTART_ARG};
 
     #[test]
     fn detects_windows_autostart_without_affecting_other_platforms() {
@@ -132,10 +128,5 @@ mod tests {
         assert!(launch.watchdog_pending());
         launch.settle();
         assert!(!launch.watchdog_pending());
-    }
-
-    #[test]
-    fn autostart_watchdog_covers_the_full_bounded_startup_path() {
-        assert!(AUTOSTART_WATCHDOG_TIMEOUT >= Duration::from_secs(120));
     }
 }

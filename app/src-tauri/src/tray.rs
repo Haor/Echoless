@@ -1,14 +1,10 @@
 use std::sync::atomic::{AtomicBool, Ordering};
-#[cfg(target_os = "windows")]
-use std::sync::Mutex;
-#[cfg(target_os = "windows")]
-use std::sync::MutexGuard;
 
 use tauri::State;
 #[cfg(target_os = "windows")]
 use tauri::{
     menu::{Menu, MenuItem, PredefinedMenuItem},
-    tray::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent},
+    tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
 };
 #[cfg(desktop)]
 use tauri::{AppHandle, Manager};
@@ -16,58 +12,16 @@ use tauri::{AppHandle, Manager};
 #[cfg(target_os = "windows")]
 use crate::proc::{terminate_run, RunState};
 
-#[cfg(target_os = "windows")]
-pub(crate) struct TrayIconState(pub(crate) Mutex<Option<TrayIcon>>);
-
 /// Windows tray preferences pushed by the frontend at startup and on change.
-/// 只剩「关闭到托盘」——最小化到托盘已退役(用户定案 2026-07-05)。
+/// 只剩「关闭到托盘」——最小化到托盘已退役。
+#[derive(Default)]
 pub(crate) struct TrayPrefs {
-    pub(crate) close_to_tray: AtomicBool,
+    close_to_tray: AtomicBool,
 }
 
-impl Default for TrayPrefs {
-    fn default() -> Self {
-        Self {
-            close_to_tray: AtomicBool::new(false),
-        }
-    }
-}
-
-#[cfg(target_os = "windows")]
-fn tray_icon_state_guard(state: &TrayIconState) -> MutexGuard<'_, Option<TrayIcon>> {
-    state
-        .0
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-}
-
-pub(crate) fn set_tray_prefs_inner(prefs: &TrayPrefs, close_to_tray: bool) {
-    #[cfg(target_os = "windows")]
-    {
-        prefs.close_to_tray.store(close_to_tray, Ordering::SeqCst);
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        let _ = close_to_tray;
-        prefs.close_to_tray.store(false, Ordering::SeqCst);
-    }
-}
-
-fn tray_pref_enabled(value: &AtomicBool) -> bool {
-    let stored = value.load(Ordering::SeqCst);
-    #[cfg(target_os = "windows")]
-    {
-        stored
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        let _ = stored;
-        false
-    }
-}
-
+/// Close-to-tray only exists on Windows, the only platform with a tray icon.
 pub(crate) fn close_to_tray_enabled(prefs: &TrayPrefs) -> bool {
-    tray_pref_enabled(&prefs.close_to_tray)
+    prefs.close_to_tray.load(Ordering::SeqCst)
 }
 
 fn tray_tooltip(running: bool) -> &'static str {
@@ -79,19 +33,12 @@ fn tray_tooltip(running: bool) -> &'static str {
 }
 
 pub(crate) fn update_tray_tooltip(app: &tauri::AppHandle, running: bool) {
-    let tooltip = tray_tooltip(running);
     #[cfg(target_os = "windows")]
-    {
-        let tray_state = app.state::<TrayIconState>();
-        let tray = tray_icon_state_guard(&tray_state).clone();
-        if let Some(tray) = tray {
-            let _ = tray.set_tooltip(Some(tooltip));
-        }
+    if let Some(tray) = app.tray_by_id(TRAY_ID) {
+        let _ = tray.set_tooltip(Some(tray_tooltip(running)));
     }
     #[cfg(not(target_os = "windows"))]
-    {
-        let _ = (app, tooltip);
-    }
+    let _ = (app, tray_tooltip(running));
 }
 
 #[cfg(target_os = "windows")]
@@ -146,13 +93,15 @@ pub(crate) fn register_windows_tray(app: &mut tauri::App) -> tauri::Result<()> {
         builder = builder.icon(icon);
     }
 
-    let tray = builder.build(app)?;
-    let tray_state = app.state::<TrayIconState>();
-    *tray_icon_state_guard(&tray_state) = Some(tray);
+    // The app keeps the built tray icon; it is looked up again by TRAY_ID.
+    builder.build(app)?;
     Ok(())
 }
 
 #[tauri::command]
 pub(crate) fn set_tray_prefs(prefs: State<TrayPrefs>, close_to_tray: bool) {
-    set_tray_prefs_inner(&prefs, close_to_tray);
+    prefs.close_to_tray.store(
+        cfg!(target_os = "windows") && close_to_tray,
+        Ordering::SeqCst,
+    );
 }

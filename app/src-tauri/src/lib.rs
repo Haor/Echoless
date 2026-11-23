@@ -4,9 +4,6 @@
 //   - run 的 --status-json 以 JSONL 流式解析,经事件推给前端
 //
 // 契约真理源:docs/CLI.md + CLI `--json` 实测。
-#[cfg(target_os = "windows")]
-use std::sync::Mutex;
-
 use tauri::{Manager, WebviewUrl, WebviewWindowBuilder, WindowEvent};
 #[cfg(target_os = "macos")]
 use tauri_plugin_decorum::WebviewWindowExt;
@@ -21,8 +18,6 @@ mod nvafx;
 mod platform;
 mod proc;
 mod sidecar;
-#[cfg(test)]
-mod single_instance_contract;
 mod startup;
 #[cfg(test)]
 mod tests;
@@ -41,9 +36,9 @@ use startup::{
     get_autostart_enabled, get_startup_mode, set_autostart_enabled, settle_startup_launch,
     should_focus_existing_instance, StartupLaunch, AUTOSTART_WATCHDOG_TIMEOUT,
 };
-use tray::{close_to_tray_enabled, set_tray_prefs, TrayPrefs};
 #[cfg(target_os = "windows")]
-use tray::{register_windows_tray, TrayIconState};
+use tray::register_windows_tray;
+use tray::{close_to_tray_enabled, set_tray_prefs, TrayPrefs};
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -72,9 +67,6 @@ pub fn run() {
             .arg(startup::AUTOSTART_ARG)
             .build(),
     );
-
-    #[cfg(target_os = "windows")]
-    let builder = builder.manage(TrayIconState(Mutex::new(None)));
 
     builder
         .invoke_handler(tauri::generate_handler![

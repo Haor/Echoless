@@ -3,6 +3,7 @@ use std::io::ErrorKind;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use tauri::Manager;
@@ -17,13 +18,17 @@ pub(crate) fn transient_config_dir(app: &tauri::AppHandle) -> Result<PathBuf, St
     Ok(dir)
 }
 
-fn transient_config_path(dir: &Path, label: &str, attempt: usize) -> PathBuf {
+/// The pid and an in-process counter make the name unique; `create_new`
+/// still refuses to overwrite anything that exists.
+fn transient_config_path(dir: &Path, label: &str) -> PathBuf {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_nanos())
         .unwrap_or(0);
+    let sequence = NEXT.fetch_add(1, Ordering::Relaxed);
     dir.join(format!(
-        "echoless-{label}-{}-{nanos}-{attempt}.toml",
+        "echoless-{label}-{}-{nanos}-{sequence}.toml",
         std::process::id()
     ))
 }
@@ -58,19 +63,9 @@ pub(crate) fn write_transient_config_toml(
     label: &str,
     toml_text: &str,
 ) -> Result<PathBuf, String> {
-    for attempt in 0..16 {
-        let path = transient_config_path(dir, label, attempt);
-        match write_toml_create_new(&path, toml_text) {
-            Ok(()) => return Ok(path),
-            Err(err) if path.exists() => {
-                if attempt == 15 {
-                    return Err(err);
-                }
-            }
-            Err(err) => return Err(err),
-        }
-    }
-    Err("failed to create a unique config file".to_string())
+    let path = transient_config_path(dir, label);
+    write_toml_create_new(&path, toml_text)?;
+    Ok(path)
 }
 
 pub(crate) fn cleanup_run_config(path: &Path) {
