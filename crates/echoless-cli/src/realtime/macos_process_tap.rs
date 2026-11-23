@@ -55,11 +55,13 @@ struct ProcessTapStartConfig {
 impl Drop for MacProcessTapStream {
     fn drop(&mut self) {
         self.running.store(false, Ordering::SeqCst);
+        // SIGKILL: the helper's signal handlers do not run; coreaudiod releases its
+        // private tap and aggregate device when the process exits.
         let _ = self.child.kill();
         // kill 关闭 helper stdout 后,reader 的 read 返回 0 自然退出。但 helper
         // 若陷入内核不可中断状态,SIGKILL 延迟生效,无限期 join 会拖住整个
-        // 停机(审计 B-19)。限时等待:超时则不 join 也不 wait(阻塞),reader
-        // 线程随本进程退出回收;孤儿 helper 由其 getppid 自愈兜底(B-01)。
+        // 停机。限时等待:超时则不 join 也不 wait(阻塞),reader
+        // 线程随本进程退出回收;孤儿 helper 由其 getppid 自愈兜底。
         let mut exited = false;
         for _ in 0..20 {
             match self.child.try_wait() {
@@ -100,11 +102,11 @@ pub fn helper_path() -> Result<PathBuf> {
     if let Some(path) = current_exe_neighbor("echoless-process-tap-poc")? {
         return Ok(path);
     }
-    if let Some(path) = current_exe_neighbor("echoless-process-tap")? {
-        return Ok(path);
-    }
 
-    for base in current_dir_ancestors()? {
+    // Development builds only: never execute a helper found by walking up from CWD
+    // in a release binary.
+    #[cfg(debug_assertions)]
+    for base in env::current_dir()?.ancestors() {
         let candidate = base.join(DEV_HELPER);
         if candidate.is_file() {
             return Ok(candidate);
@@ -128,12 +130,9 @@ pub fn preflight_permission() -> Option<&'static str> {
     if !output.status.success() {
         return None;
     }
+    // The bundled helper reports non-granted TCC states as "undetermined".
     match String::from_utf8_lossy(&output.stdout).trim() {
         "granted" => Some("granted"),
-        // Current helper intentionally maps private-TCC denied/unknown outputs to
-        // "undetermined" so the UI can use the request path first. Keep this arm
-        // defensive for older helpers or future contract changes.
-        "denied" => Some("denied"),
         "undetermined" => Some("undetermined"),
         _ => None,
     }
@@ -176,6 +175,7 @@ pub fn start<P>(
     producer: P,
     drops: Arc<AtomicU64>,
     running: Arc<AtomicBool>,
+    stream_failed: Arc<AtomicBool>,
     status_json: bool,
 ) -> Result<MacProcessTapStream>
 where
@@ -192,7 +192,10 @@ where
         producer,
         drops,
         running,
-        move |message| emit_process_tap_failure(status_json, message),
+        move |message| {
+            stream_failed.store(true, Ordering::SeqCst);
+            emit_process_tap_failure(status_json, message);
+        },
     )
 }
 
@@ -321,7 +324,7 @@ where
     }
     let mut resampler = if header.sample_rate != target_rate {
         eprintln!(
-            "macOS Process Tap: system output {} Hz != pipeline {target_rate} Hz; enabling rubato resampling",
+            "macOS Process Tap: system output {} Hz != pipeline {target_rate} Hz; resampling the reference",
             header.sample_rate
         );
         Some(InterleavedInputResampler::new(
@@ -434,6 +437,7 @@ fn emit_process_tap_failure(status_json: bool, message: String) {
                 "stream": "reference",
                 "message": message,
                 "fatal": true,
+                "recoverable": false,
             })
             .to_string(),
         );
@@ -463,11 +467,6 @@ fn current_exe_neighbor(name: &str) -> Result<Option<PathBuf>> {
     };
     let candidate = dir.join(name);
     Ok(candidate.is_file().then_some(candidate))
-}
-
-fn current_dir_ancestors() -> Result<Vec<PathBuf>> {
-    let cwd = env::current_dir()?;
-    Ok(cwd.ancestors().map(Path::to_path_buf).collect())
 }
 
 #[cfg(test)]
@@ -574,14 +573,7 @@ mod tests {
         )
     }
 
-    #[test]
-    fn current_dir_ancestors_includes_current_directory() {
-        let cwd = env::current_dir().unwrap();
-        let ancestors = current_dir_ancestors().unwrap();
-        assert_eq!(ancestors.first(), Some(&cwd));
-    }
-
-    // 审计 B-05:流头声道数与请求不一致时以头为准,逐帧下混到请求布局。
+    // 流头声道数与请求不一致时以头为准,逐帧下混到请求布局。
     #[test]
     fn stream_header_channel_mismatch_downmixes_to_requested_layout() {
         let mut bytes = stream_header(48_000, 2); // tap 实际 stereo

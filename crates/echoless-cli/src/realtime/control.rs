@@ -165,8 +165,12 @@ fn parse_runtime_control_command(line: &str) -> Result<RuntimeControlCommand> {
     }
 }
 
+/// A diagnostics recorder being created off the audio thread, with its `max_seconds`.
+pub(super) type PendingDiagnostic = Receiver<(Option<u32>, Result<Option<DiagnosticRecorder>>)>;
+
 pub(super) struct RuntimeControlContext<'a> {
     pub(super) diagnostic: &'a mut Option<DiagnosticRecorder>,
+    pub(super) pending_diagnostic: &'a mut Option<PendingDiagnostic>,
     pub(super) stats: Option<&'a mut RealtimeStats>,
     pub(super) chain: &'a mut ProcessorChain,
     pub(super) sample_rate: u32,
@@ -185,6 +189,7 @@ pub(super) fn handle_runtime_controls(
     control: &mut Option<Receiver<RuntimeControlEvent>>,
     mut ctx: RuntimeControlContext<'_>,
 ) {
+    install_pending_diagnostic(&mut ctx);
     let Some(receiver) = control.as_mut() else {
         return;
     };
@@ -195,6 +200,7 @@ pub(super) fn handle_runtime_controls(
                     command,
                     RuntimeControlCommandContext {
                         diagnostic: ctx.diagnostic,
+                        pending_diagnostic: ctx.pending_diagnostic,
                         stats: ctx.stats.as_deref_mut(),
                         chain: ctx.chain,
                         sample_rate: ctx.sample_rate,
@@ -214,9 +220,9 @@ pub(super) fn handle_runtime_controls(
             }
             Err(TryRecvError::Empty) => break,
             Err(TryRecvError::Disconnected) => {
-                // stdin 关闭 = 停机契约(审计 B-01):GUI 优雅停止先关 stdin;
-                // GUI 崩溃/被杀时管道同样关闭。两种情况都收敛停机,
-                // 避免孤儿 CLI 继续占用麦克风/虚拟麦/Process Tap helper。
+                // stdin EOF is the stop contract: the GUI closes stdin to stop, and a
+                // crashed GUI closes the pipe too, so no orphan CLI keeps the devices.
+                eprintln!("stdin closed; stopping");
                 *control = None;
                 ctx.running.store(false, Ordering::SeqCst);
                 break;
@@ -225,8 +231,47 @@ pub(super) fn handle_runtime_controls(
     }
 }
 
+fn install_pending_diagnostic(ctx: &mut RuntimeControlContext<'_>) {
+    let Some(pending) = ctx.pending_diagnostic.as_ref() else {
+        return;
+    };
+    let (max_seconds, result) = match pending.try_recv() {
+        Ok(created) => created,
+        Err(TryRecvError::Empty) => return,
+        Err(TryRecvError::Disconnected) => {
+            (None, Err(anyhow::anyhow!("recorder setup thread exited")))
+        }
+    };
+    *ctx.pending_diagnostic = None;
+    match result.and_then(|recorder| recorder.context("diagnostics recorder was not created")) {
+        Ok(recorder) => {
+            let session_dir = recorder.session_dir_string();
+            let status = recorder.status_handle();
+            if let Some(stats) = ctx.stats.as_deref_mut() {
+                stats.set_diagnostics(Some(session_dir.clone()), Some(status));
+            }
+            *ctx.diagnostic = Some(recorder);
+            emit_runtime_json(
+                ctx.status_json,
+                json!({
+                    "type": "diagnostics_started",
+                    "session_dir": session_dir,
+                    "max_seconds": max_seconds,
+                    "recording": true,
+                }),
+            );
+        }
+        Err(err) => emit_control_error(
+            ctx.status_json,
+            Some("start_diagnostics"),
+            format!("failed to start diagnostics: {err:#}"),
+        ),
+    }
+}
+
 struct RuntimeControlCommandContext<'a> {
     diagnostic: &'a mut Option<DiagnosticRecorder>,
+    pending_diagnostic: &'a mut Option<PendingDiagnostic>,
     stats: Option<&'a mut RealtimeStats>,
     chain: &'a mut ProcessorChain,
     sample_rate: u32,
@@ -254,10 +299,11 @@ fn handle_runtime_control_command(
                 );
                 return;
             }
-            if ctx
-                .diagnostic
-                .as_ref()
-                .is_some_and(DiagnosticRecorder::is_recording)
+            if ctx.pending_diagnostic.is_some()
+                || ctx
+                    .diagnostic
+                    .as_ref()
+                    .is_some_and(DiagnosticRecorder::is_recording)
             {
                 emit_control_error(
                     ctx.status_json,
@@ -267,47 +313,36 @@ fn handle_runtime_control_command(
                 return;
             }
 
-            let _previous = ctx.diagnostic.take();
-            let node_stats = ctx.chain.stats();
-            match DiagnosticRecorder::new(DiagnosticRecorderConfig {
-                enabled: true,
-                max_seconds,
-                sample_rate: ctx.sample_rate,
-                reference_channels: ctx.reference_channels,
-                frame_ms: ctx.frame_ms,
-                near_delay_ms: *ctx.near_delay_ms,
-                output_level: *ctx.output_level,
-                node_stats: &node_stats,
-                status_json: ctx.status_json,
-            }) {
-                Ok(Some(recorder)) => {
-                    let session_dir = recorder.session_dir_string();
-                    let status = recorder.status_handle();
-                    if let Some(stats) = ctx.stats {
-                        stats.set_diagnostics(Some(session_dir.clone()), Some(status));
-                    }
-                    *ctx.diagnostic = Some(recorder);
-                    emit_runtime_json(
-                        ctx.status_json,
-                        json!({
-                            "type": "diagnostics_started",
-                            "session_dir": session_dir,
-                            "max_seconds": max_seconds,
-                            "recording": true,
-                        }),
-                    );
-                }
-                Ok(None) => emit_control_error(
-                    ctx.status_json,
-                    Some("start_diagnostics"),
-                    "diagnostics recorder was not created",
-                ),
-                Err(err) => emit_control_error(
-                    ctx.status_json,
-                    Some("start_diagnostics"),
-                    format!("failed to start diagnostics: {err:#}"),
-                ),
+            // Creating files and joining the previous writer would block the 10 ms
+            // audio loop, so both run on short-lived threads. The new recorder is
+            // installed by the next handle_runtime_controls call that sees it.
+            if let Some(previous) = ctx.diagnostic.take() {
+                thread::spawn(move || drop(previous));
             }
+            let node_stats = ctx.chain.stats();
+            let (sample_rate, reference_channels, frame_ms, status_json) = (
+                ctx.sample_rate,
+                ctx.reference_channels,
+                ctx.frame_ms,
+                ctx.status_json,
+            );
+            let (near_delay_ms, output_level) = (*ctx.near_delay_ms, *ctx.output_level);
+            let (sender, receiver) = channel();
+            thread::spawn(move || {
+                let created = DiagnosticRecorder::new(DiagnosticRecorderConfig {
+                    enabled: true,
+                    max_seconds,
+                    sample_rate,
+                    reference_channels,
+                    frame_ms,
+                    near_delay_ms,
+                    output_level,
+                    node_stats: &node_stats,
+                    status_json,
+                });
+                let _ = sender.send((max_seconds, created));
+            });
+            *ctx.pending_diagnostic = Some(receiver);
         }
         RuntimeControlCommand::StopDiagnostics => {
             let Some(recorder) = ctx.diagnostic.as_mut() else {
@@ -488,7 +523,7 @@ fn emit_control_error(
 
 fn emit_runtime_json(status_json: bool, value: Value) {
     if status_json {
-        // 审计 B-02:命令回执在音频处理线程发出,走异步发射器,不同步碰 stdout。
+        // Replies are sent from the audio thread, so they go through the async emitter.
         emit_stdout_line(value.to_string());
     } else {
         eprintln!("{value}");
@@ -593,15 +628,54 @@ mod tests {
     }
 
     #[test]
-    fn runtime_control_capabilities_match_frontend_commands() {
-        assert!(SUPPORTED_RUNTIME_CONTROLS.contains(&"start_diagnostics"));
-        assert!(SUPPORTED_RUNTIME_CONTROLS.contains(&"stop_diagnostics"));
-        assert!(SUPPORTED_RUNTIME_CONTROLS.contains(&"set_output_level"));
-        assert!(SUPPORTED_RUNTIME_CONTROLS.contains(&"set_bypass"));
-        assert!(SUPPORTED_RUNTIME_CONTROLS.contains(&"set_near_delay_ms"));
-        assert!(SUPPORTED_RUNTIME_CONTROLS.contains(&"set_initial_delay_ms"));
-        assert!(SUPPORTED_RUNTIME_CONTROLS.contains(&"set_aec3_agc"));
-        assert!(SUPPORTED_RUNTIME_CONTROLS.contains(&"set_localvqe_noise_gate"));
+    fn every_advertised_runtime_control_is_parsed() {
+        for cmd in SUPPORTED_RUNTIME_CONTROLS {
+            let err = parse_runtime_control_command(&json!({ "cmd": cmd }).to_string())
+                .err()
+                .map(|err| err.to_string())
+                .unwrap_or_default();
+            assert!(
+                !err.contains("unknown runtime control command"),
+                "{cmd} is advertised but not parsed"
+            );
+        }
+    }
+
+    #[test]
+    fn stdin_eof_stops_the_run() {
+        let (sender, receiver) = channel();
+        drop(sender);
+        let mut control = Some(receiver);
+        let running = AtomicBool::new(true);
+        let mut diagnostic = None;
+        let mut pending_diagnostic = None;
+        let mut chain = ProcessorChain::new(48_000, 1);
+        let (mut near_delay_ms, mut near_delay_samples) = (0, 0);
+        let mut near_delay_buffer = VecDeque::new();
+        let (mut output_level, mut bypassed) = (50, false);
+
+        handle_runtime_controls(
+            &mut control,
+            RuntimeControlContext {
+                diagnostic: &mut diagnostic,
+                pending_diagnostic: &mut pending_diagnostic,
+                stats: None,
+                chain: &mut chain,
+                sample_rate: 48_000,
+                reference_channels: 1,
+                frame_ms: 10,
+                near_delay_ms: &mut near_delay_ms,
+                near_delay_samples: &mut near_delay_samples,
+                near_delay_buffer: &mut near_delay_buffer,
+                output_level: &mut output_level,
+                bypassed: &mut bypassed,
+                status_json: true,
+                running: &running,
+            },
+        );
+
+        assert!(!running.load(Ordering::SeqCst));
+        assert!(control.is_none());
     }
 
     #[test]

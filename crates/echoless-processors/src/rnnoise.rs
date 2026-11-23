@@ -136,14 +136,10 @@ impl EchoProcessor for RnNoise {
     }
 
     fn configure(&mut self, params: &toml::Table) -> anyhow::Result<()> {
+        // try_new() already created and primed the native state.
         ensure!(
             params.is_empty(),
             "RNNoise does not accept configuration parameters"
-        );
-        self.reset();
-        ensure!(
-            self.last.runtime_error_count == 0,
-            "failed to reset RNNoise state"
         );
         Ok(())
     }

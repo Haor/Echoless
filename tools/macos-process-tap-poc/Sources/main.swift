@@ -612,11 +612,12 @@ if options.probePermission {
 
 let recorder = ProcessTapRecorder(options: options)
 
-// ── 进程回收自愈(审计 B-01)────────────────────────────────────────────
-// 默认信号动作会跳过 recorder.stop(),遗留 tap/聚合设备占用系统音频
-// (录音指示器长亮)。SIGTERM/SIGINT 改走干净清理;SIGPIPE 忽略后由流循环
-// 的 write 错误分支主动清理(见下)。流模式主线程阻塞在 sleep 循环,
-// 信号源必须挂全局队列才能得到调度。
+// ── 进程回收自愈 ──────────────────────────────────────────────────────────
+// SIGINT 会经终端 Ctrl+C 或 probe-delay 的进程组信号到达本进程,SIGTERM 来自
+// 外部停止;两者都走 recorder.stop() 干净释放 tap。echoless CLI 自身停机时
+// 直接 SIGKILL(不可捕获),此时依赖 tap/聚合设备为 private,由 coreaudiod 在
+// 进程退出时回收。SIGPIPE 忽略后由流循环的 write 错误分支主动清理(见下)。
+// 流模式主线程阻塞在 sleep 循环,信号源必须挂全局队列才能得到调度。
 signal(SIGTERM, SIG_IGN)
 signal(SIGINT, SIG_IGN)
 signal(SIGPIPE, SIG_IGN)
@@ -647,7 +648,7 @@ if options.probePermission {
     fputs("permission probe succeeded\n", stderr)
     exit(0)
 } else if options.streamStdout {
-    // A5:PCM 前先发 16 字节二进制头(magic ELTP + version + 实际采样率 + 声道数),
+    // PCM 前先发 16 字节二进制头(magic ELTP + version + 实际采样率 + 声道数),
     // Rust 侧据此决定是否插重采样 —— tap 采样率跟随系统输出设备,不恒为 48k。
     var header = Data("ELTP".utf8)
     for value in [UInt32(1), UInt32(recorder.sampleRate.rounded()), UInt32(recorder.channels)] {
@@ -666,7 +667,7 @@ if options.probePermission {
         Thread.sleep(forTimeInterval: 0.005)
         // 父死自愈:CLI 被 SIGKILL/崩溃时本进程被收养(ppid=1),SIGKILL 不可
         // 捕获,轮询是唯一可靠防线;系统静音期 tap 无数据、不写管道,不能指望
-        // SIGPIPE/写错误兜底(审计 B-01)。
+        // SIGPIPE/写错误兜底。
         if getppid() == 1 {
             fputs("parent process exited; releasing Process Tap\n", stderr)
             recorder.stop()

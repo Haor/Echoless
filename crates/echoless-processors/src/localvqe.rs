@@ -8,15 +8,18 @@ use anyhow::{bail, Context, Result};
 use libloading::Library;
 use std::collections::VecDeque;
 use std::ffi::{CStr, CString};
-#[cfg(target_os = "windows")]
-use std::os::raw::c_void;
-use std::os::raw::{c_char, c_float, c_int};
+use std::os::raw::{c_char, c_float, c_int, c_void};
 use std::path::{Path, PathBuf};
+use std::ptr::NonNull;
 
+#[cfg(target_os = "windows")]
+use crate::win_dll::DllDirectoryGuard;
 use crate::{dsp::copy_or_zero, EchoProcessor, IoSpec, ProcessorStats};
 
 const LOCALVQE_SAMPLE_RATE: u32 = 16_000;
 const DEFAULT_NOISE_GATE_THRESHOLD_DBFS: f32 = -45.0;
+/// Upper bound for one input block at the node rate (10 ms at 16 kHz is 160 samples).
+const STREAM_BLOCK_RESERVE: usize = 512;
 
 #[cfg(target_os = "windows")]
 const DEFAULT_LIBRARY_NAMES: &[&str] = &["localvqe.dll"];
@@ -25,8 +28,9 @@ const DEFAULT_LIBRARY_NAMES: &[&str] = &["liblocalvqe.dylib", "localvqe.dylib"];
 #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
 const DEFAULT_LIBRARY_NAMES: &[&str] = &["liblocalvqe.so", "localvqe.so"];
 
-type LocalVqeCtx = usize;
-type LocalVqeOptions = usize;
+// Opaque C handles; owned values are stored as NonNull, raw pointers only cross the ABI.
+type LocalVqeCtx = *mut c_void;
+type LocalVqeOptions = *mut c_void;
 type OptionsNewFn = unsafe extern "C" fn() -> LocalVqeOptions;
 type OptionsFreeFn = unsafe extern "C" fn(LocalVqeOptions);
 type OptionsSetStringFn = unsafe extern "C" fn(LocalVqeOptions, *const c_char) -> c_int;
@@ -103,7 +107,7 @@ impl LocalVqe {
                         noise_gate: self.noise_gate,
                         noise_gate_threshold_dbfs: self.noise_gate_threshold_dbfs,
                     };
-                    return LocalVqeRuntime::new(api, candidate.clone(), config)
+                    return LocalVqeRuntime::new(api, config)
                         .map(|runtime| Box::new(runtime) as Box<dyn LocalVqeBackend>);
                 }
                 Err(err) => errors.push(format!("{}: {err}", candidate.display())),
@@ -240,7 +244,14 @@ impl EchoProcessor for LocalVqe {
             .unwrap_or(DEFAULT_NOISE_GATE_THRESHOLD_DBFS);
 
         let runtime = self.load_runtime()?;
-        self.frame_out.resize(runtime.hop(), 0.0);
+        let hop = runtime.hop();
+        self.frame_out.resize(hop, 0.0);
+        // Steady state holds under one hop plus one input block per queue; reserve
+        // headroom so the first audio-thread frames do not allocate.
+        let capacity = 4 * (hop + STREAM_BLOCK_RESERVE);
+        self.near_buffer.reserve(capacity);
+        self.far_buffer.reserve(capacity);
+        self.out_queue.reserve(capacity);
         self.runtime = Some(runtime);
         self.reset_stream_state();
         Ok(())
@@ -276,8 +287,7 @@ impl EchoProcessor for LocalVqe {
         }
     }
 
-    // D5:上报真实错误计数与最近错误(此前恒 empty → HEALTH 面板对 LocalVQE 全盲)。
-    // 神经模型无 AEC 发散概念,diverged 恒 false 是真实语义而非未接线。
+    // A neural model has no AEC divergence state, so `diverged` stays false.
     fn stats(&self) -> ProcessorStats {
         ProcessorStats {
             runtime_error_count: self.runtime_errors,
@@ -312,11 +322,12 @@ impl LocalVqe {
 
 struct LocalVqeRuntime {
     api: LocalVqeApi,
-    ctx: LocalVqeCtx,
-    _library_path: PathBuf,
+    ctx: NonNull<c_void>,
     hop: usize,
-    _fft_size: usize,
 }
+
+// The context is used by one owner at a time (no Sync); moving it to the audio thread is fine.
+unsafe impl Send for LocalVqeRuntime {}
 
 trait LocalVqeBackend: Send {
     fn hop(&self) -> usize;
@@ -335,19 +346,14 @@ struct LocalVqeRuntimeConfig<'a> {
 }
 
 impl LocalVqeRuntime {
-    fn new(
-        api: LocalVqeApi,
-        library_path: PathBuf,
-        config: LocalVqeRuntimeConfig<'_>,
-    ) -> Result<Self> {
+    fn new(api: LocalVqeApi, config: LocalVqeRuntimeConfig<'_>) -> Result<Self> {
         let model = cstring_path(config.model_path)?;
         let backend = config.backend.map(cstring).transpose()?;
 
-        let options = unsafe { (api.options_new)() };
-        if options == 0 {
-            bail!("localvqe_options_new returned null");
-        }
+        let options = NonNull::new(unsafe { (api.options_new)() })
+            .context("localvqe_options_new returned null")?;
         let guard = LocalVqeOptionsGuard { api: &api, options };
+        let options = options.as_ptr();
 
         check_setter(
             unsafe { (api.options_set_model_path)(options, model.as_ptr()) },
@@ -374,46 +380,28 @@ impl LocalVqeRuntime {
 
         let ctx = unsafe { (api.new_with_options)(options) };
         drop(guard);
-        if ctx == 0 {
-            bail!(
+        let ctx = NonNull::new(ctx).with_context(|| {
+            format!(
                 "localvqe_new_with_options returned null for model {}",
                 config.model_path.display()
-            );
-        }
+            )
+        })?;
+        // From here on Drop frees the context on every error path.
+        let mut runtime = Self { api, ctx, hop: 0 };
 
-        let sample_rate = unsafe { (api.sample_rate)(ctx) };
+        let sample_rate = unsafe { (runtime.api.sample_rate)(ctx.as_ptr()) };
         if sample_rate != LOCALVQE_SAMPLE_RATE as c_int {
-            unsafe { (api.free)(ctx) };
             bail!("localvqe sample rate {sample_rate} is unsupported; expected {LOCALVQE_SAMPLE_RATE}");
         }
-        let hop = unsafe { (api.hop_length)(ctx) };
-        let fft_size = unsafe { (api.fft_size)(ctx) };
+        let hop = unsafe { (runtime.api.hop_length)(ctx.as_ptr()) };
+        let fft_size = unsafe { (runtime.api.fft_size)(ctx.as_ptr()) };
         if hop <= 0 || fft_size <= 0 {
-            let msg = api.last_error(ctx);
-            unsafe { (api.free)(ctx) };
+            let msg = runtime.api.last_error(ctx);
             bail!("localvqe returned invalid shape hop={hop}, fft={fft_size}: {msg}");
         }
-
-        check_runtime(
-            &api,
-            ctx,
-            unsafe {
-                (api.set_noise_gate)(
-                    ctx,
-                    if config.noise_gate { 1 } else { 0 },
-                    config.noise_gate_threshold_dbfs,
-                )
-            },
-            "set_noise_gate",
-        )?;
-
-        Ok(Self {
-            api,
-            ctx,
-            _library_path: library_path,
-            hop: hop as usize,
-            _fft_size: fft_size as usize,
-        })
+        runtime.hop = hop as usize;
+        runtime.set_noise_gate(config.noise_gate, config.noise_gate_threshold_dbfs)?;
+        Ok(runtime)
     }
 }
 
@@ -425,7 +413,7 @@ impl LocalVqeBackend for LocalVqeRuntime {
     fn process_frame(&mut self, near: &[f32], far: &[f32], out: &mut [f32]) -> Result<()> {
         let ret = unsafe {
             (self.api.process_frame_f32)(
-                self.ctx,
+                self.ctx.as_ptr(),
                 near.as_ptr(),
                 far.as_ptr(),
                 self.hop as c_int,
@@ -436,40 +424,43 @@ impl LocalVqeBackend for LocalVqeRuntime {
     }
 
     fn reset(&mut self) {
-        unsafe { (self.api.reset)(self.ctx) };
+        unsafe { (self.api.reset)(self.ctx.as_ptr()) };
     }
 
     fn set_noise_gate(&mut self, enabled: bool, threshold_dbfs: f32) -> Result<()> {
-        check_runtime(
-            &self.api,
-            self.ctx,
-            unsafe {
-                (self.api.set_noise_gate)(self.ctx, if enabled { 1 } else { 0 }, threshold_dbfs)
-            },
-            "set_noise_gate",
-        )
+        let ret = unsafe {
+            (self.api.set_noise_gate)(
+                self.ctx.as_ptr(),
+                if enabled { 1 } else { 0 },
+                threshold_dbfs,
+            )
+        };
+        check_runtime(&self.api, self.ctx, ret, "set_noise_gate")
     }
 }
 
 impl Drop for LocalVqeRuntime {
     fn drop(&mut self) {
-        unsafe { (self.api.free)(self.ctx) };
+        unsafe { (self.api.free)(self.ctx.as_ptr()) };
     }
 }
 
 struct LocalVqeOptionsGuard<'a> {
     api: &'a LocalVqeApi,
-    options: LocalVqeOptions,
+    options: NonNull<c_void>,
 }
 
 impl Drop for LocalVqeOptionsGuard<'_> {
     fn drop(&mut self) {
-        unsafe { (self.api.options_free)(self.options) };
+        unsafe { (self.api.options_free)(self.options.as_ptr()) };
     }
 }
 
 struct LocalVqeApi {
+    // Field order matters: the library unloads before its DLL directory is removed.
     _lib: Library,
+    #[cfg(target_os = "windows")]
+    _dll_dirs: Option<DllDirectoryGuard>,
     options_new: OptionsNewFn,
     options_free: OptionsFreeFn,
     options_set_model_path: OptionsSetStringFn,
@@ -489,7 +480,8 @@ struct LocalVqeApi {
 
 impl LocalVqeApi {
     fn load(path: &Path) -> Result<Self> {
-        let _dll_dir_guard = localvqe_dll_directory_guard(path)?;
+        #[cfg(target_os = "windows")]
+        let dll_dirs = localvqe_dll_directory_guard(path)?;
         let lib = unsafe { Library::new(path) }
             .with_context(|| format!("failed to open localvqe library {}", path.display()))?;
         unsafe {
@@ -510,12 +502,14 @@ impl LocalVqeApi {
                 reset: symbol(&lib, b"localvqe_reset\0")?,
                 set_noise_gate: symbol(&lib, b"localvqe_set_noise_gate\0")?,
                 _lib: lib,
+                #[cfg(target_os = "windows")]
+                _dll_dirs: dll_dirs,
             })
         }
     }
 
-    fn last_error(&self, ctx: LocalVqeCtx) -> String {
-        let ptr = unsafe { (self.last_error)(ctx) };
+    fn last_error(&self, ctx: NonNull<c_void>) -> String {
+        let ptr = unsafe { (self.last_error)(ctx.as_ptr()) };
         if ptr.is_null() {
             return String::new();
         }
@@ -535,7 +529,7 @@ unsafe fn symbol<T: Copy>(lib: &Library, name: &[u8]) -> Result<T> {
 }
 
 #[cfg(target_os = "windows")]
-fn localvqe_dll_directory_guard(path: &Path) -> Result<Option<LocalVqeDllDirectoryGuard>> {
+fn localvqe_dll_directory_guard(path: &Path) -> Result<Option<DllDirectoryGuard>> {
     let Some(parent) = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -549,72 +543,7 @@ fn localvqe_dll_directory_guard(path: &Path) -> Result<Option<LocalVqeDllDirecto
             .with_context(|| format!("failed to resolve current directory for {}", path.display()))?
             .join(parent)
     };
-    LocalVqeDllDirectoryGuard::new(&[dir]).map(Some)
-}
-
-#[cfg(not(target_os = "windows"))]
-fn localvqe_dll_directory_guard(_path: &Path) -> Result<Option<()>> {
-    Ok(None)
-}
-
-#[cfg(target_os = "windows")]
-struct LocalVqeDllDirectoryGuard {
-    cookies: Vec<*mut c_void>,
-    _paths: Vec<Vec<u16>>,
-}
-
-#[cfg(target_os = "windows")]
-impl LocalVqeDllDirectoryGuard {
-    fn new(paths: &[PathBuf]) -> Result<Self> {
-        use std::os::windows::ffi::OsStrExt;
-        use windows_sys::Win32::System::LibraryLoader::{
-            AddDllDirectory, SetDefaultDllDirectories, LOAD_LIBRARY_SEARCH_DEFAULT_DIRS,
-            LOAD_LIBRARY_SEARCH_USER_DIRS,
-        };
-
-        let ok = unsafe {
-            SetDefaultDllDirectories(
-                LOAD_LIBRARY_SEARCH_DEFAULT_DIRS | LOAD_LIBRARY_SEARCH_USER_DIRS,
-            )
-        };
-        if ok == 0 {
-            return Err(std::io::Error::last_os_error())
-                .context("failed to set Windows DLL default search paths for LocalVQE");
-        }
-
-        let mut cookies = Vec::new();
-        let mut wide_paths = Vec::new();
-        for path in paths {
-            let wide: Vec<u16> = path
-                .as_os_str()
-                .encode_wide()
-                .chain(std::iter::once(0))
-                .collect();
-            let cookie = unsafe { AddDllDirectory(wide.as_ptr()) };
-            if cookie.is_null() {
-                return Err(std::io::Error::last_os_error())
-                    .with_context(|| format!("failed to add DLL directory {}", path.display()));
-            }
-            cookies.push(cookie);
-            wide_paths.push(wide);
-        }
-        Ok(Self {
-            cookies,
-            _paths: wide_paths,
-        })
-    }
-}
-
-#[cfg(target_os = "windows")]
-impl Drop for LocalVqeDllDirectoryGuard {
-    fn drop(&mut self) {
-        use windows_sys::Win32::System::LibraryLoader::RemoveDllDirectory;
-        for cookie in self.cookies.drain(..) {
-            unsafe {
-                RemoveDllDirectory(cookie);
-            }
-        }
-    }
+    DllDirectoryGuard::new(&[dir]).map(Some)
 }
 
 fn required_path(params: &toml::Table, key: &str) -> Result<Option<PathBuf>> {
@@ -733,7 +662,7 @@ fn check_setter(ret: c_int, field: &str) -> Result<()> {
     }
 }
 
-fn check_runtime(api: &LocalVqeApi, ctx: LocalVqeCtx, ret: c_int, call: &str) -> Result<()> {
+fn check_runtime(api: &LocalVqeApi, ctx: NonNull<c_void>, ret: c_int, call: &str) -> Result<()> {
     if ret == 0 {
         Ok(())
     } else {

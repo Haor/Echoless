@@ -267,6 +267,14 @@ fn expect_top_i64(table: &toml::Table, key: &str, errors: &mut Vec<ConfigValidat
     }
 }
 
+/// Entry-point check shared by `run`, `offline`, and `nvafx offline`.
+pub(crate) fn ensure_valid_pipeline_config(cfg: &PipelineConfig) -> Result<()> {
+    match validate_pipeline_config(cfg).first() {
+        Some(error) => bail!("invalid config: {}: {}", error.path, error.message),
+        None => Ok(()),
+    }
+}
+
 pub(crate) fn validate_pipeline_config(cfg: &PipelineConfig) -> Vec<ConfigValidationError> {
     let mut errors = Vec::new();
     if cfg.sample_rate == 0 {
@@ -338,8 +346,16 @@ fn validate_chain_node(
         return;
     }
 
-    match registry::canonical_kind(&node.kind) {
-        "aec3" => validate_aec3_node(&base, &node.params, errors),
+    let kind = node.kind.as_str();
+    // These engines run fixed 10 ms blocks; other frame lengths are zero-padded.
+    if matches!(kind, "aec3" | "webrtc_ns" | "rnnoise") && cfg.frame_ms != 10 {
+        errors.push(ConfigValidationError::new(
+            "frame_ms",
+            format!("{kind} requires 10ms frames"),
+        ));
+    }
+    match kind {
+        "aec3" => validate_aec3_node(cfg, &base, &node.params, errors),
         "localvqe" => validate_localvqe_node(&base, &node.params, errors),
         "nvidia_afx_aec" => validate_nvafx_node(cfg, &base, &node.params, errors),
         "webrtc_ns" => validate_webrtc_ns_node(&base, &node.params, errors),
@@ -350,10 +366,15 @@ fn validate_chain_node(
 }
 
 fn is_known_processor_kind(kind: &str) -> bool {
-    registry::kinds().contains(&registry::canonical_kind(kind))
+    registry::kinds().contains(&kind)
 }
 
-fn validate_aec3_node(base: &str, params: &toml::Table, errors: &mut Vec<ConfigValidationError>) {
+fn validate_aec3_node(
+    cfg: &PipelineConfig,
+    base: &str,
+    params: &toml::Table,
+    errors: &mut Vec<ConfigValidationError>,
+) {
     for key in ["ns", "ns_level"] {
         if params.contains_key(key) {
             errors.push(ConfigValidationError::new(
@@ -363,6 +384,7 @@ fn validate_aec3_node(base: &str, params: &toml::Table, errors: &mut Vec<ConfigV
         }
     }
     expect_bool(params, base, "agc", errors);
+    expect_bool(params, base, "delay_hold", errors);
     expect_bool(params, base, "linear_stable_echo_path", errors);
     expect_i64_range(
         params,
@@ -374,22 +396,37 @@ fn validate_aec3_node(base: &str, params: &toml::Table, errors: &mut Vec<ConfigV
     );
     expect_i64_min(params, base, "tail_ms", i64::from(MIN_TAIL_MS), errors);
     expect_i64_min(params, base, "delay_num_filters", 1, errors);
+    // reference_channels is a pipeline setting that the runtime copies into every
+    // AEC3 node; a different node-level value would be silently overwritten.
     if let Some(value) = params.get("reference_channels") {
-        let ok = value.as_integer().is_some_and(|v| matches!(v, 1 | 2))
-            || value
-                .as_str()
-                .map(|s| {
-                    matches!(
-                        s.to_ascii_lowercase().as_str(),
-                        "mono" | "1" | "1ch" | "stereo" | "2" | "2ch"
-                    )
-                })
-                .unwrap_or(false);
-        if !ok {
-            errors.push(ConfigValidationError::new(
+        let channels = value
+            .as_integer()
+            .filter(|v| matches!(v, 1 | 2))
+            .map(|v| v as u16)
+            .or_else(|| {
+                value
+                    .as_str()
+                    .and_then(|s| match s.to_ascii_lowercase().as_str() {
+                        "mono" | "1" | "1ch" => Some(1),
+                        "stereo" | "2" | "2ch" => Some(2),
+                        _ => None,
+                    })
+            });
+        match channels {
+            None => errors.push(ConfigValidationError::new(
                 format!("{base}.reference_channels"),
                 "reference_channels must be mono, stereo, 1, or 2",
-            ));
+            )),
+            Some(channels) if channels != cfg.reference_channels.channel_count() => {
+                errors.push(ConfigValidationError::new(
+                    format!("{base}.reference_channels"),
+                    format!(
+                        "reference_channels is a pipeline setting; set the top-level reference_channels instead (currently {})",
+                        cfg.reference_channels.as_str()
+                    ),
+                ))
+            }
+            Some(_) => {}
         }
     }
 }
@@ -480,25 +517,6 @@ fn validate_nvafx_node(
         &["silence", "bypass"],
         errors,
     );
-    match echoless_processors::nvafx::doctor_report() {
-        Ok(report) if report.ok() => {}
-        Ok(report) => {
-            let detail = report
-                .checks
-                .iter()
-                .find(|check| check.status.is_problem())
-                .map(|check| format!("{}: {}", check.name, check.detail))
-                .unwrap_or_else(|| "doctor did not pass".to_string());
-            errors.push(ConfigValidationError::new(
-                format!("{base}.doctor"),
-                format!("nvidia_afx_aec doctor failed: {detail}"),
-            ));
-        }
-        Err(err) => errors.push(ConfigValidationError::new(
-            format!("{base}.doctor"),
-            format!("nvidia_afx_aec doctor failed: {err:#}"),
-        )),
-    }
 }
 
 fn expect_bool(
@@ -808,7 +826,7 @@ mod tests {
             toml::Value::Integer(i64::from(MIN_TAIL_MS - 1)),
         );
         let mut errors = Vec::new();
-        validate_aec3_node("chain[0]", &params, &mut errors);
+        validate_aec3_node(&PipelineConfig::default(), "chain[0]", &params, &mut errors);
         assert_eq!(errors.len(), 1);
         assert_eq!(errors[0].path, "chain[0].tail_ms");
 
@@ -817,7 +835,7 @@ mod tests {
             toml::Value::Integer(i64::from(MIN_TAIL_MS)),
         );
         errors.clear();
-        validate_aec3_node("chain[0]", &params, &mut errors);
+        validate_aec3_node(&PipelineConfig::default(), "chain[0]", &params, &mut errors);
         assert!(errors.is_empty(), "{errors:?}");
     }
 
@@ -943,6 +961,94 @@ mod tests {
         assert!(paths.contains(&"near_delay_ms"));
         assert!(paths.contains(&"output_level"));
         assert!(paths.contains(&"reference_channels"));
-        assert!(paths.contains(&"chain[1].doctor"));
+    }
+
+    #[test]
+    fn fixed_block_processors_require_ten_ms_frames() {
+        for kind in ["aec3", "webrtc_ns", "rnnoise"] {
+            let cfg = PipelineConfig {
+                frame_ms: 5,
+                chain: vec![NodeConfig {
+                    kind: kind.into(),
+                    params: toml::Table::new(),
+                }],
+                ..PipelineConfig::default()
+            };
+
+            let errors = validate_pipeline_config(&cfg);
+
+            assert!(
+                errors
+                    .iter()
+                    .any(|error| error.path == "frame_ms" && error.message.contains(kind)),
+                "{kind}: {errors:?}"
+            );
+        }
+
+        let passthrough = PipelineConfig {
+            frame_ms: 5,
+            chain: vec![NodeConfig {
+                kind: "passthrough".into(),
+                params: toml::Table::new(),
+            }],
+            ..PipelineConfig::default()
+        };
+        assert!(validate_pipeline_config(&passthrough).is_empty());
+    }
+
+    #[test]
+    fn aec3_delay_hold_must_be_boolean() {
+        let mut params = toml::Table::new();
+        params.insert("delay_hold".into(), toml::Value::String("yes".into()));
+        let mut errors = Vec::new();
+
+        validate_aec3_node(&PipelineConfig::default(), "chain[0]", &params, &mut errors);
+
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].path, "chain[0].delay_hold");
+    }
+
+    #[test]
+    fn aec3_node_reference_channels_cannot_contradict_the_pipeline() {
+        let mut params = toml::Table::new();
+        params.insert(
+            "reference_channels".into(),
+            toml::Value::String("stereo".into()),
+        );
+        let mut errors = Vec::new();
+        validate_aec3_node(&PipelineConfig::default(), "chain[0]", &params, &mut errors);
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].path, "chain[0].reference_channels");
+
+        let stereo = PipelineConfig {
+            reference_channels: ReferenceChannels::Stereo,
+            ..PipelineConfig::default()
+        };
+        errors.clear();
+        validate_aec3_node(&stereo, "chain[0]", &params, &mut errors);
+        assert!(errors.is_empty(), "{errors:?}");
+    }
+
+    #[test]
+    fn nvafx_validation_checks_config_only_without_running_doctor() {
+        // This machine has no NVAFX runtime; a doctor run would add a problem.
+        let mut params = toml::Table::new();
+        params.insert(
+            "model_path".into(),
+            toml::Value::String("custom.trtpkg".into()),
+        );
+        params.insert("disable_cuda_graph".into(), toml::Value::Boolean(true));
+        params.insert("use_default_gpu".into(), toml::Value::Boolean(false));
+        let cfg = PipelineConfig {
+            chain: vec![NodeConfig {
+                kind: "nvidia_afx_aec".into(),
+                params,
+            }],
+            ..PipelineConfig::default()
+        };
+
+        let errors = validate_pipeline_config(&cfg);
+
+        assert!(errors.is_empty(), "{errors:?}");
     }
 }

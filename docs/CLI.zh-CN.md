@@ -90,10 +90,9 @@ echoless run --processor aec3 --no-ns
 echoless probe-delay --json --mic default --reference system --output "CABLE Input"
 ```
 
-该命令接受 `default` 选择符,但其 clap 默认值是刻意面向 macOS 的
-(`MacBook Pro...` / `BlackHole 2ch`),用于维护者本地的校准装置。
-可移植脚本应显式传入 `--mic`、`--reference` 和 `--output`,而不要依赖
-这些默认值。
+`--mic` 与 `--output` 默认为 `default`(系统默认设备),`--reference` 默认为
+`system`。请把 `--output` 设为通话软件用作麦克风的虚拟设备,避免处理后的声音
+送到扬声器。
 
 它本身不会停止任何东西——不要在另一个 `run` 正占用设备时运行它。
 Flag:`--beeps N`(默认 12,最少 2)、`--startup-delay S`(4)、`--volume 0..1`(0.35)、
@@ -121,7 +120,9 @@ echoless offline --mic mic.wav --reference ref.wav --out clean.wav --config my.t
 
 `offline` 会校验处理器拓扑和 WAV 进 / WAV 出的行为。它不模拟实时设备
 边界、`near_delay_ms`、bypass 交叉淡化、队列背压,或设备采样率转换通路,
-因此不应把它当作精确的实时延迟或实时路由基准。
+因此不应把它当作精确的实时延迟或实时路由基准。使用 `--config` 时会沿用其中的
+`reference_channels`,立体声参考可以离线复现;输入 WAV 被视为已对齐,不再叠加
+`near_delay_ms`。
 
 ## doctor / processors / config
 

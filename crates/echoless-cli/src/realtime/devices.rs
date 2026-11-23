@@ -157,11 +157,26 @@ pub(super) fn select_reference_source(
 ) -> Result<ReferenceSource> {
     match selector {
         "none" | "" => Ok(ReferenceSource::None),
-        "system" | "default" => select_system_reference_source(host),
+        "system" | "default" => {
+            if let Some(reason) = system_reference_unsupported(std::env::consts::OS) {
+                bail!("{reason}");
+            }
+            select_system_reference_source(host)
+        }
         sel => {
             let (device, kind) = select_render_device(host, sel)?;
             Ok(ReferenceSource::Cpal { device, kind })
         }
+    }
+}
+
+const LINUX_SYSTEM_REFERENCE_HINT: &str = "reference = \"system\" is not supported on Linux: the ALSA \"default\" capture device records the microphone, not the speakers. Use input:<monitor source> instead, e.g. --reference \"input:Monitor of Echoless-Output\" (list sources with `echoless devices`).";
+
+/// Returns why `reference = "system"` cannot work on `os`, if it cannot.
+fn system_reference_unsupported(os: &str) -> Option<&'static str> {
+    match os {
+        "windows" | "macos" => None,
+        _ => Some(LINUX_SYSTEM_REFERENCE_HINT),
     }
 }
 
@@ -296,6 +311,9 @@ pub fn print_devices() -> Result<()> {
     println!(
         "reference also accepts 'system' (Win = default output loopback, mac = Process Tap) / 'none' / 'output:<name>' / 'input:<name>'."
     );
+    println!(
+        "On Linux 'system' is unavailable; use 'input:<monitor source>', e.g. 'input:Monitor of Echoless-Output'."
+    );
     Ok(())
 }
 
@@ -404,7 +422,7 @@ pub fn audio_doctor_json_with_options(options: AudioDoctorOptions) -> Result<Val
         (true, true) => "missing",
         _ => "unknown",
     };
-    // D4:VB-CABLE 装完必须重启 Windows 才出现音频端点。驱动残迹在而端点不在
+    // VB-CABLE 装完必须重启 Windows 才出现音频端点。驱动残迹在而端点不在
     // = 「已装未生效」,以 needs_reboot 提示前端向导进入重启节点。
     let driver_present = vb_cable_driver_present();
     let needs_reboot = cfg!(windows) && driver_present && install_status != "installed";
@@ -426,7 +444,9 @@ pub fn audio_doctor_json_with_options(options: AudioDoctorOptions) -> Result<Val
         "install_status": install_status,
         "needs_reboot": needs_reboot,
         "virtual_driver_present": driver_present,
-        "permission_state": audio_permission_state(&inputs),
+        // Enumerating CoreAudio devices does not require microphone TCC consent,
+        // so the device list says nothing about the real permission state.
+        "permission_state": "unknown",
         "system_audio_permission": system_audio_permission,
         "system_audio_permission_probe": system_audio_probe.as_ref().map(SystemAudioPermissionProbe::to_json),
         "reference_sources": devices["reference_sources"].clone(),
@@ -686,19 +706,7 @@ fn recommended_audio_driver() -> &'static str {
     }
 }
 
-fn audio_permission_state(inputs: &[Value]) -> &'static str {
-    if cfg!(target_os = "macos") {
-        if inputs.is_empty() {
-            "undetermined"
-        } else {
-            "granted"
-        }
-    } else {
-        "unknown"
-    }
-}
-
-pub(super) fn system_audio_permission_state() -> &'static str {
+fn system_audio_permission_state() -> &'static str {
     #[cfg(target_os = "macos")]
     {
         if macos_process_tap_helper_available() {
@@ -817,7 +825,7 @@ fn is_linux_virtual_output_name(name: &str) -> bool {
     name.contains("echoless") || name.contains("null")
 }
 
-pub(super) fn is_virtual_audio_name(name: &str) -> bool {
+fn is_virtual_audio_name(name: &str) -> bool {
     let name = name.to_ascii_lowercase();
     name.contains("vb-audio")
         || name.contains("vb-cable")
@@ -825,7 +833,6 @@ pub(super) fn is_virtual_audio_name(name: &str) -> bool {
         || name.contains("cable input")
         || name.contains("cable output")
         || name.contains("blackhole")
-        || name.contains("virtual desktop")
 }
 
 fn stable_device_id(device: &Device, kind: DeviceKind, index: usize) -> String {
@@ -900,7 +907,7 @@ fn device_label(device: &Device) -> String {
         .unwrap_or_else(|_| "<unknown>".to_owned())
 }
 
-pub(super) fn format_device_description(desc: &DeviceDescription) -> String {
+fn format_device_description(desc: &DeviceDescription) -> String {
     let name = desc.name().trim();
     let detail = desc
         .driver()
@@ -1003,5 +1010,38 @@ mod tests {
         assert!(!is_linux_virtual_output_name(
             "Built-in Audio Analog Stereo"
         ));
+    }
+
+    #[test]
+    fn virtual_audio_name_detection_covers_cable_drivers_only() {
+        assert!(is_virtual_audio_name(
+            "CABLE Input (VB-Audio Virtual Cable)"
+        ));
+        assert!(is_virtual_audio_name("BlackHole 2ch"));
+        assert!(!is_virtual_audio_name("MacBook Pro Speakers"));
+        // Quest streaming endpoints are real headset audio, not a loopback cable.
+        assert!(!is_virtual_audio_name("Virtual Desktop Audio"));
+        assert!(!is_virtual_audio_name("Virtual Desktop Mic"));
+    }
+
+    #[test]
+    fn device_description_label_prefers_driver_detail() {
+        let desc = cpal::DeviceDescriptionBuilder::new("麦克风")
+            .driver("USB Condenser Microphone")
+            .device_type(cpal::DeviceType::Microphone)
+            .interface_type(cpal::InterfaceType::Usb)
+            .build();
+
+        assert_eq!(
+            format_device_description(&desc),
+            "麦克风 / USB Condenser Microphone"
+        );
+    }
+
+    #[test]
+    fn system_reference_is_rejected_where_capture_would_record_the_mic() {
+        assert!(system_reference_unsupported("linux").is_some());
+        assert!(system_reference_unsupported("windows").is_none());
+        assert!(system_reference_unsupported("macos").is_none());
     }
 }

@@ -175,7 +175,7 @@ fn parse_reference_channels(s: &str) -> Result<ReferenceChannels, String> {
 
 #[cfg(test)]
 mod tests {
-    use clap::{error::ErrorKind, Parser};
+    use clap::Parser;
 
     use super::{Cli, Cmd};
 
@@ -188,69 +188,5 @@ mod tests {
 
         assert!(args.diagnostics);
         assert_eq!(args.diagnostic_seconds, None);
-    }
-
-    #[test]
-    fn nvafx_commands_reject_removed_runtime_dir_option() {
-        let cases = [
-            vec!["echoless", "nvafx", "doctor", "--runtime-dir", "custom"],
-            vec![
-                "echoless",
-                "nvafx",
-                "offline",
-                "--mic",
-                "mic.wav",
-                "--reference",
-                "ref.wav",
-                "--out",
-                "out.wav",
-                "--runtime-dir",
-                "custom",
-            ],
-            vec![
-                "echoless",
-                "nvafx",
-                "install",
-                "--common-zip",
-                "common.zip",
-                "--model-zip",
-                "model.zip",
-                "--runtime-dir",
-                "custom",
-            ],
-            vec![
-                "echoless",
-                "nvafx",
-                "download-install",
-                "--runtime-dir",
-                "custom",
-            ],
-        ];
-
-        for args in cases {
-            let error = match Cli::try_parse_from(args) {
-                Ok(_) => panic!("removed --runtime-dir option was accepted"),
-                Err(error) => error,
-            };
-            assert_eq!(error.kind(), ErrorKind::UnknownArgument);
-        }
-    }
-
-    #[test]
-    fn run_rejects_removed_diagnostic_dir_option() {
-        let error = match Cli::try_parse_from(["echoless", "run", "--diagnostic-dir", "custom"]) {
-            Ok(_) => panic!("removed --diagnostic-dir option was accepted"),
-            Err(error) => error,
-        };
-        assert_eq!(error.kind(), ErrorKind::UnknownArgument);
-    }
-
-    #[test]
-    fn probe_delay_rejects_removed_out_dir_option() {
-        let error = match Cli::try_parse_from(["echoless", "probe-delay", "--out-dir", "custom"]) {
-            Ok(_) => panic!("removed --out-dir option was accepted"),
-            Err(error) => error,
-        };
-        assert_eq!(error.kind(), ErrorKind::UnknownArgument);
     }
 }

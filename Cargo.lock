@@ -453,7 +453,6 @@ name = "echoless-audio-io"
 version = "1.2.0"
 dependencies = [
  "anyhow",
- "bitflags",
  "hound",
 ]
 
@@ -471,7 +470,6 @@ dependencies = [
  "echoless-processors",
  "hound",
  "ringbuf",
- "rubato",
  "serde_json",
  "sha2",
  "toml",

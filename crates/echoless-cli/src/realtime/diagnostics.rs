@@ -67,11 +67,7 @@ impl DiagnosticsStatusHandle {
     }
 
     pub(super) fn elapsed_s(&self) -> f64 {
-        if self.sample_rate == 0 {
-            0.0
-        } else {
-            self.frames() as f64 / self.sample_rate as f64
-        }
+        self.frames() as f64 / self.sample_rate as f64
     }
 }
 
@@ -308,7 +304,6 @@ impl DiagnosticRecorder {
             total_ref_input_drops: 0,
             total_ref_stale_drops: 0,
             total_ref_underruns: 0,
-            human_to_stderr: config.status_json,
             status_json: config.status_json,
             status: status.clone(),
             recycle_sender: recycle_sender.clone(),
@@ -342,23 +337,24 @@ impl DiagnosticRecorder {
         self.dir.display().to_string()
     }
 
-    pub(super) fn write_frame(&mut self, sample: &StatsSample<'_>) -> Result<bool> {
-        if !self.status.is_recording() {
-            return Ok(false);
+    /// Queues one frame for the writer thread; a full queue counts a drop.
+    pub(super) fn write_frame(&mut self, sample: &StatsSample<'_>) -> Result<()> {
+        if !self.status.is_recording() || self.sender.is_none() {
+            return Ok(());
         }
-        let Some(sender) = self.sender.clone() else {
-            return Ok(false);
-        };
         let mut frame = self.take_frame();
         frame.fill_from_sample(sample);
+        let Some(sender) = self.sender.as_ref() else {
+            return Ok(());
+        };
         match sender.try_send(DiagnosticCommand::Frame(frame)) {
-            Ok(()) => Ok(true),
+            Ok(()) => Ok(()),
             Err(TrySendError::Full(command)) => {
                 if let DiagnosticCommand::Frame(frame) = command {
                     let _ = self.recycle_sender.try_send(frame);
                 }
                 self.status.increment_drops();
-                Ok(true)
+                Ok(())
             }
             Err(TrySendError::Disconnected(_)) => {
                 self.status.set_recording(false);
@@ -385,13 +381,9 @@ impl DiagnosticRecorder {
         }
     }
 
-    fn finish(&mut self, reason: DiagnosticDoneReason) {
-        if let Some(sender) = self.sender.take() {
-            match sender.try_send(DiagnosticCommand::Finish(reason)) {
-                Ok(()) | Err(TrySendError::Disconnected(_)) => {}
-                Err(TrySendError::Full(_)) => {}
-            }
-        }
+    /// Closing the channel ends the writer with `RunExit`; then wait for it to finalize.
+    fn finish(&mut self) {
+        self.sender.take();
         if let Some(writer) = self.writer.take() {
             if let Err(err) = writer.join() {
                 eprintln!("diagnostics writer thread exited abnormally: {err:?}");
@@ -402,7 +394,7 @@ impl DiagnosticRecorder {
 
 impl Drop for DiagnosticRecorder {
     fn drop(&mut self) {
-        self.finish(DiagnosticDoneReason::RunExit);
+        self.finish();
     }
 }
 
@@ -432,7 +424,6 @@ struct DiagnosticWriter {
     total_ref_input_drops: u64,
     total_ref_stale_drops: u64,
     total_ref_underruns: u64,
-    human_to_stderr: bool,
     status_json: bool,
     status: DiagnosticsStatusHandle,
     recycle_sender: SyncSender<Box<DiagnosticFrame>>,
@@ -706,10 +697,12 @@ impl DiagnosticWriter {
                 "clock_skew_direction": skew.direction.map(ClockSkewDirection::as_str),
                 "clock_skew_ref_correlated": skew.ref_correlated,
             });
-            println!("{event}");
+            // Written synchronously so the event is not lost when the run exits right
+            // after; a closed stdout (GUI gone) is ignored instead of panicking.
+            let _ = writeln!(std::io::stdout().lock(), "{event}");
         } else {
             print_human(
-                self.human_to_stderr,
+                self.status_json,
                 format!(
                     "diagnostics recording complete (reason={}, ok={}, drops={}, output_underruns={}, output_skew_pct={:.2}): {}",
                     reason.as_str(),
@@ -993,7 +986,7 @@ mod tests {
             node_stats: &node_stats,
         };
 
-        assert!(recorder.write_frame(&sample)?);
+        recorder.write_frame(&sample)?;
         drop(recorder);
 
         let mic_reader = hound::WavReader::open(dir.join("mic.wav"))?;
@@ -1073,7 +1066,7 @@ mod tests {
             node_stats: &node_stats,
         };
 
-        assert!(recorder.write_frame(&sample)?);
+        recorder.write_frame(&sample)?;
         for _ in 0..50 {
             if !status.is_recording() {
                 break;
@@ -1140,7 +1133,7 @@ mod tests {
             node_stats: &node_stats,
         };
 
-        assert!(recorder.write_frame(&sample)?);
+        recorder.write_frame(&sample)?;
         recorder.request_finish(DiagnosticDoneReason::Stopped);
         assert!(!status.is_recording());
         for _ in 0..100 {
