@@ -56,9 +56,6 @@ pub(crate) struct ProbeDelayArgs {
 }
 
 pub(crate) fn cmd_probe_delay(a: ProbeDelayArgs) -> Result<()> {
-    if !cfg!(feature = "realtime") {
-        bail!("probe-delay requires the realtime feature (cpal)");
-    }
     if !(cfg!(target_os = "macos") || cfg!(windows) || cfg!(target_os = "linux")) {
         bail!("probe-delay currently supports macOS / Windows / Linux only");
     }
@@ -613,7 +610,7 @@ impl Drop for ProbeChild {
     }
 }
 
-#[cfg(all(feature = "realtime", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 fn play_probe_beep(_a: &ProbeDelayArgs, beep_path: &Path, cancel: &AtomicBool) -> Result<()> {
     let mut player = Command::new("afplay")
         .arg(beep_path)
@@ -635,7 +632,7 @@ fn play_probe_beep(_a: &ProbeDelayArgs, beep_path: &Path, cancel: &AtomicBool) -
     }
 }
 
-#[cfg(all(feature = "realtime", windows))]
+#[cfg(windows)]
 fn play_probe_beep(a: &ProbeDelayArgs, beep_path: &Path, _cancel: &AtomicBool) -> Result<()> {
     let selector = reference_playback_output_selector(&a.reference)?;
     let samples = read_probe_beep_samples(beep_path)?;
@@ -648,7 +645,7 @@ fn play_probe_beep(a: &ProbeDelayArgs, beep_path: &Path, _cancel: &AtomicBool) -
 //   描述名 = "Monitor of <sink_desc>"(:3998)。
 // 映射失败时回退默认输出(常见场景 monitor 的就是默认 sink)——beep 只要从被
 // 监听的 sink 出声,分析就成立;彻底播错设备时 probe 会以 ref silent 告警收场。
-#[cfg(all(feature = "realtime", target_os = "linux"))]
+#[cfg(target_os = "linux")]
 fn play_probe_beep(a: &ProbeDelayArgs, beep_path: &Path, _cancel: &AtomicBool) -> Result<()> {
     let samples = read_probe_beep_samples(beep_path)?;
     if let Some(stem) = monitor_reference_output_stem(&a.reference)? {
@@ -668,7 +665,7 @@ fn play_probe_beep(a: &ProbeDelayArgs, beep_path: &Path, _cancel: &AtomicBool) -
 
 /// monitor 参考名 → 被监听 sink 的名字片段(cpal 输出设备 selector)。
 /// None = 用默认输出。纯字符串逻辑,单测在所有平台跑。
-#[cfg_attr(not(all(feature = "realtime", target_os = "linux")), allow(dead_code))]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn monitor_reference_output_stem(reference: &str) -> Result<Option<String>> {
     let reference = reference.trim();
     match reference {
@@ -686,17 +683,9 @@ fn monitor_reference_output_stem(reference: &str) -> Result<Option<String>> {
     }
 }
 
-#[cfg(all(
-    feature = "realtime",
-    not(any(target_os = "macos", windows, target_os = "linux"))
-))]
+#[cfg(not(any(target_os = "macos", windows, target_os = "linux")))]
 fn play_probe_beep(_a: &ProbeDelayArgs, _beep_path: &Path, _cancel: &AtomicBool) -> Result<()> {
     bail!("no probe-delay beep playback implementation for the current platform");
-}
-
-#[cfg(not(feature = "realtime"))]
-fn play_probe_beep(_a: &ProbeDelayArgs, _beep_path: &Path, _cancel: &AtomicBool) -> Result<()> {
-    bail!("probe-delay beep playback requires the realtime feature (cpal)");
 }
 
 #[cfg(any(windows, test))]

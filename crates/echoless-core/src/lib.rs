@@ -170,7 +170,7 @@ pub struct RunReport {
     pub node_stats: Vec<ProcessorStats>,
 }
 
-/// 离线跑通整条链:mic 源 + ref 源 → 处理链 → sink。当前可用(P1 离线评测)。
+/// 离线跑通整条链:mic 源 + ref 源 → 处理链 → sink。用于离线评测。
 pub fn run_offline<M, R, S>(
     cfg: &PipelineConfig,
     mut mic: M,
@@ -245,10 +245,7 @@ where
 }
 
 pub fn apply_reference_channels_to_chain(nodes: &mut [NodeConfig], mode: ReferenceChannels) {
-    for node in nodes
-        .iter_mut()
-        .filter(|node| echoless_processors::registry::canonical_kind(&node.kind) == "aec3")
-    {
+    for node in nodes.iter_mut().filter(|node| node.kind == "aec3") {
         node.params.insert(
             "reference_channels".to_string(),
             toml::Value::String(mode.as_str().to_string()),

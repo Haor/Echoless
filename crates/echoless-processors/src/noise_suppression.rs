@@ -1,6 +1,6 @@
 //! Product-level external noise-suppression compatibility rules.
 
-use crate::{registry, NodeConfig};
+use crate::NodeConfig;
 
 pub const WEBRTC_MODE: &str = "webrtc";
 pub const RNNOISE_MODE: &str = "rnnoise";
@@ -63,10 +63,7 @@ pub fn localvqe_model_capability(model_path: &str) -> LocalVqeModelCapability {
 }
 
 pub fn is_external_noise_suppression_kind(kind: &str) -> bool {
-    matches!(
-        registry::canonical_kind(kind),
-        WEBRTC_PROCESSOR_KIND | RNNOISE_PROCESSOR_KIND
-    )
+    matches!(kind, WEBRTC_PROCESSOR_KIND | RNNOISE_PROCESSOR_KIND)
 }
 
 pub fn validate_noise_suppression_chain(nodes: &[NodeConfig]) -> Vec<NoiseChainError> {
@@ -86,7 +83,7 @@ pub fn validate_noise_suppression_chain(nodes: &[NodeConfig]) -> Vec<NoiseChainE
 
     if let Some(&ns_index) = ns_indices.first() {
         for node in nodes {
-            if registry::canonical_kind(&node.kind) != "localvqe" {
+            if node.kind != "localvqe" {
                 continue;
             }
             let model = node
@@ -127,7 +124,7 @@ pub fn validate_noise_suppression_chain(nodes: &[NodeConfig]) -> Vec<NoiseChainE
 }
 
 fn engine_allows_external_noise_suppression(node: &NodeConfig) -> bool {
-    match registry::canonical_kind(&node.kind) {
+    match node.kind.as_str() {
         "aec3" | "nvidia_afx_aec" => true,
         "localvqe" => node
             .params

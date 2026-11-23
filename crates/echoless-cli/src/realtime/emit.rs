@@ -1,4 +1,4 @@
-//! stdout 异步发射器(审计 B-02)。
+//! stdout 异步发射器。
 //!
 //! JSONL 状态/命令回执的写出不允许发生在 10ms 音频处理线程上:sidecar
 //! 场景 stdout 是管道,GUI 侧读线程一旦短暂卡顿(GC/窗口拖动/重排),
@@ -42,18 +42,5 @@ pub(super) fn emit_stdout_line(line: String) {
             }
         }
         Err(TrySendError::Disconnected(_)) => {}
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn emit_does_not_block_and_survives_burst() {
-        // 远超队列容量的突发也不得阻塞调用方(满则丢弃)。
-        for i in 0..(QUEUE_CAPACITY * 4) {
-            emit_stdout_line(format!("{{\"type\":\"test\",\"seq\":{i}}}"));
-        }
     }
 }

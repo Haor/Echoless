@@ -2,12 +2,10 @@ use anyhow::{bail, Result};
 
 use crate::cli::RunArgs;
 use crate::config_validate::ensure_valid_pipeline_config;
-#[cfg(feature = "realtime")]
 use crate::realtime;
 use echoless_core::PipelineConfig;
 use echoless_processors::NodeConfig;
 
-#[cfg(feature = "realtime")]
 pub(crate) fn cmd_run(a: RunArgs) -> Result<()> {
     let cfg = load_run_config(&a)?;
     ensure_valid_pipeline_config(&cfg)?;
@@ -24,14 +22,6 @@ pub(crate) fn cmd_run(a: RunArgs) -> Result<()> {
     realtime::run_with_options(&cfg, opts)
 }
 
-#[cfg(not(feature = "realtime"))]
-pub(crate) fn cmd_run(_a: RunArgs) -> Result<()> {
-    anyhow::bail!(
-        "realtime pipeline requires the realtime feature (cpal); current build has it disabled"
-    )
-}
-
-#[cfg_attr(not(feature = "realtime"), allow(dead_code))]
 fn load_run_config(a: &RunArgs) -> Result<PipelineConfig> {
     let cfg = if let Some(path) = &a.config {
         let s = std::fs::read_to_string(path)?;
@@ -42,7 +32,6 @@ fn load_run_config(a: &RunArgs) -> Result<PipelineConfig> {
     apply_run_overrides(cfg, a)
 }
 
-#[cfg_attr(not(feature = "realtime"), allow(dead_code))]
 fn apply_run_overrides(mut cfg: PipelineConfig, a: &RunArgs) -> Result<PipelineConfig> {
     if let Some(v) = &a.mic {
         cfg.mic = v.clone();
@@ -113,26 +102,20 @@ fn apply_run_overrides(mut cfg: PipelineConfig, a: &RunArgs) -> Result<PipelineC
     Ok(cfg)
 }
 
-#[cfg_attr(not(feature = "realtime"), allow(dead_code))]
 fn set_aec3_param(nodes: &mut [NodeConfig], key: &str, value: toml::Value) -> Result<()> {
-    let Some(node) = nodes
-        .iter_mut()
-        .find(|node| echoless_processors::registry::canonical_kind(&node.kind) == "aec3")
-    else {
+    let Some(node) = nodes.iter_mut().find(|node| node.kind == "aec3") else {
         bail!("{key} requires an aec3 node in the config, or use --processor aec3");
     };
     node.params.insert(key.to_string(), value);
     Ok(())
 }
 
-#[cfg_attr(not(feature = "realtime"), allow(dead_code))]
 fn remove_external_ns(nodes: &mut Vec<NodeConfig>) {
     nodes.retain(|node| {
         !echoless_processors::noise_suppression::is_external_noise_suppression_kind(&node.kind)
     });
 }
 
-#[cfg_attr(not(feature = "realtime"), allow(dead_code))]
 fn select_webrtc_ns(nodes: &mut Vec<NodeConfig>, level: Option<&str>) -> Result<()> {
     use echoless_processors::noise_suppression::WEBRTC_PROCESSOR_KIND;
 
@@ -155,7 +138,6 @@ fn select_webrtc_ns(nodes: &mut Vec<NodeConfig>, level: Option<&str>) -> Result<
     Ok(())
 }
 
-#[cfg(feature = "realtime")]
 fn runtime_options_from_args(a: &RunArgs) -> Result<realtime::RuntimeOptions> {
     if matches!(a.stats_interval_ms, Some(0)) {
         bail!("--stats-interval-ms must be greater than 0");
@@ -302,7 +284,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "realtime")]
     fn runtime_options_use_verbose_default_interval() {
         let mut args = run_args();
         args.verbose = true;
@@ -314,7 +295,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "realtime")]
     fn runtime_options_use_status_json_default_interval() {
         let mut args = run_args();
         args.status_json = true;
@@ -326,7 +306,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "realtime")]
     fn runtime_options_reject_zero_interval() {
         let mut args = run_args();
         args.stats_interval_ms = Some(0);

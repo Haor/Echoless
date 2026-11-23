@@ -8,7 +8,7 @@ use std::time::Duration;
 use anyhow::Context;
 use hound::{SampleFormat, WavReader, WavSpec, WavWriter};
 
-use crate::{AudioFormat, AudioSink, AudioSource, OwnedPacket, PacketFlags};
+use crate::{AudioFormat, AudioSink, AudioSource, OwnedPacket};
 
 /// 从 WAV 读取的 `AudioSource`。一次性载入内存,按固定帧数分块吐出,合成时间戳。
 pub struct WavFileSource {
@@ -73,7 +73,6 @@ impl AudioSource for WavFileSource {
             frames: take as u32,
             timestamp_ns,
             device_pos,
-            flags: PacketFlags::empty(),
         }))
     }
 

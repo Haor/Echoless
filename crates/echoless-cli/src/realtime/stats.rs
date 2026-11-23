@@ -73,9 +73,6 @@ pub(super) fn input_queue_latency_ms(mic_q_samples: usize, sample_rate: u32) -> 
 }
 
 fn queue_latency_ms(samples: usize, sample_rate: u32) -> f64 {
-    if sample_rate == 0 {
-        return 0.0;
-    }
     samples as f64 / sample_rate as f64 * 1000.0
 }
 
@@ -557,7 +554,7 @@ impl RealtimeStats {
             ref_pace_loss,
             self.ref_underruns,
         );
-        // 审计 B-02:本方法在音频处理线程上执行,写出必须走异步发射器,
+        // 本方法在音频处理线程上执行,写出必须走异步发射器,
         // 不许同步碰 stdout(管道满会阻塞处理循环 → 爆音)。
         if self.status_json {
             emit_stdout_line(self.status_json_line(now));

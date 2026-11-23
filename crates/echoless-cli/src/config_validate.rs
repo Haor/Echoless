@@ -346,7 +346,7 @@ fn validate_chain_node(
         return;
     }
 
-    let kind = registry::canonical_kind(&node.kind);
+    let kind = node.kind.as_str();
     // These engines run fixed 10 ms blocks; other frame lengths are zero-padded.
     if matches!(kind, "aec3" | "webrtc_ns" | "rnnoise") && cfg.frame_ms != 10 {
         errors.push(ConfigValidationError::new(
@@ -366,7 +366,7 @@ fn validate_chain_node(
 }
 
 fn is_known_processor_kind(kind: &str) -> bool {
-    registry::kinds().contains(&registry::canonical_kind(kind))
+    registry::kinds().contains(&kind)
 }
 
 fn validate_aec3_node(

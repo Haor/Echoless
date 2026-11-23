@@ -6,10 +6,10 @@
 //!                         ├─► 处理线程(每 10ms)─ chain.process(near, far) ─► out_ring ──► 输出设备
 //! 系统 loopback ─► render_ring┘
 //! ```
-//! 设备 I/O 可用原生采样率打开,在设备边界固定比率重采样到 pipeline rate;
+//! 设备 I/O 可用原生采样率打开,在设备边界重采样到 pipeline rate(输出/参考侧带水位速率匹配);
 //! ProcessorChain 仍负责处理器节点边界重采样(如 LocalVQE 16k)。
 //! 跨平台靠 cpal:Windows WASAPI(含 output loopback)/ macOS CoreAudio。
-//! 系统声音参考 = output 设备做 loopback(Windows 原生;macOS 需 BlackHole 之类)。
+//! 系统声音参考:Windows = 默认输出 loopback;macOS = Process Tap helper;Linux = input:<monitor>。
 //! 虚拟音频输出 = 选 VB-Cable / BlackHole 作 output 设备。
 
 mod control;
@@ -61,7 +61,7 @@ use self::resample::{
 use self::stats::{RealtimeStats, RealtimeStatsConfig, StatsSample};
 use echoless_core::{
     apply_output_level, apply_reference_channels_to_chain, output_level_gain_db, PipelineConfig,
-    ReferenceChannels, MAX_NEAR_DELAY_MS, MAX_OUTPUT_LEVEL,
+    ReferenceChannels,
 };
 use echoless_processors::{chain_from_nodes, ProcessorChain};
 
@@ -214,28 +214,12 @@ pub fn run_with_options(cfg: &PipelineConfig, options: RuntimeOptions) -> Result
     let reference_source = select_reference_source(&host, cfg.reference.as_str())
         .context("failed to select reference source")?;
 
+    // `cmd_run` has validated sample_rate, frame_ms, near_delay_ms and output_level.
     let sample_rate = cfg.sample_rate;
-    if cfg.frame_ms == 0 {
-        bail!("frame length must be greater than 0ms");
-    }
-    let frame_samples = sample_rate as u64 * cfg.frame_ms as u64;
-    if !frame_samples.is_multiple_of(1000) {
-        bail!(
-            "sample rate and frame length must yield an integer sample count: sample_rate={sample_rate}, frame_ms={}",
-            cfg.frame_ms
-        );
-    }
-    let frame_size = (frame_samples / 1000) as usize;
-    if cfg.near_delay_ms > MAX_NEAR_DELAY_MS {
-        bail!("near_delay_ms must be <= {MAX_NEAR_DELAY_MS}");
-    }
-    if cfg.output_level > MAX_OUTPUT_LEVEL {
-        bail!("output_level must be <= {MAX_OUTPUT_LEVEL}");
-    }
+    let frame_size = cfg.frame_size() as usize;
     let near_delay_samples = delay_ms_to_samples(cfg.near_delay_ms, sample_rate);
-    let ring_size = frame_size * 12 + near_delay_samples; // ~120ms plus explicit near delay
-                                                          // A5:tap 采样率由 helper 流头上报,与管线不一致时 reader 侧线性重采样,
-                                                          // 不再要求管线锁 48k。
+    // Input ring capacity: ~120 ms of headroom plus the configured near delay.
+    let ring_size = frame_size * 12 + near_delay_samples;
 
     let reference_channels = if reference_source.has_reference() {
         usize::from(cfg.reference_channels.channel_count())
@@ -456,8 +440,7 @@ pub fn run_with_options(cfg: &PipelineConfig, options: RuntimeOptions) -> Result
     let output_preroll_samples =
         prime_output_ring(&mut out_prod, frame_size, OUTPUT_PREROLL_FRAMES);
     let output_preroll_ms = samples_to_ms(output_preroll_samples, sample_rate);
-    // 控制线程无条件启动(不再只限 --status-json):stdin EOF = 停机契约的
-    // 感知通道,GUI/管道调用方关闭 stdin 即优雅停机(审计 B-01)。
+    // 控制线程无条件启动:stdin EOF = 停机契约,GUI/管道调用方关闭 stdin 即优雅停机。
     let control = Some(spawn_control_reader());
     let started_event = json!({
         "type": "started",
@@ -726,13 +709,9 @@ fn process_loop<M, R, O>(
             node_stats: &node_stats,
         };
         if let Some(recorder) = diagnostic.as_mut() {
-            match recorder.write_frame(&sample) {
-                Ok(true) => {}
-                Ok(false) => {}
-                Err(err) => {
-                    eprintln!("diagnostics recording failed, disabled: {err:#}");
-                    diagnostic = None;
-                }
+            if let Err(err) = recorder.write_frame(&sample) {
+                eprintln!("diagnostics recording failed, disabled: {err:#}");
+                diagnostic = None;
             }
         }
         if let Some(stats) = stats.as_mut() {
@@ -763,7 +742,7 @@ fn process_bypass_frame(
     crossfade: &mut BypassCrossfade,
 ) {
     // bypass 时链也恒跑(keep-warm):AEC3 滤波器/有状态节点持续收敛,
-    // 解旁路瞬间无重收敛间隙;bypass 只决定输出选源(审计 B-09,DECISIONS #4)。
+    // 解旁路瞬间无重收敛间隙;bypass 只决定输出选源。
     chain.process(
         inputs.near,
         inputs.far,
@@ -842,11 +821,7 @@ fn prime_output_ring<P: Producer<Item = f32>>(
 }
 
 fn samples_to_ms(samples: usize, sample_rate: u32) -> f64 {
-    if sample_rate == 0 {
-        0.0
-    } else {
-        samples as f64 / sample_rate as f64 * 1000.0
-    }
+    samples as f64 / sample_rate as f64 * 1000.0
 }
 
 // ── 流构建(多采样格式)────────────────────────────────────────────────────────
@@ -1278,6 +1253,7 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
 
     use cpal::{BackendSpecificError, StreamError};
+    use echoless_core::MAX_OUTPUT_LEVEL;
     use echoless_processors::{aec3::Aec3Engine, EchoProcessor, IoSpec, ProcessorStats};
     use ringbuf::traits::Observer;
 
@@ -1442,8 +1418,8 @@ mod tests {
         approx_slice(&out, &[0.3, -0.6, 0.75, -0.75], 0.001);
     }
 
-    // 冷路径(bypass 期间停喂 chain)已随审计 B-09 删除:该路径解旁路后残差是
-    // 保温路径的 5 倍以上(重收敛间隙),产品语义要求 OFF=穿透时引擎恒保温。
+    // bypass 期间停喂 chain 的冷路径解旁路后残差是保温路径的 5 倍以上(重收敛间隙),
+    // 产品语义要求 OFF=穿透时引擎恒保温。
     #[test]
     fn bypass_keeps_chain_warm_for_clean_restore() {
         let warm = restore_rms_after_bypass();
