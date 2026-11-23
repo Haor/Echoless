@@ -339,4 +339,38 @@ describe("persistent device selection (B-27)", () => {
     expect(res.preferred.output).toBe("out-b");
     expect(res.preferred.reference).toBe("system");
   });
+
+  it("prefers standard paired VB-CABLE output over CABLE In 16 Ch regardless of enumeration order", () => {
+    const devices = list(
+      [
+        dev("input", "麦克风 / USB Condenser Microphone", "mic-usb", {
+          is_default: true,
+        }),
+        dev("input", "CABLE Output / VB-Audio Virtual Cable", "in-vb", {
+          index: 1,
+        }),
+      ],
+      [
+        dev("output", "CABLE In 16 Ch / VB-Audio Virtual Cable", "out-vb-16ch"),
+        dev("output", "扬声器 / VB-Audio Virtual Cable", "out-vb-std", {
+          index: 1,
+        }),
+      ],
+      [
+        ref("system", "System audio", "system", true),
+        ref("none", "No reference", "none", true),
+      ],
+    );
+
+    const res = resolveDeviceSelection({
+      devices,
+      preferred: {},
+      currentActive: { selInput: "default", selOutput: "default", reference: "system" },
+      platform: "windows",
+    });
+
+    expect(res.active.selOutput).toBe("out-vb-std");
+    expect(res.preferred.output).toBe("out-vb-std");
+    expect(res.preferred.outputName).toBe("扬声器 / VB-Audio Virtual Cable");
+  });
 });

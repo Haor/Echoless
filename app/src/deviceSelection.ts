@@ -1,8 +1,10 @@
 import type { AudioDevice, DeviceList, Platform, ReferenceSource } from "./types";
 import {
+  isMultichannelVirtualPin,
   isSelfLoopReference,
   isVirtualAudioInput,
   isVirtualAudioOutput,
+  pairVirtualAppMic,
 } from "./virtualRoute";
 
 export const DEVICE_SELECTION_KEY = "echoless.deviceSelection.v1";
@@ -102,9 +104,24 @@ export function pickDefaultInput(
 export function pickDefaultOutput(
   outputs: readonly AudioDevice[],
   platform?: Platform,
+  inputs?: readonly AudioDevice[],
 ): string {
-  const virt = outputs.find((d) => isVirtualAudioOutput(d.name, platform));
-  if (virt) return virt.stable_id;
+  const virtOutputs = outputs.filter((d) =>
+    isVirtualAudioOutput(d.name, platform),
+  );
+  if (virtOutputs.length > 0) {
+    const ordered = [
+      ...virtOutputs.filter((d) => !isMultichannelVirtualPin(d.name)),
+      ...virtOutputs.filter((d) => isMultichannelVirtualPin(d.name)),
+    ];
+    if (inputs && inputs.length > 0) {
+      const paired = ordered.find(
+        (d) => pairVirtualAppMic(d, inputs, outputs) != null,
+      );
+      if (paired) return paired.stable_id;
+    }
+    return ordered[0].stable_id;
+  }
   return (
     outputs.find((d) => d.is_default)?.stable_id ??
     outputs[0]?.stable_id ??
@@ -217,7 +234,7 @@ export function resolveDeviceSelection(params: {
     preferred.output,
     preferred.outputName,
     currentActive.selOutput,
-    (outs) => pickDefaultOutput(outs, platform),
+    (outs) => pickDefaultOutput(outs, platform, devices.inputs),
   );
   const inRes = resolveAudioSlot(
     devices.inputs,

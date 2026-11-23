@@ -25,9 +25,23 @@ const LINUX_VIRTUAL_OUTPUT_RE = /echoless|null/i;
 const LINUX_MONITOR_RE = /monitor/i;
 const WORD_INPUT_RE = /\binput\b/i;
 const CABLE_LINE_TOKEN_RE = /\b(?:cable-[a-z0-9]+|line\s+\d+)\b/i;
+// Single-cable VB-Audio adapters (base, Cable A/B/C/D, Hi-Fi Cable) have one
+// recording endpoint (CABLE Output) even when Windows exposes two playback pins
+// under the same adapter suffix (e.g. "CABLE Input" / localized "扬声器" + "CABLE In 16 Ch").
+const SINGLE_CABLE_VBAUDIO_SUFFIX_RE =
+  /^(?:\d+-\s*)?vb-?audio\s+(?:virtual\s+cable|hi-?fi\s+cable|cable(?:\s+[a-z0-9]+)?)$/i;
+const MULTICHANNEL_VIRTUAL_PIN_RE = /\b(?:in\s+)?(?:16|32|64)\s*ch\b/i;
 
 function normalizeName(name: string): string {
   return name.trim().replace(/\s+/g, " ").toLowerCase();
+}
+
+export function isMultichannelVirtualPin(name: string): boolean {
+  return MULTICHANNEL_VIRTUAL_PIN_RE.test(name);
+}
+
+function isSingleCableVbAudioSuffix(suffix: string | null): boolean {
+  return suffix != null && SINGLE_CABLE_VBAUDIO_SUFFIX_RE.test(suffix);
 }
 
 export function stripReferencePrefix(value: string): string {
@@ -108,12 +122,14 @@ export function pairVirtualAppMic<T extends NamedDevice>(
     if (sameName) return sameName;
   }
 
-  // Tier 2: unique adapter/driver suffix match for virtual outputs (handles renamed endpoints)
+  // Tier 2: adapter/driver suffix match for virtual outputs (handles renamed or
+  // localized endpoints such as "扬声器 / VB-Audio Virtual Cable" and companion
+  // multichannel pins such as "CABLE In 16 Ch / VB-Audio Virtual Cable").
   if (!isVirtualAudioOutput(output.name)) return null;
   const suffix = extractAdapterSuffix(output.name);
   if (!suffix) return null;
 
-  if (allOutputs) {
+  if (allOutputs && !isSingleCableVbAudioSuffix(suffix)) {
     const outputsWithSameSuffix = allOutputs.filter(
       (out) => extractAdapterSuffix(out.name) === suffix,
     );
@@ -183,9 +199,14 @@ export function resolveVirtualRoute(params: {
     };
   }
 
-  // Current output is physical (or unselected): recommend a genuinely paired virtual cable.
+  // Current output is physical (or unselected): recommend a genuinely paired virtual cable,
+  // preferring standard 2ch/8ch endpoints over multichannel companion pins (e.g. CABLE In 16 Ch).
   const virtOutputs = activeOutputs.filter(isVirtOut);
-  for (const candidate of virtOutputs) {
+  const preferredVirtOutputs = [
+    ...virtOutputs.filter((d) => !isMultichannelVirtualPin(d.name)),
+    ...virtOutputs.filter((d) => isMultichannelVirtualPin(d.name)),
+  ];
+  for (const candidate of preferredVirtOutputs) {
     const paired = pairVirtualAppMic(candidate, activeInputs, activeOutputs);
     if (paired) {
       return {
@@ -198,7 +219,7 @@ export function resolveVirtualRoute(params: {
     }
   }
 
-  const fallbackOut = virtOutputs[0] ?? null;
+  const fallbackOut = preferredVirtOutputs[0] ?? null;
   return {
     output: fallbackOut,
     appMic: null,
@@ -229,6 +250,16 @@ export function isSelfLoopReference(
   if (!outDev) return false;
 
   if (normalizeName(ref.label) === normalizeName(outDev.name)) return true;
+
+  if (ref.kind === "output") {
+    const outSuffix = extractAdapterSuffix(outDev.name);
+    if (
+      isSingleCableVbAudioSuffix(outSuffix) &&
+      extractAdapterSuffix(ref.label) === outSuffix
+    ) {
+      return true;
+    }
+  }
 
   if (ref.kind === "input") {
     const paired = pairVirtualAppMic(outDev, inputs, outputs);

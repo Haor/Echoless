@@ -335,4 +335,81 @@ describe("isSelfLoopReference", () => {
       ),
     ).toBe(false);
   });
+
+  it("pairs localized VB-CABLE playback pins (扬声器 + CABLE In 16 Ch) with CABLE Output and blocks self-loops", () => {
+    const devices: Pick<DeviceList, "inputs" | "outputs"> = {
+      outputs: [
+        dev("output", "扬声器 / ToDesk Virtual Audio", "{out-todesk}"),
+        dev("output", "CABLE In 16 Ch / VB-Audio Virtual Cable", "{out-vb-16ch}"),
+        dev("output", "扬声器 / VB-Audio Virtual Cable", "{out-vb-std}"),
+        dev("output", "扬声器 / 2- XMOS USB Audio", "{out-xmos}"),
+      ],
+      inputs: [
+        dev("input", "CABLE Output / VB-Audio Virtual Cable", "{in-vb}"),
+      ],
+    };
+
+    expect(
+      resolveVirtualRoute({
+        selectedOutput: "{out-vb-16ch}",
+        devices,
+        platform: "windows",
+      }),
+    ).toMatchObject({
+      ready: true,
+      selectedIsVirtual: true,
+      counterpartMissing: false,
+      appMic: { stable_id: "{in-vb}" },
+    });
+
+    expect(
+      resolveVirtualRoute({
+        selectedOutput: "{out-vb-std}",
+        devices,
+        platform: "windows",
+      }),
+    ).toMatchObject({
+      ready: true,
+      selectedIsVirtual: true,
+      counterpartMissing: false,
+      appMic: { stable_id: "{in-vb}" },
+    });
+
+    // When a physical output is selected, prefer the standard endpoint over CABLE In 16 Ch.
+    expect(
+      resolveVirtualRoute({
+        selectedOutput: "{out-xmos}",
+        devices,
+        platform: "windows",
+      }),
+    ).toMatchObject({
+      ready: true,
+      selectedIsVirtual: false,
+      output: { stable_id: "{out-vb-std}" },
+      appMic: { stable_id: "{in-vb}" },
+    });
+
+    // Both CABLE Output and the sibling VB-CABLE output pin must be flagged as self-loops.
+    expect(
+      isSelfLoopReference(
+        ref("input", "CABLE Output / VB-Audio Virtual Cable", "{in-vb}"),
+        "{out-vb-16ch}",
+        devices,
+      ),
+    ).toBe(true);
+    expect(
+      isSelfLoopReference(
+        ref("output", "扬声器 / VB-Audio Virtual Cable", "{out-vb-std}"),
+        "{out-vb-16ch}",
+        devices,
+      ),
+    ).toBe(true);
+    expect(
+      isSelfLoopReference(
+        ref("output", "扬声器 / 2- XMOS USB Audio", "{out-xmos}"),
+        "{out-vb-16ch}",
+        devices,
+      ),
+    ).toBe(false);
+  });
 });
