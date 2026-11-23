@@ -1,4 +1,4 @@
-import type { Health } from "../runtimeTelemetry";
+import { dash, type Health } from "../runtimeTelemetry";
 import type { DeviceList, DoctorAudio, Platform } from "../types";
 import { openDiagnosticsDir, openPath, openUrl } from "../api";
 import { useI18n } from "../i18n";
@@ -92,7 +92,10 @@ export function DiagnosticsPage({
     // 时钟漂移是断续/回声残留的常见根因,比一个可心算的加总更值得占一格。
     {
       label: "clock skew",
-      value: health.clock_skew_pct === null ? "—" : `${health.clock_skew_pct.toFixed(1)}%`,
+      value:
+        health.clock_skew_pct === null
+          ? "—"
+          : `${dash(health.clock_skew_pct)}%`,
       warn: health.clock_skew_warning,
       hint: t("clockSkewHint"),
       pos: "top",
@@ -221,7 +224,7 @@ export function DiagnosticsPage({
             <span className="dpath live">{health.session_dir}</span>
             {health.recording && (
               <span className="recbadge">
-                ● {health.rec_elapsed_s.toFixed(1)}s
+                ● {dash(health.rec_elapsed_s)}s
                 {seconds ? ` / ${seconds}s` : ""}
               </span>
             )}

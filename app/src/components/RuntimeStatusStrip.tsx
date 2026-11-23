@@ -2,12 +2,12 @@ import { memo } from "react";
 import { openUrl } from "../api";
 import { useI18n } from "../i18n";
 import {
+  dash,
   useRunStatusKind,
   useRuntimeLive,
   type RunStatusKind,
 } from "../runtimeTelemetry";
 import { ScrambleText } from "./ScrambleText";
-import { dash } from "../numeric";
 
 // 直达「屏幕与系统音频录制」隐私面板;未知 anchor 时 macOS 回退打开隐私根页。
 export const SYS_AUDIO_PRIVACY_URL =

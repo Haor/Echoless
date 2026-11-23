@@ -1,6 +1,10 @@
 import { useEffect, useSyncExternalStore } from "react";
 import type { RuntimeStatus } from "./types";
 
+// Telemetry number formatting: null / undefined / NaN / Infinity render as "—".
+export const dash = (v: number | null | undefined, d = 1): string =>
+  v == null || !Number.isFinite(v) ? "—" : v.toFixed(d);
+
 export type RunStatusKind = "live" | "noref" | "warn" | "bypass" | "stopped";
 
 export interface RunStatusInputs {

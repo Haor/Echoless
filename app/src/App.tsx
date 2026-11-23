@@ -78,6 +78,7 @@ import { RuntimeFooterBars } from "./components/RuntimeFooterBars";
 import { RuntimeSignalPanel } from "./components/RuntimeSignalPanel";
 import { ErrorBoundary } from "./components/ErrorBoundary";
 import { Hint } from "./components/Hint";
+import { TvNoise } from "./components/TvNoise";
 import {
   acceptRunEvent,
   acceptRunExit,
@@ -85,7 +86,6 @@ import {
   observeRunStart,
   type RunGeneration,
 } from "./runGeneration";
-import { controlErrorMessage, streamErrorMessage } from "./runEventDisplay";
 import {
   RuntimeStatusStrip,
   RuntimeSubline,
@@ -102,17 +102,10 @@ import {
   modelFileName,
   normalizeNoiseMode,
   patchNoiseModeParam,
-  shouldSelectNoiseMode,
-  isNearDelayOnlyPatch,
   hotInitialDelayValue,
   hotLocalvqeNoiseGateValue,
-  platformNearDelayDefault,
   createRunIntentGuard,
   createSerialQueue,
-  bypassToggleTarget,
-  settleBypassObservation,
-  clearBypassPending,
-  routeEngineKindSelection,
   canChangePipeline,
   pipelineForEngineKind,
 } from "./engineLogic";
@@ -123,30 +116,18 @@ import {
   setDiagnosticsSessionDir,
 } from "./runtimeTelemetry";
 import { createAsyncListenerScope } from "./asyncListener";
-import { settleBootGate } from "./bootGate";
 import {
   INITIAL_STREAM_RECOVERY,
   nextStreamRecovery,
   type StreamRecoveryState,
 } from "./streamRecovery";
 import {
-  createStartupCleanup,
-  expectStartupRun,
-  INITIAL_STARTUP_RUN_HANDSHAKE,
-  observeStartupRunStarted,
   shouldAttemptAutoStart,
   shouldRevealAutostartFailure,
   shouldRevealWindow,
   startupDataReady,
   type StartupMode,
 } from "./startupMode";
-import {
-  beginAutostartChange,
-  displayAutostartEnabled,
-  rejectAutostartChange,
-  settleAutostart,
-  type AutostartPreference,
-} from "./autostartPreference";
 import {
   initialActiveSelection,
   readPreferredDeviceSelection,
@@ -160,7 +141,14 @@ import {
 } from "./deviceSelection";
 import { isSelfLoopReference, resolveVirtualRoute } from "./virtualRoute";
 
-const ensureStartupRuntimeCleanup = createStartupCleanup(stopRun);
+let startupCleanupPromise: Promise<void> | null = null;
+function ensureStartupRuntimeCleanup(): Promise<void> {
+  startupCleanupPromise ??= stopRun().then(
+    () => undefined,
+    () => undefined,
+  );
+  return startupCleanupPromise;
+}
 
 function revealMainWindow(): void {
   const window = getCurrentWindow();
@@ -667,7 +655,7 @@ function useEngineConfig({
   platformRef.current = platform;
 
   function hotNearDelayValue(next: PipelineCfg): number {
-    return next.near_delay_ms ?? platformNearDelayDefault(platformRef.current);
+    return next.near_delay_ms ?? (platformRef.current === "macos" ? 25 : 0);
   }
 
   function dispatchHotControl(key: HotControlKey, send: () => void) {
@@ -735,44 +723,41 @@ function useEngineConfig({
   }
 
   // 切 backend:优先恢复该引擎上次的参数(保住 LocalVQE 选过的模型),否则用 manifest 默认。
-  function changeKind(k: string) {
-    routeEngineKindSelection(kindRef, k, engineReady(k), {
-      setup: (target) => {
-        stopForEngineSetupRef.current();
-        gotoView(target === "nvidia_afx_aec" ? "rtxsetup" : "engine");
-      },
-      apply: (previous, target) => {
-        paramsByKind.current[previous] = paramsRef.current;
-        const np =
-          paramsByKind.current[target] ??
-          defaultParams(processors.find((p) => p.kind === target));
-        paramsByKind.current[target] = np;
-        paramsRef.current = np;
-        const nextPipeline = pipelineForEngineKind(
-          target,
-          pipelineRef.current,
-        );
-        const nextNoiseMode = normalizeNoiseMode(
-          noiseSuppression,
-          target,
-          np,
-          noiseModeRef.current,
-        );
-        pipelineRef.current = nextPipeline;
-        noiseModeRef.current = nextNoiseMode;
-        updateEngine({
-          kind: target,
-          noiseMode: nextNoiseMode,
-          params: np,
-          pipeline: nextPipeline,
-        });
-        applyChangeRef.current({
-          kind: target,
-          noiseMode: nextNoiseMode,
-          params: np,
-          pipeline: nextPipeline,
-        });
-      },
+  function changeKind(target: string) {
+    const previous = kindRef.current;
+    if (previous === target) return;
+    if (!engineReady(target)) {
+      stopForEngineSetupRef.current();
+      gotoView(target === "nvidia_afx_aec" ? "rtxsetup" : "engine");
+      return;
+    }
+    kindRef.current = target;
+    paramsByKind.current[previous] = paramsRef.current;
+    const np =
+      paramsByKind.current[target] ??
+      defaultParams(processors.find((p) => p.kind === target));
+    paramsByKind.current[target] = np;
+    paramsRef.current = np;
+    const nextPipeline = pipelineForEngineKind(target, pipelineRef.current);
+    const nextNoiseMode = normalizeNoiseMode(
+      noiseSuppression,
+      target,
+      np,
+      noiseModeRef.current,
+    );
+    pipelineRef.current = nextPipeline;
+    noiseModeRef.current = nextNoiseMode;
+    updateEngine({
+      kind: target,
+      noiseMode: nextNoiseMode,
+      params: np,
+      pipeline: nextPipeline,
+    });
+    applyChangeRef.current({
+      kind: target,
+      noiseMode: nextNoiseMode,
+      params: np,
+      pipeline: nextPipeline,
     });
   }
 
@@ -917,7 +902,7 @@ function useEngineConfig({
       kindRef.current,
       paramsRef.current,
     );
-    if (!shouldSelectNoiseMode(noiseModeRef.current, next, allowed)) return;
+    if (noiseModeRef.current === next || !allowed.includes(next)) return;
     noiseModeRef.current = next;
     updateEngine({ noiseMode: next });
     applyChangeRef.current({ noiseMode: next });
@@ -946,7 +931,8 @@ function useEngineConfig({
     const npl = { ...cur, ...patch };
     pipelineRef.current = npl;
     updateEngine({ pipeline: npl });
-    if (isNearDelayOnlyPatch(patch)) {
+    const patchKeys = Object.keys(patch);
+    if (patchKeys.length === 1 && patchKeys[0] === "near_delay_ms") {
       dispatchHotControl("near_delay_ms", () => {
         setNearDelayMs(hotNearDelayValue(npl)).catch((e) =>
           noteError(String(e)),
@@ -1037,8 +1023,7 @@ type RunLifecycleDeps = {
   updateApp: Dispatch<Patch<AppState>>;
   noteError: (err: string | null) => void;
   gotoView: (view: View) => void;
-  onRunReservedRef: MutableRefObject<(runId: number) => void>;
-  onRunStartedRef: MutableRefObject<(runId: number) => void>;
+  onRunStarted: () => void;
 };
 
 function useRunLifecycle({
@@ -1066,8 +1051,7 @@ function useRunLifecycle({
   updateApp,
   noteError,
   gotoView,
-  onRunReservedRef,
-  onRunStartedRef,
+  onRunStarted,
 }: RunLifecycleDeps) {
   const [runtimeCleanupReady, setRuntimeCleanupReady] = useState(false);
   // 当前 run 实际生效的参考源(由 started 给出),供 status 判断是否 Process Tap。
@@ -1076,7 +1060,6 @@ function useRunLifecycle({
   // 子进程最近一条 stderr 日志(用于在非预期退出时报错)。
   const lastLogRef = useRef<string>("");
   const probeBorrowedRunRef = useRef(false);
-  const engineSetupStopPendingRef = useRef(false);
   const runIntentRef = useRef(createRunIntentGuard(powerOn));
   const streamRecoveryRef = useRef<StreamRecoveryState>(
     INITIAL_STREAM_RECOVERY,
@@ -1085,11 +1068,12 @@ function useRunLifecycle({
   const restartRunRef = useRef<() => Promise<number | null>>(async () => null);
   const bypassTargetRef = useRef(bypassPending ?? bypassed);
   bypassTargetRef.current = bypassPending ?? bypassed;
-  if (!powerOn) engineSetupStopPendingRef.current = false;
   const recRef = useRef(rec);
   recRef.current = rec;
   const diagSecondsRef = useRef(diagSeconds);
   diagSecondsRef.current = diagSeconds;
+  const onRunStartedRef = useRef(onRunStarted);
+  onRunStartedRef.current = onRunStarted;
 
   const clearStreamRecoveryTimer = useCallback(() => {
     if (streamRecoveryTimerRef.current == null) return;
@@ -1160,7 +1144,7 @@ function useRunLifecycle({
                 recovering: false,
               };
             }
-            onRunStartedRef.current(ev.run_id);
+            onRunStartedRef.current();
             telRef.current.on = true;
             refSourceRef.current = ev.reference_source ?? null;
             updateApp({
@@ -1184,16 +1168,17 @@ function useRunLifecycle({
           }
           if (ev.type === "control_error") {
             if (ev.cmd === "set_bypass") {
-              updateApp((state) => ({
-                ...state,
-                ...clearBypassPending(state),
-              }));
+              updateApp((state) =>
+                state.bypassPending == null
+                  ? state
+                  : { ...state, bypassPending: null },
+              );
             }
-            noteError(controlErrorMessage(ev));
+            noteError(`${ev.cmd?.trim() || "runtime control"}: ${ev.message}`);
             return;
           }
           if (ev.type === "stream_error") {
-            const message = streamErrorMessage(ev);
+            const message = `${ev.stream} stream error: ${ev.message}`;
             lastLogRef.current = message;
             if (!ev.fatal) {
               noteError(message);
@@ -1242,11 +1227,12 @@ function useRunLifecycle({
           if (ev.type === "localvqe_noise_gate_changed") {
             return;
           }
-          // 穿透回执:pending 只由后端回执/status 落定,避免写入竞态把假状态钉死。
           if (ev.type === "bypass_changed") {
             updateApp((state) => ({
               ...state,
-              ...settleBypassObservation(state, ev.bypassed),
+              bypassed: ev.bypassed,
+              bypassPending:
+                state.bypassPending === ev.bypassed ? null : state.bypassPending,
             }));
             return;
           }
@@ -1290,12 +1276,13 @@ function useRunLifecycle({
                 : state,
             );
           }
-          // status 常驻 bypassed 字段:兜底同步(如回执丢失/前端重载)。
           if (typeof s.bypassed === "boolean") {
             const sb = s.bypassed;
             updateApp((state) => ({
               ...state,
-              ...settleBypassObservation(state, sb),
+              bypassed: sb,
+              bypassPending:
+                state.bypassPending === sb ? null : state.bypassPending,
             }));
           }
           const tel = telRef.current;
@@ -1402,7 +1389,6 @@ function useRunLifecycle({
       if (!runIntentRef.current.allowsStart(startIntent)) return null;
       telRef.current.on = true;
       const runId = await startRun(toml, 80);
-      onRunReservedRef.current(runId);
       if (!runIntentRef.current.allowsStart(startIntent)) {
         telRef.current.on = false;
         await stopRun().catch(() => {});
@@ -1466,9 +1452,7 @@ function useRunLifecycle({
   }
 
   stopForEngineSetupRef.current = () => {
-    if (!runIntentRef.current.wantsRun() || engineSetupStopPendingRef.current)
-      return;
-    engineSetupStopPendingRef.current = true;
+    if (!runIntentRef.current.wantsRun()) return;
     void stop();
   };
 
@@ -1493,14 +1477,15 @@ function useRunLifecycle({
   async function togglePower() {
     if (busy || probing) return;
     if (powerOn) {
-      const next = bypassToggleTarget({ bypassed, bypassPending });
-      if (next == null) return;
+      if (bypassPending != null) return;
+      const next = !bypassed;
       updateApp({ bypassPending: next });
       setBypass(next).catch((e) => {
-        updateApp((state) => ({
-          ...state,
-          ...clearBypassPending(state, next),
-        }));
+        updateApp((state) =>
+          state.bypassPending === next
+            ? { ...state, bypassPending: null }
+            : state,
+        );
         noteError(String(e));
       });
       return;
@@ -1633,14 +1618,13 @@ function useRunLifecycle({
   };
 }
 
-function AppShell() {
+export default function App() {
   const [appState, updateApp] = useReducer(
     patchReducer<AppState>,
     undefined,
     initAppState,
   );
-  // 就绪门:首屏数据+字体就位前整窗隐藏,一次性淡入——消除空壳骨架闪烁与
-  // 字标 FOUT(fallback 字体宽度不同 → 点阵字标从窄变宽跳)。
+  // 首屏数据+字体就位前整窗隐藏,一次性淡入——消除骨架闪烁与 FOUT。
   const [booted, setBooted] = useState(false);
   const [startupMode, setStartupMode] = useState<StartupMode>("unknown");
   const [startupCoreReady, setStartupCoreReady] = useState(false);
@@ -1653,49 +1637,28 @@ function AppShell() {
   lvDlRef.current = lvDl;
   const autoStartAttemptedRef = useRef(false);
   const startupSettledRef = useRef(false);
-  const autostartHandshakeRef = useRef(INITIAL_STARTUP_RUN_HANDSHAKE);
   const startupModeRef = useRef(startupMode);
   startupModeRef.current = startupMode;
-  const onRunReservedRef = useRef<(runId: number) => void>(() => {});
-  const onRunStartedRef = useRef<(runId: number) => void>(() => {});
   const settleStartupOnce = useCallback(() => {
     if (startupSettledRef.current) return;
     startupSettledRef.current = true;
     settleStartupLaunch().catch(() => {});
   }, []);
-  const updateAutostartHandshake = (next: typeof INITIAL_STARTUP_RUN_HANDSHAKE) => {
-    const wasSettled = autostartHandshakeRef.current.settled;
-    autostartHandshakeRef.current = next;
-    if (wasSettled || !next.settled) return;
-    settleStartupOnce();
-  };
-  onRunReservedRef.current = (runId) => {
-    if (startupModeRef.current !== "autostart") return;
-    updateAutostartHandshake(
-      expectStartupRun(autostartHandshakeRef.current, runId),
-    );
-  };
-  onRunStartedRef.current = (runId) => {
-    if (startupModeRef.current !== "autostart") return;
-    updateAutostartHandshake(
-      observeStartupRunStarted(autostartHandshakeRef.current, runId),
-    );
-  };
-  // 独立兜底:无论数据 effect 内部发生什么(异常/promise 不 resolve),
-  // 字体就绪即揭幕,最迟 1.2s 硬封顶保证绝不卡在空屏。字体本地 woff2
-  // 加载 <200ms,常态是数据 effect 先揭幕(见下),这里只兜底。
+  const handleRunStarted = useCallback(() => {
+    if (startupModeRef.current === "autostart") settleStartupOnce();
+  }, [settleStartupOnce]);
+
+  // 独立兜底:字体就绪即揭幕,最迟 1.2s 硬封顶保证绝不卡在空屏。
   useEffect(() => {
     let cancelled = false;
     const lift = () => {
       if (!cancelled) setBooted(true);
     };
-    void settleBootGate(
-      document.fonts?.ready,
-      new Promise((resolve) => setTimeout(resolve, 1200)),
-      lift,
-    );
+    const timer = window.setTimeout(lift, 1200);
+    void Promise.resolve(document.fonts?.ready).finally(lift);
     return () => {
       cancelled = true;
+      window.clearTimeout(timer);
     };
   }, []);
   useEffect(() => {
@@ -1883,8 +1846,7 @@ function AppShell() {
     updateApp,
     noteError,
     gotoView,
-    onRunReservedRef,
-    onRunStartedRef,
+    onRunStarted: handleRunStarted,
   });
   const autoStartRunRef = useRef(start);
   autoStartRunRef.current = start;
@@ -2373,20 +2335,20 @@ function AppShell() {
     setTrayPrefs(trayPrefs.closeToTray).catch(() => {});
   }, [trayPrefs]);
 
-  // Windows 启动项以系统注册状态为真理源,不再复制一份 localStorage 偏好。
-  // 用户可在任务管理器/系统设置里关闭启动项;窗口重新聚焦时同步实际状态。
-  const [autostartPreference, setAutostartPreference] =
-    useState<AutostartPreference>({ enabled: null, pending: null });
+  // Windows 启动项以系统注册状态为真理源;窗口重新聚焦时同步实际状态。
+  const [autostartPref, setAutostartPref] = useState<{
+    enabled: boolean | null;
+    pending: boolean | null;
+  }>({ enabled: null, pending: null });
   const autostartRequestRef = useRef(0);
-  const autostartChangePendingRef = useRef(false);
   const refreshAutostart = useCallback(() => {
-    if (platform !== "windows" || autostartChangePendingRef.current) return;
+    if (platform !== "windows") return;
     const request = ++autostartRequestRef.current;
     getAutostartEnabled()
       .then((enabled) => {
         if (request !== autostartRequestRef.current) return;
-        setAutostartPreference((current) =>
-          current.pending == null ? settleAutostart(enabled) : current,
+        setAutostartPref((cur) =>
+          cur.pending == null ? { enabled, pending: null } : cur,
         );
       })
       .catch((e) => {
@@ -2402,28 +2364,20 @@ function AppShell() {
 
   function changeAutostart(enabled: boolean) {
     if (dev && platformView === "windows" && platform !== "windows") {
-      setAutostartPreference(settleAutostart(enabled));
+      setAutostartPref({ enabled, pending: null });
       return;
     }
-    autostartChangePendingRef.current = true;
     const request = ++autostartRequestRef.current;
-    setAutostartPreference((current) =>
-      beginAutostartChange(current, enabled),
-    );
+    setAutostartPref((cur) => ({ enabled: cur.enabled, pending: enabled }));
     persistAutostartEnabled(enabled)
       .then((actual) => {
         if (request !== autostartRequestRef.current) return;
-        setAutostartPreference(settleAutostart(actual));
+        setAutostartPref({ enabled: actual, pending: null });
       })
       .catch((e) => {
         if (request !== autostartRequestRef.current) return;
-        setAutostartPreference((current) => rejectAutostartChange(current));
+        setAutostartPref((cur) => ({ enabled: cur.enabled, pending: null }));
         noteError(String(e));
-      })
-      .finally(() => {
-        if (request === autostartRequestRef.current) {
-          autostartChangePendingRef.current = false;
-        }
       });
   }
 
@@ -2765,11 +2719,10 @@ function AppShell() {
             onTrayPrefs={(patch) =>
               updateTrayPrefs((cur) => ({ ...cur, ...patch }))
             }
-            autoStartEnabled={displayAutostartEnabled(autostartPreference)}
+            autoStartEnabled={autostartPref.pending ?? autostartPref.enabled ?? false}
             autoStartBusy={
               !(dev && platformView === "windows" && platform !== "windows") &&
-              (autostartPreference.enabled == null ||
-                autostartPreference.pending != null)
+              (autostartPref.enabled == null || autostartPref.pending != null)
             }
             onAutoStart={changeAutostart}
           />
@@ -2884,9 +2837,7 @@ function AppShell() {
         <RuntimeFooterBars telRef={telRef} powerOn={powerOn} />
       </footer>
 
-      {/* v10 动态底噪(WebGL shader,见 TvNoise 注释);OFF 时随 sysoff 渐隐停走 */}
       <TvNoise active={uiOn} />
-      {/* v6 VHS 亮带(transform 合成器动画);OFF 时随 sysoff 渐隐暂停 */}
       <div className="vhs" aria-hidden="true">
         <i className="band" />
         <i className="line" />
@@ -2895,210 +2846,7 @@ function AppShell() {
   );
 }
 
-// 动态底噪 v4:WebGL 逐项复刻 feTurbulence(type=turbulence, baseFrequency=1.15,
-// numOctaves=1),每帧一次 draw call,CPU 归零(原版 SMIL 滤镜 = 320% CPU)。
-// 复刻要点(三轮反馈的最终结论):
-//   · value noise(晶格 + smoothstep 插值)= 平滑连续场 —— 质感的关键;
-//     逐像素独立 hash 是椒盐白噪,又硬又脏;
-//   · |2n-1| 折叠 = turbulence 的 |noise|,分布偏 0,白底上大多近乎透明;
-//   · px uniform = baseFrequency/dpr,晶格按 CSS 像素网格(与 SVG 滤镜一致)。
-const NOISE_FS = `precision highp float;
-uniform float t;
-uniform float px;
-float h(vec2 p) {
-  return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453123);
-}
-float vn(vec2 p, float s) {
-  vec2 i = floor(p);
-  vec2 f = fract(p);
-  vec2 u = f * f * (3.0 - 2.0 * f);
-  return mix(
-    mix(h(i + s), h(i + s + vec2(1.0, 0.0)), u.x),
-    mix(h(i + s + vec2(0.0, 1.0)), h(i + s + vec2(1.0, 1.0)), u.x),
-    u.y
-  );
-}
-float tb(vec2 p, float s) {
-  return abs(vn(p, s) * 2.0 - 1.0);
-}
-void main() {
-  vec2 p = gl_FragCoord.xy * px;
-  vec3 rgb = vec3(tb(p, t), tb(p, t + 17.0), tb(p, t + 41.0));
-  float a = tb(p, t + 89.0);
-  // alpha 恒等折叠:multiply 下 (rgb, a) 与 (mix(1,rgb,a), 1) 逐像素等价。
-  // 输出全不透明,绕开 WKWebView 对 premultipliedAlpha:false 画布的
-  // unpremultiply 溢出(a→0 像素爆成高饱和彩点 = 椒盐,用户三轮反馈根源)。
-  gl_FragColor = vec4(mix(vec3(1.0), rgb, a), 1.0);
-}`;
-const NOISE_VS = `attribute vec2 a;
-void main() { gl_Position = vec4(a, 0.0, 1.0); }`;
-
-function TvNoise({ active }: { active: boolean }) {
-  const ref = useRef<HTMLCanvasElement>(null);
-  const wrapRef = useRef<HTMLDivElement>(null);
-  const activeRef = useRef(active);
-  activeRef.current = active;
-  const scheduleRef = useRef<() => void>(() => {});
-  useEffect(() => {
-    const canvas = ref.current;
-    const wrap = wrapRef.current;
-    if (!canvas) return;
-    const gl = canvas.getContext("webgl", {
-      alpha: false, // 输出全不透明(alpha 已折进颜色),跨引擎合成零歧义
-      antialias: false,
-      depth: false,
-      stencil: false,
-      powerPreference: "low-power",
-      // 不设 preserveDrawingBuffer:不读回像素,省驱动保留后缓冲的开销,
-      // 也减轻 GPU 压力下 WebView2/WKWebView 主动丢弃 context 的概率。
-    });
-    if (!gl) return; // 无 WebGL:静默无噪点(氛围件,不值得再养 fallback)
-
-    let tLoc: WebGLUniformLocation | null = null;
-    let pxLoc: WebGLUniformLocation | null = null;
-    let ready = false;
-    let forceFit = false;
-
-    // GL 资源建立:首次挂载 + context 恢复后都走这里重建 program/buffer。
-    const initGL = (): boolean => {
-      const compile = (type: number, src: string) => {
-        const s = gl.createShader(type)!;
-        gl.shaderSource(s, src);
-        gl.compileShader(s);
-        return s;
-      };
-      const prog = gl.createProgram()!;
-      gl.attachShader(prog, compile(gl.VERTEX_SHADER, NOISE_VS));
-      gl.attachShader(prog, compile(gl.FRAGMENT_SHADER, NOISE_FS));
-      gl.linkProgram(prog);
-      if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) return false;
-      gl.useProgram(prog);
-      // 全屏三角形
-      const buf = gl.createBuffer();
-      gl.bindBuffer(gl.ARRAY_BUFFER, buf);
-      gl.bufferData(
-        gl.ARRAY_BUFFER,
-        new Float32Array([-1, -1, 3, -1, -1, 3]),
-        gl.STATIC_DRAW,
-      );
-      const loc = gl.getAttribLocation(prog, "a");
-      gl.enableVertexAttribArray(loc);
-      gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
-      tLoc = gl.getUniformLocation(prog, "t");
-      pxLoc = gl.getUniformLocation(prog, "px");
-      forceFit = true; // 恢复后 viewport 需重设,即便画布尺寸未变
-      return true;
-    };
-    ready = initGL();
-
-    // 画布按设备物理像素渲染(retina 不糊),噪声晶格按 CSS 像素网格
-    // (px = baseFrequency / dpr)—— 两者同 feTurbulence 的栅格化行为。
-    const fit = () => {
-      const dpr = window.devicePixelRatio || 1;
-      const w = Math.max(1, Math.round(canvas.clientWidth * dpr));
-      const h = Math.max(1, Math.round(canvas.clientHeight * dpr));
-      if (forceFit || canvas.width !== w || canvas.height !== h) {
-        canvas.width = w;
-        canvas.height = h;
-        gl.viewport(0, 0, w, h);
-        forceFit = false;
-      }
-      // 1.35:较设计稿 baseFrequency 1.15 晶格更密 → 颗粒更细(用户定档)
-      gl.uniform1f(pxLoc, 1.35 / dpr);
-    };
-    let raf = 0;
-    let seed = 2;
-    let focused = document.hasFocus();
-    const shouldRun = () => !document.hidden && focused && activeRef.current;
-    const draw = () => {
-      if (!ready) return;
-      gl.uniform1f(tLoc, seed);
-      gl.drawArrays(gl.TRIANGLES, 0, 3);
-    };
-    const stop = () => {
-      if (raf) cancelAnimationFrame(raf);
-      raf = 0;
-    };
-    const frame = () => {
-      raf = 0;
-      seed = (seed + 0.618) % 61.0;
-      draw();
-      if (shouldRun()) raf = requestAnimationFrame(frame);
-    };
-    const schedule = () => {
-      if (ready && !raf && shouldRun()) raf = requestAnimationFrame(frame);
-    };
-    scheduleRef.current = schedule;
-    const onVisibility = () => {
-      if (document.hidden) stop();
-      else schedule();
-    };
-    const onFocus = () => {
-      focused = true;
-      schedule();
-    };
-    const onBlur = () => {
-      focused = false;
-      stop();
-    };
-    const onLost = (e: Event) => {
-      e.preventDefault();
-      ready = false;
-      stop();
-      if (wrap) wrap.classList.add("ctxlost");
-    };
-    const onRestored = () => {
-      ready = initGL();
-      if (wrap) wrap.classList.remove("ctxlost");
-      if (ready) {
-        fit();
-        draw();
-      }
-      schedule();
-    };
-    if (ready) {
-      fit();
-      draw();
-    }
-    canvas.addEventListener("webglcontextlost", onLost, false);
-    canvas.addEventListener("webglcontextrestored", onRestored, false);
-    const ro = new ResizeObserver(() => {
-      if (!ready) return;
-      fit();
-      draw();
-    });
-    ro.observe(canvas);
-    document.addEventListener("visibilitychange", onVisibility);
-    window.addEventListener("focus", onFocus);
-    window.addEventListener("blur", onBlur);
-    schedule();
-    return () => {
-      stop();
-      ro.disconnect();
-      document.removeEventListener("visibilitychange", onVisibility);
-      window.removeEventListener("focus", onFocus);
-      window.removeEventListener("blur", onBlur);
-      canvas.removeEventListener("webglcontextlost", onLost, false);
-      canvas.removeEventListener("webglcontextrestored", onRestored, false);
-      scheduleRef.current = () => {};
-    };
-  }, []);
-  useEffect(() => {
-    // 重新上电 → 恢复走噪
-    if (active) scheduleRef.current();
-  }, [active]);
-  return (
-    <div className="tvnoise" aria-hidden="true" ref={wrapRef}>
-      <canvas ref={ref} />
-    </div>
-  );
-}
-
-export default function App() {
-  return <AppShell />;
-}
-
-// UPTIME 走表:开机从零计,关机冻结最后读数(v3 原则 #5)。
+// UPTIME 走表:开机从零计,关机冻结最后读数。
 // ref 直写 DOM:每秒走字不进 React 渲染;vdom 文本恒定,父级重渲不会覆写。
 function UptimeStamp({ powerOn }: { powerOn: boolean }) {
   const ref = useRef<HTMLSpanElement>(null);

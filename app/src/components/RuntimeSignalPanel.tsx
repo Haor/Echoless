@@ -1,10 +1,9 @@
 import { memo } from "react";
 import { useI18n } from "../i18n";
-import { useRuntimeLive } from "../runtimeTelemetry";
+import { dash, useRuntimeLive } from "../runtimeTelemetry";
 import { Scope, type Telemetry } from "./Scope";
 import { ScrambleText } from "./ScrambleText";
 import { RAIL_TEXT, type RunStatusKind } from "./RuntimeStatusStrip";
-import { dash } from "../numeric";
 
 export const RuntimeSignalPanel = memo(function RuntimeSignalPanel({
   telRef,
