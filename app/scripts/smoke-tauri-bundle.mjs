@@ -130,8 +130,6 @@ function macAppLayout(appBundle) {
 
 function targetDirLayout(targetDir) {
   const ext = process.platform === "win32" ? ".exe" : "";
-  const helperName =
-    process.platform === "darwin" ? "echoless-process-tap-poc" : "echoless-process-tap-poc";
   return {
     kind: "target-dir",
     root: targetDir,
@@ -139,36 +137,16 @@ function targetDirLayout(targetDir) {
     cli: path.join(targetDir, `echoless${ext}`),
     resources: path.join(targetDir, "resources"),
     infoPlist: null,
-    helper: path.join(targetDir, "resources", "helpers", helperName),
+    helper: path.join(targetDir, "resources", "helpers", "echoless-process-tap-poc"),
   };
 }
 
 function installedAppLayout(installDir) {
-  const resources = discoverResourcesDir(installDir);
+  const resources = path.join(installDir, "resources");
+  // The GUI keeps the cargo binary name; `echoless.exe` is the sidecar CLI.
+  const isAppExecutable = (file) => basenameLower(file) === "echoless-app.exe";
   const appExecutable =
-    firstDirectFile(
-      installDir,
-      (file) =>
-        ["echoless.exe", "echoless-app.exe", "echoless app.exe", "echoless_gui.exe"].includes(
-          basenameLower(file),
-        ),
-    ) ??
-    firstDirectFile(
-      installDir,
-      (file) => basenameLower(file).endsWith(".exe") && basenameLower(file).includes("echoless"),
-    ) ??
-    firstFile(
-      installDir,
-      (file) =>
-        ["echoless.exe", "echoless-app.exe", "echoless app.exe", "echoless_gui.exe"].includes(
-          basenameLower(file),
-        ),
-    ) ??
-    firstFile(
-      installDir,
-      (file) =>
-        basenameLower(file).endsWith(".exe") && basenameLower(file).includes("echoless"),
-    );
+    firstDirectFile(installDir, isAppExecutable) ?? firstFile(installDir, isAppExecutable);
   const cli =
     firstFile(
       resources,
@@ -199,11 +177,6 @@ function installedAppLayout(installDir) {
     infoPlist: null,
     helper: null,
   };
-}
-
-function discoverResourcesDir(root) {
-  const direct = path.join(root, "resources");
-  return direct;
 }
 
 function run(cmd, cmdArgs, options = {}) {

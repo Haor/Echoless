@@ -48,8 +48,12 @@ impl StartupLaunch {
         self.settled.store(true, Ordering::SeqCst);
     }
 
+    pub(crate) fn is_settled(&self) -> bool {
+        self.settled.load(Ordering::SeqCst)
+    }
+
     pub(crate) fn watchdog_pending(&self) -> bool {
-        self.autostart && !self.settled.load(Ordering::SeqCst)
+        self.autostart && !self.is_settled()
     }
 }
 

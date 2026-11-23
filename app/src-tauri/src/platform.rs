@@ -1,5 +1,4 @@
 use std::fs::OpenOptions;
-use std::io::ErrorKind;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -8,14 +7,41 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use tauri::Manager;
 
-pub(crate) fn transient_config_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {
-    let dir = app
+fn runtime_configs_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    Ok(app
         .path()
         .app_local_data_dir()
         .map_err(|e| e.to_string())?
-        .join("runtime-configs");
+        .join("runtime-configs"))
+}
+
+pub(crate) fn transient_config_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    let dir = runtime_configs_dir(app)?;
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     Ok(dir)
+}
+
+/// Removes run/validate configs that a crashed or killed session left behind.
+/// Call it only at startup, before this instance writes its own configs.
+pub(crate) fn remove_stale_transient_configs(app: &tauri::AppHandle) {
+    if let Ok(dir) = runtime_configs_dir(app) {
+        remove_transient_configs_in(&dir);
+    }
+}
+
+pub(crate) fn remove_transient_configs_in(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for path in entries.flatten().map(|entry| entry.path()) {
+        let is_config = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("echoless-") && name.ends_with(".toml"));
+        if is_config && path.is_file() {
+            cleanup_run_config(&path);
+        }
+    }
 }
 
 /// The pid and an in-process counter make the name unique; `create_new`
@@ -68,12 +94,9 @@ pub(crate) fn write_transient_config_toml(
     Ok(path)
 }
 
+/// Best effort: a config that is already gone or cannot be removed is ignored.
 pub(crate) fn cleanup_run_config(path: &Path) {
-    match std::fs::remove_file(path) {
-        Ok(()) => {}
-        Err(err) if err.kind() == ErrorKind::NotFound => {}
-        Err(_) => {}
-    }
+    let _ = std::fs::remove_file(path);
 }
 
 /// 在系统默认浏览器打开外部链接(驱动 / VC++ 下载页)。
@@ -238,7 +261,7 @@ mod tests {
 
     #[test]
     fn privacy_root_and_anchored_subpanels_allowed() {
-        // 系统录音无稳定锚点 → 回退隐私根面板;必须放行(S-01)。
+        // 系统录音无稳定锚点 → 回退隐私根面板;必须放行。
         let root = "x-apple.systempreferences:com.apple.preference.security?Privacy";
         assert_eq!(validate_browser_url(root).as_deref(), Ok(root));
         // 麦克风等带锚点子面板照常放行。

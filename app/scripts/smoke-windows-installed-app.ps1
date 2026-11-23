@@ -140,34 +140,14 @@ function Find-InstalledApp {
     $candidates += (Join-Path ${env:ProgramFiles(x86)} "Echoless")
   }
 
+  # %LOCALAPPDATA%\Echoless is also the data root, so require the GUI binary.
   foreach ($candidate in $candidates) {
-    if (Test-Path $candidate) {
+    if (Test-Path (Join-Path $candidate "echoless-app.exe")) {
       return (Resolve-Path $candidate).Path
     }
   }
 
-  $roots = @(
-    (Join-Path $env:LOCALAPPDATA "Programs"),
-    $env:LOCALAPPDATA,
-    $env:ProgramFiles,
-    ${env:ProgramFiles(x86)}
-  ) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) -and (Test-Path $_) }
-
-  foreach ($root in $roots) {
-    $match = Get-ChildItem -Path $root -Directory -Recurse -ErrorAction SilentlyContinue |
-      Where-Object {
-        $_.Name -match "(?i)echoless" -or
-        (Test-Path (Join-Path $_.FullName "echoless.exe")) -or
-        (Get-ChildItem -Path $_.FullName -File -Filter "*echoless*.exe" -ErrorAction SilentlyContinue | Select-Object -First 1)
-      } |
-      Sort-Object FullName |
-      Select-Object -First 1
-    if ($null -ne $match) {
-      return $match.FullName
-    }
-  }
-
-  throw "Installed Echoless directory not found."
+  throw "Installed Echoless directory not found; tried: $($candidates -join ', ')"
 }
 
 $installer = $null

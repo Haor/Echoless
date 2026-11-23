@@ -12,7 +12,8 @@ use crate::localvqe::{
     LocalVqeModelPin,
 };
 use crate::platform::{
-    cleanup_run_config, validate_browser_url, validate_open_path, write_transient_config_toml,
+    cleanup_run_config, remove_transient_configs_in, validate_browser_url, validate_open_path,
+    write_transient_config_toml,
 };
 use crate::proc::{
     begin_run, command_output_with_timeout, install_run, is_active_run, parse_jsonl_line_event,
@@ -430,6 +431,23 @@ fn transient_config_writer_creates_unique_files() {
     cleanup_run_config(&second);
     assert!(!first.exists());
     assert!(!second.exists());
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn startup_sweep_removes_only_leftover_transient_configs() {
+    let dir = unique_temp_dir("echoless-config-sweep");
+    let leftover = write_transient_config_toml(&dir, "run", "stale = true").unwrap();
+    let unrelated = dir.join("notes.toml");
+    std::fs::write(&unrelated, "keep = true").unwrap();
+    std::fs::create_dir(dir.join("echoless-dir.toml")).unwrap();
+
+    remove_transient_configs_in(&dir);
+
+    assert!(!leftover.exists());
+    assert!(unrelated.exists());
+    assert!(dir.join("echoless-dir.toml").is_dir());
 
     let _ = std::fs::remove_dir_all(dir);
 }

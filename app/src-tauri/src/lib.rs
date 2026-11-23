@@ -101,10 +101,12 @@ pub fn run() {
             // 在 single-instance setup 成功后才打开/清理共享日志目录。第二实例会在
             // single-instance plugin 中退出，不再与主实例竞争日志文件。
             logging::init(env!("CARGO_PKG_VERSION"));
+            // Same single-instance guarantee: no live run of this app owns these files.
+            platform::remove_stale_transient_configs(app.handle());
 
-            // 默认打开基线 1040×640(v17 设计稿画布,布局按此定稿);
-            // B1:min 锁到默认尺寸 —— plate 分格在更小窗口必然破版。
-            // B3:builder 背景色 = 新色板 --bg #1d1d1b,resize 瞬间不露白边。
+            // 1040×640 is the layout baseline and also the minimum: the plate grid
+            // breaks in smaller windows. The background matches the frontend
+            // --bg #1d1d1b so a resize never flashes white.
             let mut builder =
                 WebviewWindowBuilder::new(app, "main", WebviewUrl::App("index.html".into()))
                     .title("Echoless")
@@ -134,12 +136,21 @@ pub fn run() {
 
             let window = builder.build()?;
 
-            // 手动启动兜底:前端正常会在首屏就绪后亮窗;万一前端完全崩溃也在 5s 后
-            // 强制显示。Windows autostart 必须保持隐藏,用户仍可从托盘或再次启动来显窗。
+            // Manual launch fallback: the frontend shows the window once its first
+            // screen is ready; if it never does (for example it crashed), show it
+            // after 5 s. Skip this when the window is already visible or the user
+            // already closed it to the tray (the launch is settled then).
+            // Windows autostart stays hidden; the tray or a second launch shows it.
             if !app.state::<StartupLaunch>().is_autostart() {
+                let fallback_app = app.handle().clone();
                 let w = window.clone();
                 std::thread::spawn(move || {
                     std::thread::sleep(std::time::Duration::from_secs(5));
+                    if fallback_app.state::<StartupLaunch>().is_settled()
+                        || w.is_visible().unwrap_or(false)
+                    {
+                        return;
+                    }
                     let _ = w.show();
                     let _ = w.set_focus();
                 });
@@ -171,7 +182,6 @@ pub fn run() {
             }
             #[cfg(target_os = "macos")]
             device_watch::start(app.handle());
-            let _ = &window;
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -179,6 +189,8 @@ pub fn run() {
                 let prefs = window.state::<TrayPrefs>();
                 if close_to_tray_enabled(&prefs) {
                     api.prevent_close();
+                    // The user chose where the window goes; startup fallbacks must not reopen it.
+                    window.state::<StartupLaunch>().settle();
                     let _ = window.hide();
                 } else {
                     let state = window.state::<RunState>();
@@ -189,7 +201,7 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
         .run(|app_handle, event| {
-            // Cmd+Q / 菜单退出 / Dock Quit 不产生 CloseRequested(审计 B-01):
+            // Cmd+Q / 菜单退出 / Dock Quit 不产生 CloseRequested:
             // 统一在 ExitRequested 回收 sidecar,避免孤儿 CLI 占用麦克风/虚拟麦。
             if let tauri::RunEvent::ExitRequested { .. } = event {
                 let _ = terminate_run(&app_handle.state::<RunState>());

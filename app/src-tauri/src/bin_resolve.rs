@@ -40,8 +40,8 @@ fn current_exe_dir() -> Option<PathBuf> {
 ///   1. ECHOLESS_BIN(开发者显式覆盖);
 ///   2. Tauri externalBin 被 tauri-build 复制到当前可执行文件旁的 `echoless`;
 ///   3. Tauri Resource 目录中的候选;
-///   4. dev 生成的 `src-tauri/binaries/echoless-<target-triple>`;
-///   5. root target release/debug 回退。
+///   4. 仅 debug 构建:dev 生成的 `src-tauri/binaries/echoless-<target-triple>`;
+///   5. 仅 debug 构建:root target release/debug 回退。
 pub(crate) fn echoless_bin(app: Option<&tauri::AppHandle>) -> Result<PathBuf, String> {
     let mut candidates = Vec::new();
     if let Ok(p) = std::env::var("ECHOLESS_BIN") {
@@ -67,25 +67,28 @@ pub(crate) fn echoless_bin(app: Option<&tauri::AppHandle>) -> Result<PathBuf, St
         }
     }
 
-    let manifest = Path::new(env!("CARGO_MANIFEST_DIR")); // .../echoless/app/src-tauri
-    push_file_candidate(
-        &mut candidates,
-        manifest
-            .join("binaries")
-            .join(format!("echoless-{}{}", TAURI_TARGET_TRIPLE, exe_suffix())),
-    );
-    push_file_candidate(
-        &mut candidates,
-        manifest
-            .join("../../target/release")
-            .join(format!("echoless{}", exe_suffix())),
-    );
-    push_file_candidate(
-        &mut candidates,
-        manifest
-            .join("../../target/debug")
-            .join(format!("echoless{}", exe_suffix())),
-    );
+    // Build-machine paths: only meaningful in dev builds, never shipped in release.
+    #[cfg(debug_assertions)]
+    {
+        let manifest = Path::new(env!("CARGO_MANIFEST_DIR")); // .../echoless/app/src-tauri
+        push_file_candidate(
+            &mut candidates,
+            manifest.join("binaries").join(format!(
+                "echoless-{}{}",
+                TAURI_TARGET_TRIPLE,
+                exe_suffix()
+            )),
+        );
+        for profile in ["release", "debug"] {
+            push_file_candidate(
+                &mut candidates,
+                manifest
+                    .join("../../target")
+                    .join(profile)
+                    .join(format!("echoless{}", exe_suffix())),
+            );
+        }
+    }
 
     candidates
         .iter()
@@ -127,14 +130,18 @@ pub(crate) fn process_tap_helper_bin(
         }
     }
 
-    let manifest = Path::new(env!("CARGO_MANIFEST_DIR")); // .../echoless/app/src-tauri
-    for base in manifest.ancestors() {
-        let candidate = base
-            .join("tools")
-            .join("macos-process-tap-poc")
-            .join(".build")
-            .join("echoless-process-tap-poc");
-        push_file_candidate(&mut candidates, candidate);
+    // Dev builds only: the helper built in the repo checkout.
+    #[cfg(debug_assertions)]
+    {
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        push_file_candidate(
+            &mut candidates,
+            repo_root
+                .join("tools")
+                .join("macos-process-tap-poc")
+                .join(".build")
+                .join("echoless-process-tap-poc"),
+        );
     }
 
     candidates.into_iter().find(|path| path.is_file())
@@ -186,19 +193,22 @@ pub(crate) fn localvqe_library_path(app: Option<&tauri::AppHandle>, cli: &Path) 
         push_file_candidate(&mut candidates, PathBuf::from(p));
     }
 
-    // 产品决策(2026-07-05 修正):native runtime 随包分发,只有模型走 HF 下载。
-    // 打包 Resource 目录 → dev 的 src-tauri/resources → 品牌数据根(下载兜底)。
+    // The native runtime ships with the app; only models are downloaded.
+    // Order: bundled Resource dir → (debug builds) src-tauri/resources → brand data root.
     if let Some(resource_native) = resource_path(app, "resources/localvqe/native") {
         if let Some(path) = find_localvqe_library_in_dir(&resource_native) {
             push_file_candidate(&mut candidates, path);
         }
     }
-    let manifest_native = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("resources")
-        .join("localvqe")
-        .join("native");
-    if let Some(path) = find_localvqe_library_in_dir(&manifest_native) {
-        push_file_candidate(&mut candidates, path);
+    #[cfg(debug_assertions)]
+    {
+        let manifest_native = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("resources")
+            .join("localvqe")
+            .join("native");
+        if let Some(path) = find_localvqe_library_in_dir(&manifest_native) {
+            push_file_candidate(&mut candidates, path);
+        }
     }
 
     if let Some(path) = find_localvqe_library_in_dir(&crate::localvqe::localvqe_native_dir_path()) {
