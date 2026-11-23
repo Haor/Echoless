@@ -7,7 +7,6 @@
 //!   delay_hold / tail_ms / delay_num_filters / linear_stable_echo_path。
 //! AGC remains part of this AEC3 APM pipeline. Noise suppression is a separate
 //! processor node so every echo canceller can share the same post-filter.
-//! 详见 research/aec3_internal_map.md §2/§9/§11。
 //!
 //! feature `aec3-engine`(默认开)= 真实 AEC3;关掉 = 直通。
 
@@ -93,7 +92,7 @@ impl EchoProcessor for Aec3Engine {
         }
     }
     fn configure(&mut self, params: &toml::Table) -> anyhow::Result<()> {
-        // 注:外部延迟在当前 realtime 路径下基本无效(只在 reset 时用一次,见 §4.3);保留备用。
+        // The external delay is only applied once after (re)building the engine.
         if let Some(v) = params.get("initial_delay_ms").and_then(|v| v.as_integer()) {
             self.initial_delay_ms = v as i32;
         }
@@ -185,7 +184,7 @@ fn build_aec3_config(t: &Aec3Tuning) -> aec3_apm::EchoCanceller3Config {
         c.filter.refined.length_blocks = blocks;
         c.filter.coarse.length_blocks = blocks;
         // 注:不动 refined_initial / coarse_initial。上游初始滤波器故意短(快速粗收敛,
-        // 再切到长滤波器精修);拉长 initial 会破坏两阶段收敛、显著劣化效果(§11.3)。
+        // 再切到长滤波器精修);拉长 initial 会破坏两阶段收敛、显著劣化效果。
     }
     if let Some(nf) = t.delay_num_filters {
         c.delay.num_filters = nf;
@@ -251,7 +250,7 @@ impl Inner {
         let apm = builder
             .capture_config(StreamConfig::new(SR, 1))
             .render_config(StreamConfig::new(SR, tuning.far_channels))
-            .echo_detector(true) // 提供 residual_echo_likelihood(独立 EchoDetector,§7)
+            .echo_detector(true) // provides residual_echo_likelihood
             .build();
 
         Self {
@@ -300,7 +299,9 @@ impl Aec3Engine {
 impl Aec3Engine {
     fn process_aec3(&mut self, near: &[f32], far: &[f32], out: &mut [f32], frames: usize) {
         let mut runtime_error_count = self.last.runtime_error_count;
-        let mut last_backend_error = self.last.last_backend_error.clone();
+        // Reports only this call's error, so a clean frame clears it and the steady
+        // state does not clone a String on the audio thread.
+        let mut last_backend_error = None;
         if self.stream_delay_pending {
             if let Err(err) = self.inner.apm.set_stream_delay_ms(self.initial_delay_ms) {
                 record_backend_error(
@@ -385,7 +386,7 @@ impl Aec3Engine {
             residual_echo_likelihood: s.residual_echo_likelihood.unwrap_or(0.0) as f32,
             estimated_delay_ms: s.delay_ms.unwrap_or(0),
             aec3_delay_blocks,
-            // 替代判据:上游 divergent_filter_fraction 恒 None(§7),改用"回声似然极高"近似
+            // 替代判据:上游 divergent_filter_fraction 恒 None,改用"回声似然极高"近似
             // (AEC 基本未起作用)。可靠 diverged 待 fork 暴露 all_filters_diverged。
             diverged: s
                 .residual_echo_likelihood
@@ -526,5 +527,10 @@ mod tests {
             .last_backend_error
             .as_deref()
             .is_some_and(|err| err.contains("set_stream_delay_ms: stream parameter was clamped")));
+
+        processor.process(&near, &far, &mut out, FRAME as u32);
+        let stats = processor.stats();
+        assert_eq!(stats.runtime_error_count, 1);
+        assert_eq!(stats.last_backend_error, None);
     }
 }

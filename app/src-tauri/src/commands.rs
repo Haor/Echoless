@@ -74,9 +74,12 @@ pub(crate) async fn request_system_audio(app: tauri::AppHandle) -> Result<Value,
 /// 填充系统信息。字段缺失时返回 null,前端择有而显。仅 macOS;其它平台返回空对象。
 #[tauri::command]
 pub(crate) async fn mac_system_info() -> Value {
+    // sysctl, sw_vers and system_profiler block; keep them off the async runtime.
     #[cfg(target_os = "macos")]
     {
-        mac_system_info_impl().await
+        tauri::async_runtime::spawn_blocking(mac_system_info_impl)
+            .await
+            .unwrap_or_else(|_| serde_json::json!({}))
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -85,7 +88,7 @@ pub(crate) async fn mac_system_info() -> Value {
 }
 
 #[cfg(target_os = "macos")]
-async fn mac_system_info_impl() -> Value {
+fn mac_system_info_impl() -> Value {
     use std::process::Command;
 
     // sysctl -n <key> → 去掉换行的字符串

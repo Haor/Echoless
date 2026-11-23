@@ -6,10 +6,10 @@
 //!                         ├─► 处理线程(每 10ms)─ chain.process(near, far) ─► out_ring ──► 输出设备
 //! 系统 loopback ─► render_ring┘
 //! ```
-//! 设备 I/O 可用原生采样率打开,在设备边界固定比率重采样到 pipeline rate;
+//! 设备 I/O 可用原生采样率打开,在设备边界重采样到 pipeline rate(输出/参考侧带水位速率匹配);
 //! ProcessorChain 仍负责处理器节点边界重采样(如 LocalVQE 16k)。
 //! 跨平台靠 cpal:Windows WASAPI(含 output loopback)/ macOS CoreAudio。
-//! 系统声音参考 = output 设备做 loopback(Windows 原生;macOS 需 BlackHole 之类)。
+//! 系统声音参考:Windows = 默认输出 loopback;macOS = Process Tap helper;Linux = input:<monitor>。
 //! 虚拟音频输出 = 选 VB-Cable / BlackHole 作 output 设备。
 
 mod control;
@@ -51,32 +51,26 @@ use self::devices::{
     select_reference_source, selected_device_label, DeviceKind, ReferenceSource,
     StreamConfigChoice,
 };
-#[cfg(test)]
-use self::devices::{
-    format_device_description, is_virtual_audio_name, system_audio_permission_state,
-};
 use self::diagnostics::{DiagnosticRecorder, DiagnosticRecorderConfig, DiagnosticsStatusHandle};
 use self::frame_ring::{
-    push_interleaved_frames, skip_stale_aligned, try_pop_frame, try_push_frame, try_push_frame_with,
+    push_interleaved_frames, skip_stale_aligned, try_push_frame, try_push_frame_with,
 };
 use self::resample::{
     AdaptiveOutputResampler, AdaptiveReferenceResampler, InterleavedInputResampler,
-    OutputDeviceResampler,
 };
 use self::stats::{RealtimeStats, RealtimeStatsConfig, StatsSample};
 use echoless_core::{
     apply_output_level, apply_reference_channels_to_chain, output_level_gain_db, PipelineConfig,
-    ReferenceChannels, MAX_NEAR_DELAY_MS, MAX_OUTPUT_LEVEL,
+    ReferenceChannels,
 };
 use echoless_processors::{chain_from_nodes, ProcessorChain};
 
 const BYPASS_CROSSFADE_MS: u32 = 15;
 const OUTPUT_PREROLL_FRAMES: usize = 2;
 
-/// T3 输出侧速率匹配参数(水位反馈自适应重采样)。`enabled=false` 时输出走 pre-T3 固定直通。
+/// 输出侧速率匹配参数(水位反馈自适应重采样)。
 #[derive(Clone, Copy)]
 struct OutputRateMatch {
-    enabled: bool,
     setpoint_samples: usize,
     deadband_samples: usize,
 }
@@ -137,7 +131,6 @@ struct ProcessRuntime {
     near_delay_samples: usize,
     output_level: u32,
     bypassed: bool,
-    output_rate_match: bool,
     backend: String,
     algorithmic_latency_ms: f32,
     counters: RealtimeCounters,
@@ -221,28 +214,12 @@ pub fn run_with_options(cfg: &PipelineConfig, options: RuntimeOptions) -> Result
     let reference_source = select_reference_source(&host, cfg.reference.as_str())
         .context("failed to select reference source")?;
 
+    // `cmd_run` has validated sample_rate, frame_ms, near_delay_ms and output_level.
     let sample_rate = cfg.sample_rate;
-    if cfg.frame_ms == 0 {
-        bail!("frame length must be greater than 0ms");
-    }
-    let frame_samples = sample_rate as u64 * cfg.frame_ms as u64;
-    if !frame_samples.is_multiple_of(1000) {
-        bail!(
-            "sample rate and frame length must yield an integer sample count: sample_rate={sample_rate}, frame_ms={}",
-            cfg.frame_ms
-        );
-    }
-    let frame_size = (frame_samples / 1000) as usize;
-    if cfg.near_delay_ms > MAX_NEAR_DELAY_MS {
-        bail!("near_delay_ms must be <= {MAX_NEAR_DELAY_MS}");
-    }
-    if cfg.output_level > MAX_OUTPUT_LEVEL {
-        bail!("output_level must be <= {MAX_OUTPUT_LEVEL}");
-    }
+    let frame_size = cfg.frame_size() as usize;
     let near_delay_samples = delay_ms_to_samples(cfg.near_delay_ms, sample_rate);
-    let ring_size = frame_size * 12 + near_delay_samples; // ~120ms plus explicit near delay
-                                                          // A5:tap 采样率由 helper 流头上报,与管线不一致时 reader 侧线性重采样,
-                                                          // 不再要求管线锁 48k。
+    // Input ring capacity: ~120 ms of headroom plus the configured near delay.
+    let ring_size = frame_size * 12 + near_delay_samples;
 
     let reference_channels = if reference_source.has_reference() {
         usize::from(cfg.reference_channels.channel_count())
@@ -346,6 +323,8 @@ pub fn run_with_options(cfg: &PipelineConfig, options: RuntimeOptions) -> Result
         let running = running.clone();
         move || running.store(false, Ordering::SeqCst)
     })?;
+    // Set by any fatal device-stream error so the run exits non-zero.
+    let stream_failed = Arc::new(AtomicBool::new(false));
 
     let counters = RealtimeCounters::new();
 
@@ -365,13 +344,17 @@ pub fn run_with_options(cfg: &PipelineConfig, options: RuntimeOptions) -> Result
         "mic",
         InputChannelMode::MonoDownmix,
         counters.mic_input_drops.clone(),
-        stream_error_handler("mic", running.clone(), options.status_json),
+        stream_error_handler(
+            "mic",
+            running.clone(),
+            stream_failed.clone(),
+            options.status_json,
+        ),
     )?;
     let output_setpoint_samples = frame_size.saturating_mul(OUTPUT_PREROLL_FRAMES);
     // 软死区 = 半帧:正常回调抖动(误差远小于半帧)落在死区内,控制器不介入 = 精确直通;
     // 只有累积漂移穿出半帧才微调。半帧远小于 setpoint(2 帧),不影响漂移吸收能力。
     let output_rate_match = OutputRateMatch {
-        enabled: cfg.output_rate_match,
         setpoint_samples: output_setpoint_samples,
         deadband_samples: frame_size / 2,
     };
@@ -381,7 +364,12 @@ pub fn run_with_options(cfg: &PipelineConfig, options: RuntimeOptions) -> Result
         out_cons,
         counters.output_underruns.clone(),
         output_rate_match,
-        stream_error_handler("output", running.clone(), options.status_json),
+        stream_error_handler(
+            "output",
+            running.clone(),
+            stream_failed.clone(),
+            options.status_json,
+        ),
     )?;
     let mut render_prod = render_prod;
     let render_stream = match (&reference_source, render_config.as_ref()) {
@@ -396,7 +384,12 @@ pub fn run_with_options(cfg: &PipelineConfig, options: RuntimeOptions) -> Result
                 "ref",
                 InputChannelMode::from_reference_channels(cfg.reference_channels),
                 counters.ref_input_drops.clone(),
-                stream_error_handler("reference", running.clone(), options.status_json),
+                stream_error_handler(
+                    "reference",
+                    running.clone(),
+                    stream_failed.clone(),
+                    options.status_json,
+                ),
             )?)
         }
         _ => None,
@@ -413,6 +406,7 @@ pub fn run_with_options(cfg: &PipelineConfig, options: RuntimeOptions) -> Result
                 p,
                 counters.ref_input_drops.clone(),
                 running.clone(),
+                stream_failed.clone(),
                 options.status_json,
             )?)
         }
@@ -446,8 +440,7 @@ pub fn run_with_options(cfg: &PipelineConfig, options: RuntimeOptions) -> Result
     let output_preroll_samples =
         prime_output_ring(&mut out_prod, frame_size, OUTPUT_PREROLL_FRAMES);
     let output_preroll_ms = samples_to_ms(output_preroll_samples, sample_rate);
-    // 控制线程无条件启动(不再只限 --status-json):stdin EOF = 停机契约的
-    // 感知通道,GUI/管道调用方关闭 stdin 即优雅停机(审计 B-01)。
+    // 控制线程无条件启动:stdin EOF = 停机契约,GUI/管道调用方关闭 stdin 即优雅停机。
     let control = Some(spawn_control_reader());
     let started_event = json!({
         "type": "started",
@@ -465,7 +458,6 @@ pub fn run_with_options(cfg: &PipelineConfig, options: RuntimeOptions) -> Result
         "output_preroll_frames": OUTPUT_PREROLL_FRAMES,
         "output_preroll_samples": output_preroll_samples,
         "output_preroll_ms": output_preroll_ms,
-        "output_rate_match": cfg.output_rate_match,
         "reference_source": reference_source.status_name(),
         "diagnostics_session_dir": diagnostics_session_dir.as_deref(),
         "mic_device_sample_rate": mic_config.stream_sample_rate(),
@@ -486,7 +478,6 @@ pub fn run_with_options(cfg: &PipelineConfig, options: RuntimeOptions) -> Result
         near_delay_samples,
         output_level: cfg.output_level,
         bypassed: cfg.bypass,
-        output_rate_match: cfg.output_rate_match,
         backend,
         algorithmic_latency_ms,
         counters,
@@ -548,6 +539,9 @@ pub fn run_with_options(cfg: &PipelineConfig, options: RuntimeOptions) -> Result
     drop(process_tap_stream);
     drop(output_stream);
     proc.join().ok();
+    if stream_failed.load(Ordering::SeqCst) {
+        bail!("realtime run stopped after a fatal audio stream error");
+    }
     print_human(options.status_json, "Stopped.");
     Ok(())
 }
@@ -584,18 +578,10 @@ fn process_loop<M, R, O>(
     let mut out = vec![0.0f32; frame_size];
     let mut near_delay = VecDeque::from(vec![0.0f32; runtime.near_delay_samples]);
     let mut output_bypassed = runtime.bypassed;
-    // T3 参考侧:连续重采样吸收 far 时钟漂移,替代 skip_stale 硬丢帧(避免撕裂 AEC 参考时间轴)。
-    // 设定点 2 帧给收敛裕量;软死区半帧,正常抖动不介入 = 连续直通。关闭 output_rate_match 时
-    // 回退旧 skip_stale 路径。
-    let mut ref_resampler = if runtime.output_rate_match {
-        Some(AdaptiveReferenceResampler::new(
-            runtime.reference_channels,
-            frame_size * 2,
-            frame_size / 2,
-        ))
-    } else {
-        None
-    };
+    // 参考侧连续重采样吸收 far 时钟漂移,不硬丢帧(避免撕裂 AEC 参考时间轴)。
+    // 设定点 2 帧给收敛裕量;软死区半帧,正常抖动不介入 = 连续直通。
+    let mut ref_resampler =
+        AdaptiveReferenceResampler::new(runtime.reference_channels, frame_size * 2, frame_size / 2);
     let mut bypass_crossfade = BypassCrossfade::new(bypass_crossfade_samples(runtime.sample_rate));
     let mut stats = runtime.stats_interval.map(|interval| {
         RealtimeStats::new(RealtimeStatsConfig {
@@ -613,6 +599,7 @@ fn process_loop<M, R, O>(
         })
     });
     let mut diagnostic = runtime.diagnostic;
+    let mut pending_diagnostic = None;
     let mut control = runtime.control;
 
     while running.load(Ordering::SeqCst) {
@@ -620,6 +607,7 @@ fn process_loop<M, R, O>(
             &mut control,
             RuntimeControlContext {
                 diagnostic: &mut diagnostic,
+                pending_diagnostic: &mut pending_diagnostic,
                 stats: stats.as_mut(),
                 chain: &mut chain,
                 sample_rate: runtime.sample_rate,
@@ -656,31 +644,19 @@ fn process_loop<M, R, O>(
             runtime.near_delay_samples,
         );
 
-        let mut ref_underrun_frames = 0;
-        let mut ref_stale_drops = 0;
-        if let Some(rc) = render_cons.as_mut() {
-            match ref_resampler.as_mut() {
-                // T3:连续重采样,按水位吸收 far 时钟漂移,不硬丢帧。参考欠载时该帧填零并计入
-                // ref_underrun(此路径下 ref_stale_drops 恒 0)。
-                Some(resampler) => {
-                    let occ_frames = rc.occupied_len() / runtime.reference_channels.max(1);
-                    let underrun_frames = resampler.fill(&mut far, frame_size, occ_frames, rc);
-                    ref_underrun_frames = underrun_frames;
-                }
-                // 关闭 output_rate_match:回退旧 skip_stale 硬丢帧路径(pre-T3 行为)。
-                None => {
-                    ref_stale_drops =
-                        skip_stale_aligned(rc, far_samples_per_frame, runtime.reference_channels)
-                            / runtime.reference_channels.max(1);
-                    if !try_pop_frame(rc, &mut far) {
-                        far.fill(0.0); // 参考欠载 → 填静音
-                        ref_underrun_frames = frame_size;
-                    }
-                }
+        // The reference resampler never drops frames, so ref_stale_drops stays 0;
+        // a missing reference frame is zero-filled and counted as an underrun.
+        let ref_stale_drops = 0;
+        let ref_underrun_frames = match render_cons.as_mut() {
+            Some(rc) => {
+                let occ_frames = rc.occupied_len() / runtime.reference_channels;
+                ref_resampler.fill(&mut far, frame_size, occ_frames, rc)
             }
-        } else {
-            far.fill(0.0);
-        }
+            None => {
+                far.fill(0.0);
+                0
+            }
+        };
 
         process_bypass_frame(
             &mut chain,
@@ -696,8 +672,17 @@ fn process_loop<M, R, O>(
             &mut bypass_crossfade,
         );
         apply_output_level(&mut out, runtime.output_level);
-        let node_stats = chain.stats();
         let pushed = out_prod.push_slice(&out);
+        // chain.stats() allocates; only collect it for diagnostics frames and status lines.
+        let node_stats = if diagnostic
+            .as_ref()
+            .is_some_and(DiagnosticRecorder::is_recording)
+            || stats.as_ref().is_some_and(RealtimeStats::print_due)
+        {
+            chain.stats()
+        } else {
+            Vec::new()
+        };
         let output_overruns = out.len().saturating_sub(pushed) as u64;
         let ref_q = render_cons
             .as_ref()
@@ -724,13 +709,9 @@ fn process_loop<M, R, O>(
             node_stats: &node_stats,
         };
         if let Some(recorder) = diagnostic.as_mut() {
-            match recorder.write_frame(&sample) {
-                Ok(true) => {}
-                Ok(false) => {}
-                Err(err) => {
-                    eprintln!("diagnostics recording failed, disabled: {err:#}");
-                    diagnostic = None;
-                }
+            if let Err(err) = recorder.write_frame(&sample) {
+                eprintln!("diagnostics recording failed, disabled: {err:#}");
+                diagnostic = None;
             }
         }
         if let Some(stats) = stats.as_mut() {
@@ -761,7 +742,7 @@ fn process_bypass_frame(
     crossfade: &mut BypassCrossfade,
 ) {
     // bypass 时链也恒跑(keep-warm):AEC3 滤波器/有状态节点持续收敛,
-    // 解旁路瞬间无重收敛间隙;bypass 只决定输出选源(审计 B-09,DECISIONS #4)。
+    // 解旁路瞬间无重收敛间隙;bypass 只决定输出选源。
     chain.process(
         inputs.near,
         inputs.far,
@@ -840,11 +821,7 @@ fn prime_output_ring<P: Producer<Item = f32>>(
 }
 
 fn samples_to_ms(samples: usize, sample_rate: u32) -> f64 {
-    if sample_rate == 0 {
-        0.0
-    } else {
-        samples as f64 / sample_rate as f64 * 1000.0
-    }
+    samples as f64 / sample_rate as f64 * 1000.0
 }
 
 // ── 流构建(多采样格式)────────────────────────────────────────────────────────
@@ -866,9 +843,11 @@ macro_rules! dispatch_format {
 fn stream_error_handler(
     label: &'static str,
     running: Arc<AtomicBool>,
+    stream_failed: Arc<AtomicBool>,
     status_json: bool,
 ) -> impl FnMut(cpal::StreamError) {
     move |err| {
+        stream_failed.store(true, Ordering::SeqCst);
         running.store(false, Ordering::SeqCst);
         eprintln!("{label} stream error: {err}");
         if status_json {
@@ -1099,60 +1078,30 @@ where
 {
     let config = choice.config();
     let channels = usize::from(config.channels);
-    let mut resampler =
-        OutputDeviceResampler::new(choice.pipeline_sample_rate, choice.stream_sample_rate());
-    let needs_resampling = choice.requires_resampling();
-    // T3:启用 rate match 时始终使用 base-ratio + 水位反馈的连续重采样。名义采样率
-    // 不同时 base_ratio 处理 44.1↔48 kHz，trim 继续吸收两块设备时钟的 ppm 漂移。
+    // base-ratio + 水位反馈的连续重采样:名义采样率不同时 base_ratio 处理 44.1↔48 kHz,
+    // trim 继续吸收两块设备时钟的 ppm 漂移。
     let mut adaptive = AdaptiveOutputResampler::new(
         choice.pipeline_sample_rate,
         choice.stream_sample_rate(),
         rate_match.setpoint_samples,
         rate_match.deadband_samples,
     );
-    let use_adaptive = rate_match.enabled;
     let mut adaptive_buf: Vec<f32> = Vec::new();
     device
         .build_output_stream(
             &config,
             move |data: &mut [T], _: &cpal::OutputCallbackInfo| {
                 let frames = data.len() / channels;
-                if use_adaptive {
-                    let occupied = consumer.occupied_len();
-                    adaptive_buf.clear();
-                    adaptive_buf.resize(frames, 0.0);
-                    adaptive.fill(&mut adaptive_buf, occupied, &mut consumer, &underruns);
-                    for (frame_index, frame) in data.chunks_mut(channels).enumerate() {
-                        let s = T::from_sample(adaptive_buf[frame_index]);
-                        for out in frame {
-                            *out = s; // 单声道铺到所有输出声道
-                        }
+                let occupied = consumer.occupied_len();
+                adaptive_buf.clear();
+                adaptive_buf.resize(frames, 0.0);
+                adaptive.fill(&mut adaptive_buf, occupied, &mut consumer, &underruns);
+                for (frame_index, frame) in data.chunks_mut(channels).enumerate() {
+                    let s = T::from_sample(adaptive_buf[frame_index]);
+                    for out in frame {
+                        *out = s; // 单声道铺到所有输出声道
                     }
-                } else if needs_resampling {
-                    let samples = resampler.next_chunk(frames, &mut consumer, &underruns);
-                    for (frame_index, frame) in data.chunks_mut(channels).enumerate() {
-                        let s = T::from_sample(samples.get(frame_index).copied().unwrap_or(0.0));
-                        for out in frame {
-                            *out = s; // 单声道铺到所有输出声道
-                        }
-                    }
-                } else {
-                    for frame in data.chunks_mut(channels) {
-                        let sample = {
-                            match consumer.try_pop() {
-                                Some(v) => v.clamp(-1.0, 1.0),
-                                None => {
-                                    underruns.fetch_add(1, Ordering::Relaxed);
-                                    0.0
-                                }
-                            }
-                        };
-                        let s = T::from_sample(sample);
-                        for out in frame {
-                            *out = s; // 单声道铺到所有输出声道
-                        }
-                    }
-                };
+                }
             },
             on_error,
             None,
@@ -1303,9 +1252,8 @@ mod tests {
     use std::cell::Cell;
     use std::sync::atomic::AtomicUsize;
 
-    use cpal::{
-        BackendSpecificError, DeviceDescriptionBuilder, DeviceType, InterfaceType, StreamError,
-    };
+    use cpal::{BackendSpecificError, StreamError};
+    use echoless_core::MAX_OUTPUT_LEVEL;
     use echoless_processors::{aec3::Aec3Engine, EchoProcessor, IoSpec, ProcessorStats};
     use ringbuf::traits::Observer;
 
@@ -1470,8 +1418,8 @@ mod tests {
         approx_slice(&out, &[0.3, -0.6, 0.75, -0.75], 0.001);
     }
 
-    // 冷路径(bypass 期间停喂 chain)已随审计 B-09 删除:该路径解旁路后残差是
-    // 保温路径的 5 倍以上(重收敛间隙),产品语义要求 OFF=穿透时引擎恒保温。
+    // bypass 期间停喂 chain 的冷路径解旁路后残差是保温路径的 5 倍以上(重收敛间隙),
+    // 产品语义要求 OFF=穿透时引擎恒保温。
     #[test]
     fn bypass_keeps_chain_warm_for_clean_restore() {
         let warm = restore_rms_after_bypass();
@@ -1728,20 +1676,6 @@ mod tests {
     }
 
     #[test]
-    fn device_description_label_prefers_driver_detail() {
-        let desc = DeviceDescriptionBuilder::new("麦克风")
-            .driver("USB Condenser Microphone")
-            .device_type(DeviceType::Microphone)
-            .interface_type(InterfaceType::Usb)
-            .build();
-
-        assert_eq!(
-            format_device_description(&desc),
-            "麦克风 / USB Condenser Microphone"
-        );
-    }
-
-    #[test]
     fn input_channel_mode_downmixes_or_preserves_stereo() {
         let drops = AtomicU64::new(0);
         let (mut mono_prod, mut mono_cons) = HeapRb::<f32>::new(4).split();
@@ -1786,12 +1720,14 @@ mod tests {
             assert_eq!(payload["stream"], "output");
             assert_eq!(payload["message"], error.to_string());
             assert_eq!(payload["fatal"], true);
-            assert_eq!(payload["recoverable"], stream_error_recoverable(&error));
 
             let running = Arc::new(AtomicBool::new(true));
-            let mut handler = stream_error_handler("output", running.clone(), false);
+            let failed = Arc::new(AtomicBool::new(false));
+            let mut handler =
+                stream_error_handler("output", running.clone(), failed.clone(), false);
             handler(error);
             assert!(!running.load(Ordering::SeqCst));
+            assert!(failed.load(Ordering::SeqCst));
         }
     }
 
@@ -1849,7 +1785,7 @@ mod tests {
             source[2] = f32::NEG_INFINITY;
 
             let mut mapped = Vec::with_capacity(441 * channels);
-            for frame in source.chunks_exact(2) {
+            for frame in source.as_chunks::<2>().0 {
                 map_input_frame(frame, channel_mode, &mut mapped);
             }
             assert!(mapped.iter().all(|sample| sample.is_finite()));
@@ -1936,26 +1872,11 @@ mod tests {
 
         assert_eq!(drops.load(Ordering::Relaxed), 1);
         let mut existing = [0.0; 2];
-        assert!(try_pop_frame(&mut consumer, &mut existing));
+        assert!(super::frame_ring::try_pop_frame(
+            &mut consumer,
+            &mut existing
+        ));
         assert_eq!(existing, [10.0, 11.0]);
         assert_eq!(consumer.occupied_len(), 0);
-    }
-
-    #[test]
-    fn virtual_audio_name_detection_covers_common_drivers() {
-        assert!(is_virtual_audio_name(
-            "CABLE Input (VB-Audio Virtual Cable)"
-        ));
-        assert!(is_virtual_audio_name("BlackHole 2ch"));
-        assert!(is_virtual_audio_name("Virtual Desktop Mic"));
-        assert!(!is_virtual_audio_name("MacBook Pro Speakers"));
-    }
-
-    #[test]
-    fn system_audio_permission_state_uses_frontend_contract_values() {
-        assert!(matches!(
-            system_audio_permission_state(),
-            "granted" | "denied" | "undetermined" | "unknown"
-        ));
     }
 }

@@ -18,7 +18,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 const KEEP_DAYS: u64 = 7;
 const KEEP_FILES: usize = 20;
 const MAX_BYTES: u64 = 8 * 1024 * 1024;
-const CREATE_ATTEMPTS: usize = 1_000;
 
 struct Sink {
     file: File,
@@ -36,7 +35,7 @@ pub(crate) fn init(app_version: &str) {
         return;
     }
     prune(&dir);
-    let Ok((_path, sink)) = create_unique_sink(&dir, &file_stamp(), std::process::id()) else {
+    let Ok(sink) = create_sink(&dir, &file_stamp(), std::process::id()) else {
         return;
     };
     let _ = SINK.set(Mutex::new(Some(sink)));
@@ -80,28 +79,15 @@ fn append_line(sink: &mut Sink, line: &str, max_bytes: u64) {
     }
 }
 
-fn create_unique_sink(dir: &Path, stamp: &str, pid: u32) -> io::Result<(PathBuf, Sink)> {
-    for attempt in 0..CREATE_ATTEMPTS {
-        let path = dir.join(format!("echoless-{stamp}-p{pid}-{attempt:03}.log"));
-        match OpenOptions::new().write(true).create_new(true).open(&path) {
-            Ok(file) => {
-                return Ok((
-                    path,
-                    Sink {
-                        file,
-                        written: 0,
-                        truncated: false,
-                    },
-                ));
-            }
-            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
-            Err(err) => return Err(err),
-        }
-    }
-    Err(io::Error::new(
-        io::ErrorKind::AlreadyExists,
-        format!("failed to reserve a unique log file after {CREATE_ATTEMPTS} attempts"),
-    ))
+/// One file per process: the nanosecond stamp plus the pid make the name unique.
+fn create_sink(dir: &Path, stamp: &str, pid: u32) -> io::Result<Sink> {
+    let path = dir.join(format!("echoless-{stamp}-p{pid}.log"));
+    let file = OpenOptions::new().write(true).create_new(true).open(path)?;
+    Ok(Sink {
+        file,
+        written: 0,
+        truncated: false,
+    })
 }
 
 /// 清理:先删超龄,再按 mtime 新→旧只保留 KEEP_FILES-1 个(本次启动还要新建一个)。
@@ -199,8 +185,6 @@ fn civil_from_days(z: i64) -> (u64, u64, u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashSet;
-    use std::sync::{Arc, Barrier};
 
     struct TestDir(PathBuf);
 
@@ -231,47 +215,22 @@ mod tests {
     }
 
     #[test]
-    fn same_stamp_concurrent_creation_reserves_distinct_files() {
-        const WORKERS: usize = 8;
-        let dir = TestDir::new("concurrent");
-        let path = Arc::new(dir.0.clone());
-        let barrier = Arc::new(Barrier::new(WORKERS));
-        let workers: Vec<_> = (0..WORKERS)
-            .map(|_| {
-                let path = Arc::clone(&path);
-                let barrier = Arc::clone(&barrier);
-                std::thread::spawn(move || {
-                    barrier.wait();
-                    let (path, _sink) =
-                        create_unique_sink(&path, "20260710-010203-000000000", 1234)
-                            .expect("reserve unique log");
-                    path
-                })
-            })
-            .collect();
+    fn size_cap_writes_one_marker_then_stops() {
+        let dir = TestDir::new("cap");
+        let mut sink = create_sink(&dir.0, "stamp", 7).unwrap();
 
-        let paths: HashSet<_> = workers
-            .into_iter()
-            .map(|worker| worker.join().expect("worker must finish"))
-            .collect();
+        append_line(&mut sink, "1234\n", 5);
+        append_line(&mut sink, "x\n", 5);
+        append_line(&mut sink, "y\n", 5);
 
-        assert_eq!(paths.len(), WORKERS);
-        assert!(paths.iter().all(|path| path.exists()));
-    }
-
-    #[test]
-    fn colliding_sessions_keep_independent_size_caps() {
-        let dir = TestDir::new("caps");
-        let (_, mut first) = create_unique_sink(&dir.0, "same", 7).unwrap();
-        let (_, mut second) = create_unique_sink(&dir.0, "same", 7).unwrap();
-
-        append_line(&mut first, "1234\n", 5);
-        append_line(&mut first, "x\n", 5);
-        append_line(&mut second, "z\n", 5);
-
-        assert_eq!(first.written, 5);
-        assert!(first.truncated);
-        assert_eq!(second.written, 2);
-        assert!(!second.truncated);
+        assert_eq!(sink.written, 5);
+        assert!(sink.truncated);
+        let content = fs::read_to_string(dir.0.join("echoless-stamp-p7.log")).unwrap();
+        assert!(content.starts_with("1234\n"), "{content}");
+        assert_eq!(content.matches("size cap reached").count(), 1, "{content}");
+        assert!(
+            !content.contains('x') && !content.contains('y'),
+            "{content}"
+        );
     }
 }

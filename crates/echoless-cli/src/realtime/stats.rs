@@ -73,9 +73,6 @@ pub(super) fn input_queue_latency_ms(mic_q_samples: usize, sample_rate: u32) -> 
 }
 
 fn queue_latency_ms(samples: usize, sample_rate: u32) -> f64 {
-    if sample_rate == 0 {
-        return 0.0;
-    }
     samples as f64 / sample_rate as f64 * 1000.0
 }
 
@@ -362,15 +359,24 @@ fn signed_ratio(positive: u64, negative: u64, denominator: u64) -> f64 {
 
 /// 参考侧「跟不上生产/消费节奏」的合并信号,供时钟错配检测用作与 output_underruns 同源的佐证。
 ///
-/// - pre-T3(output_rate_match=off):ref 侧 `skip_stale` 硬丢帧 → 信号在 `ref_stale_drops`,
-///   参考 ring 被 skip_stale 约束住基本不溢出,`ref_input_drops≈0`。
-/// - T3(output_rate_match=on):ref 侧改连续重采样,`ref_stale_drops` 恒 0;大错配(超 ±3%
-///   权限)时参考 ring 溢出 → 信号迁移到 `ref_input_drops`。
-///
-/// 两者相加使 [`ClockSkewDetector`] 在 T3 开关两种模式下都能拿到参考侧佐证(各模式恰有一路≈0),
-/// 从而保住 T1 的告警能力(否则 T3 会让 `ref_stale_drops` 恒 0、`ref_correlated` 永假、告警失效)。
+/// 参考侧连续重采样从不硬丢帧,大错配(超 ±3% 调节范围)时表现为参考 ring 溢出
+/// (`ref_input_drops`)。`ref_stale_drops` 仍计入,以便 [`ClockSkewDetector`] 只看一个合并值。
 pub(super) fn ref_pace_loss(ref_stale_drops: u64, ref_input_drops: u64) -> u64 {
     ref_stale_drops.saturating_add(ref_input_drops)
+}
+
+/// Health counters accumulated since the run started.
+///
+/// The per-interval counters in [`RealtimeStats`] reset on every status line
+/// (default 80 ms), so they only show whether the last window had a problem.
+/// These totals are never reset during a run and back the health panel.
+#[derive(Clone, Copy, Debug, Default)]
+struct RunTotals {
+    input_drops: u64,
+    mic_stale_drops: u64,
+    ref_stale_drops: u64,
+    ref_underruns: u64,
+    output_underruns: u64,
 }
 
 pub(super) struct RealtimeStats {
@@ -411,6 +417,7 @@ pub(super) struct RealtimeStats {
     output_underruns: u64,
     clock_frames: u64,
     clock_skew: ClockSkewDetector,
+    totals: RunTotals,
     node_process_time_ms: f32,
     node_runtime_errors: u64,
     aec_estimated_delay_ms: i32,
@@ -474,6 +481,7 @@ impl RealtimeStats {
             output_underruns: 0,
             clock_frames: 0,
             clock_skew: ClockSkewDetector::new(config.sample_rate),
+            totals: RunTotals::default(),
             node_process_time_ms: 0.0,
             node_runtime_errors: 0,
             aec_estimated_delay_ms: 0,
@@ -528,16 +536,39 @@ impl RealtimeStats {
         self.ref_underruns += sample.ref_underruns;
         self.output_overruns += sample.output_overruns;
         self.output_underruns += sample.output_underruns;
+        let totals = &mut self.totals;
+        totals.input_drops = totals
+            .input_drops
+            .saturating_add(sample.mic_input_drops)
+            .saturating_add(sample.ref_input_drops);
+        totals.mic_stale_drops = totals
+            .mic_stale_drops
+            .saturating_add(sample.mic_stale_drops);
+        totals.ref_stale_drops = totals
+            .ref_stale_drops
+            .saturating_add(sample.ref_stale_drops);
+        totals.ref_underruns = totals.ref_underruns.saturating_add(sample.ref_underruns);
+        totals.output_underruns = totals
+            .output_underruns
+            .saturating_add(sample.output_underruns);
         self.clock_frames = self.clock_frames.saturating_add(sample.frame_size as u64);
-        self.node_process_time_ms = self
-            .node_process_time_ms
-            .max(aggregate_process_time_ms(sample.node_stats));
-        self.node_runtime_errors = aggregate_runtime_errors(sample.node_stats);
-        self.aec_estimated_delay_ms = aggregate_estimated_delay_ms(sample.node_stats);
-        self.aec3_delay_blocks = aggregate_aec3_delay_blocks(sample.node_stats);
-        self.node_diverged = aggregate_diverged(sample.node_stats);
-        self.node_last_error = aggregate_last_error(sample.node_stats);
+        // Node stats are collected only on frames that print or record diagnostics.
+        if !sample.node_stats.is_empty() {
+            self.node_process_time_ms = self
+                .node_process_time_ms
+                .max(aggregate_process_time_ms(sample.node_stats));
+            self.node_runtime_errors = aggregate_runtime_errors(sample.node_stats);
+            self.aec_estimated_delay_ms = aggregate_estimated_delay_ms(sample.node_stats);
+            self.aec3_delay_blocks = aggregate_aec3_delay_blocks(sample.node_stats);
+            self.node_diverged = aggregate_diverged(sample.node_stats);
+            self.node_last_error = aggregate_last_error(sample.node_stats);
+        }
         self.maybe_print();
+    }
+
+    /// True when the next observed frame will emit a status line.
+    pub(super) fn print_due(&self) -> bool {
+        self.last_print.elapsed() >= self.interval
     }
 
     fn maybe_print(&mut self) {
@@ -545,10 +576,7 @@ impl RealtimeStats {
         if now.duration_since(self.last_print) < self.interval {
             return;
         }
-        // 参考侧「跟不上」信号:pre-T3 = skip_stale 硬丢帧(ref_stale_drops);
-        // T3 开启后 ref 侧改连续重采样,ref_stale_drops 恒 0,大错配时体现为参考 ring 溢出
-        // (ref_input_drops)。两者相加 → 无论 T3 开关,都能提供与 output_underruns 同源的
-        // 时钟错配佐证(pre-T3 时 ref_input_drops≈0,T3 时 ref_stale_drops≈0,各取其一)。
+        // 参考侧「跟不上」信号,作为与 output_underruns 同源的时钟错配佐证。
         let ref_pace_loss = ref_pace_loss(self.ref_stale_drops, self.ref_input_drops);
         let clock_skew_event = self.clock_skew.observe(
             self.clock_frames,
@@ -557,7 +585,7 @@ impl RealtimeStats {
             ref_pace_loss,
             self.ref_underruns,
         );
-        // 审计 B-02:本方法在音频处理线程上执行,写出必须走异步发射器,
+        // 本方法在音频处理线程上执行,写出必须走异步发射器,
         // 不许同步碰 stdout(管道满会阻塞处理循环 → 爆音)。
         if self.status_json {
             emit_stdout_line(self.status_json_line(now));
@@ -586,8 +614,12 @@ impl RealtimeStats {
         self.output_underruns = 0;
         self.clock_frames = 0;
         self.node_process_time_ms = 0.0;
-        self.node_diverged = false;
-        self.node_last_error = None;
+        // Keep node_diverged / node_last_error: the processing loop samples
+        // chain stats when `print_due()` is true, but `maybe_print` re-reads
+        // the clock after processing. When the interval elapses between the
+        // two reads, a line prints without fresh node stats; resetting here
+        // made that line report diverged=false and no error (flicker).
+        // Fresh node stats overwrite both values on the next sampled frame.
     }
 
     fn text_line(&self, now: Instant) -> String {
@@ -731,6 +763,11 @@ impl RealtimeStats {
             "ref_underruns": self.ref_underruns,
             "output_underruns": self.output_underruns,
             "output_overruns": self.output_overruns,
+            "input_drops_total": self.totals.input_drops,
+            "mic_stale_drops_total": self.totals.mic_stale_drops,
+            "ref_stale_drops_total": self.totals.ref_stale_drops,
+            "ref_underruns_total": self.totals.ref_underruns,
+            "output_underruns_total": self.totals.output_underruns,
             "output_skew_pct": self.clock_skew.snapshot.output_skew_pct,
             "ref_skew_pct": self.clock_skew.snapshot.ref_skew_pct,
             "clock_skew_warning": self.clock_skew.warning,
@@ -883,6 +920,103 @@ mod tests {
     }
 
     #[test]
+    fn run_totals_survive_per_interval_resets() {
+        let mut stats = RealtimeStats::new(RealtimeStatsConfig {
+            interval: Duration::ZERO,
+            sample_rate: 48_000,
+            frame_ms: 10,
+            near_delay_ms: 0,
+            output_level: 100,
+            bypassed: false,
+            backend: "aec3".into(),
+            algorithmic_latency_ms: 0.0,
+            status_json: true,
+            diagnostics_session_dir: None,
+            diagnostics_status: None,
+        });
+        let frame = [0.0f32; 480];
+        let sample = |output_underruns, ref_underruns, mic_input_drops| StatsSample {
+            algorithmic_latency_ms: 0.0,
+            near_delay_ms: 0,
+            near_delay_buffered_samples: 0,
+            frame_size: 480,
+            near: &frame,
+            far: &frame,
+            out: &frame,
+            mic_q: 0,
+            ref_q: 0,
+            out_q: 0,
+            mic_input_drops,
+            ref_input_drops: 1,
+            mic_stale_drops: 2,
+            ref_stale_drops: 0,
+            ref_underruns,
+            output_overruns: 0,
+            output_underruns,
+            node_stats: &[],
+        };
+
+        // Interval zero: every observe prints a status line and resets the
+        // per-interval counters.
+        stats.observe(&sample(480, 0, 1));
+        stats.observe(&sample(0, 240, 0));
+        stats.observe(&sample(0, 0, 0));
+
+        let value = stats.status_value(Instant::now());
+        assert_eq!(value["output_underruns"], 0);
+        assert_eq!(value["ref_underruns"], 0);
+        assert_eq!(value["output_underruns_total"], 480);
+        assert_eq!(value["ref_underruns_total"], 240);
+        assert_eq!(value["input_drops_total"], 4);
+        assert_eq!(value["mic_stale_drops_total"], 6);
+        assert_eq!(value["ref_stale_drops_total"], 0);
+    }
+
+    #[test]
+    fn node_state_is_kept_when_a_status_line_has_no_fresh_node_stats() {
+        let mut stats = RealtimeStats::new(RealtimeStatsConfig {
+            interval: Duration::ZERO,
+            sample_rate: 48_000,
+            frame_ms: 10,
+            near_delay_ms: 0,
+            output_level: 100,
+            bypassed: false,
+            backend: "aec3".into(),
+            algorithmic_latency_ms: 0.0,
+            status_json: true,
+            diagnostics_session_dir: None,
+            diagnostics_status: None,
+        });
+        stats.node_diverged = true;
+        stats.node_last_error = Some("boom".into());
+        let frame = [0.0f32; 480];
+        stats.observe(&StatsSample {
+            algorithmic_latency_ms: 0.0,
+            near_delay_ms: 0,
+            near_delay_buffered_samples: 0,
+            frame_size: 480,
+            near: &frame,
+            far: &frame,
+            out: &frame,
+            mic_q: 0,
+            ref_q: 0,
+            out_q: 0,
+            mic_input_drops: 0,
+            ref_input_drops: 0,
+            mic_stale_drops: 0,
+            ref_stale_drops: 0,
+            ref_underruns: 0,
+            output_overruns: 0,
+            output_underruns: 0,
+            node_stats: &[],
+        });
+
+        let value = stats.status_value(Instant::now());
+        assert_eq!(value["diverged"], true);
+        assert_eq!(value["last_backend_error"], "boom");
+    }
+
+    #[test]
     fn clock_skew_detector_warns_after_correlated_five_second_window() {
         let mut detector = ClockSkewDetector::new(48_000);
 
@@ -979,9 +1113,9 @@ mod tests {
 
     #[test]
     fn ref_pace_loss_bridges_t3_signal_migration() {
-        // pre-T3:信号在 stale_drops,input_drops≈0。
+        // 旧硬丢帧口径:信号在 stale_drops,input_drops≈0。
         assert_eq!(ref_pace_loss(10_752, 0), 10_752);
-        // T3:ref 连续重采样,stale_drops=0,信号迁移到 input_drops(参考 ring 溢出)。
+        // ref 连续重采样,stale_drops=0,信号迁移到 input_drops(参考 ring 溢出)。
         assert_eq!(ref_pace_loss(0, 10_752), 10_752);
         // 两路都有时相加(过渡态),saturating 不溢出。
         assert_eq!(ref_pace_loss(u64::MAX, 1), u64::MAX);
@@ -997,10 +1131,10 @@ mod tests {
 
     #[test]
     fn clock_skew_still_warns_when_ref_signal_is_input_drops() {
-        // T3 场景:ref_stale_drops 恒 0,参考侧佐证经 ref_input_drops 传入。检测器仍应告警
-        // (回归护栏:T3 不得让 T1 的时钟错配告警失效)。
+        // 连续重采样场景:ref_stale_drops 恒 0,参考侧佐证经 ref_input_drops 传入。检测器仍应告警
+        // (回归护栏:连续重采样不得让时钟错配告警失效)。
         let mut detector = ClockSkewDetector::new(48_000);
-        // T3: stale=0, input=10_752;两个连续满窗(enter_streak 消抖)后告警。
+        // stale=0, input=10_752;两个连续满窗(enter_streak 消抖)后告警。
         let ref_signal = ref_pace_loss(0, 10_752);
         for _ in 0..9 {
             assert!(detector.observe(48_000, 10_752, 0, ref_signal, 0).is_none());

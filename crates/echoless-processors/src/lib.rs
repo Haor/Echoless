@@ -1,6 +1,6 @@
 //! echoless-processors — 统一回声处理节点。
 //!
-//! 关键架构(蓝本 §7):aec3 经典 AEC3 与 LocalVQE 都是平级的 `EchoProcessor` 节点,
+//! 关键架构:aec3 经典 AEC3 与 LocalVQE 都是平级的 `EchoProcessor` 节点,
 //! **没有「主引擎 + 残余」的固定主从**。怎么组合由配置决定:可单开、可串联、可自由组合、可扩展。
 //! 加新方案 = 再写一个 `impl EchoProcessor` 并在 registry 注册,其余 crate 不动。
 
@@ -16,6 +16,8 @@ pub mod passthrough;
 pub mod registry;
 pub mod rnnoise;
 pub mod webrtc_ns;
+#[cfg(windows)]
+mod win_dll;
 
 pub use chain::{chain_from_nodes, ProcessorChain};
 pub use noise_suppression::{validate_noise_suppression_chain, NoiseChainError};

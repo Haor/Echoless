@@ -2,6 +2,7 @@
 name = "echoless-core"
 edition.workspace = true
 version.workspace = true
+rust-version.workspace = true
 license.workspace = true
 description = "管线配置 + 离线编排 + 共享 DSP 边界工具;不依赖任何平台 crate"
 

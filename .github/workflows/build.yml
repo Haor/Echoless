@@ -44,13 +44,12 @@ jobs:
       - name: Checkout
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
 
-      - name: Install Rust stable
+      - name: Install Rust toolchain
         shell: bash
         run: |
           set -euo pipefail
-          rustup toolchain install stable --profile minimal
-          rustup default stable
-          rustup component add clippy rustfmt
+          rustup toolchain install 1.100.0 --profile minimal --component clippy --component rustfmt
+          rustup default 1.100.0
           rustc --version
           cargo --version
 
@@ -405,13 +404,12 @@ jobs:
             patchelf \
             libasound2-dev
 
-      - name: Install Rust stable
+      - name: Install Rust toolchain
         shell: bash
         run: |
           set -euo pipefail
-          rustup toolchain install stable --profile minimal
-          rustup default stable
-          rustup component add clippy rustfmt
+          rustup toolchain install 1.100.0 --profile minimal --component clippy --component rustfmt
+          rustup default 1.100.0
           rustc --version
           cargo --version
 

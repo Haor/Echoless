@@ -3,7 +3,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::Duration;
 
 use serde_json::Value;
@@ -131,11 +131,13 @@ fn localvqe_models_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     let dir = localvqe_models_dir_path();
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     migrate_legacy_localvqe_models(app, &dir);
-    // User-supplied and in-app downloaded .gguf files both live here.
-    // Always regenerate the README so the supported-file list / SHA-256 pins
-    // track LOCALVQE_MODEL_PINS across app updates.
+    // User-supplied and in-app downloaded .gguf files both live here. The
+    // README lists LOCALVQE_MODEL_PINS, so rewrite it only when the pins change.
     let readme = dir.join("README.txt");
-    let _ = std::fs::write(&readme, localvqe_models_readme());
+    let content = localvqe_models_readme();
+    if std::fs::read_to_string(&readme).ok().as_deref() != Some(content.as_str()) {
+        let _ = std::fs::write(&readme, content);
+    }
     Ok(dir)
 }
 
@@ -291,9 +293,10 @@ fn downloads_in_flight() -> &'static Mutex<HashSet<String>> {
 struct InFlightGuard(String);
 impl Drop for InFlightGuard {
     fn drop(&mut self) {
-        if let Ok(mut set) = downloads_in_flight().lock() {
-            set.remove(&self.0);
-        }
+        downloads_in_flight()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&self.0);
     }
 }
 
@@ -316,16 +319,15 @@ fn download_localvqe_model_blocking(
 
     // 抢占同名下载锁:已在下载则拒绝(见 DOWNLOADS_IN_FLIGHT 注释)。_inflight
     // 在函数返回时 drop、自动释放。
+    if !downloads_in_flight()
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .insert(pin.filename.to_string())
     {
-        let mut inflight = downloads_in_flight()
-            .lock()
-            .map_err(|_| "download lock poisoned".to_string())?;
-        if !inflight.insert(pin.filename.to_string()) {
-            return Err(format!(
-                "model {} is already downloading; please wait",
-                pin.filename
-            ));
-        }
+        return Err(format!(
+            "model {} is already downloading; please wait",
+            pin.filename
+        ));
     }
     let _inflight = InFlightGuard(pin.filename.to_string());
 
@@ -391,8 +393,12 @@ fn download_localvqe_model_blocking(
             std::thread::sleep(Duration::from_millis(200));
         })
     };
-    let out =
-        command_output_with_timeout(&mut curl, MODEL_DOWNLOAD_TIMEOUT, "LocalVQE model download");
+    let out = command_output_with_timeout(
+        &mut curl,
+        MODEL_DOWNLOAD_TIMEOUT,
+        "LocalVQE model download",
+        |_| false,
+    );
     stop.store(true, Ordering::Relaxed);
     let _ = poller.join();
     let out = out?;

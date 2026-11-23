@@ -221,6 +221,7 @@ impl RuntimeErrorMode {
 
 #[derive(Clone, Debug)]
 struct AecConfig {
+    #[cfg_attr(not(windows), allow(dead_code))]
     model_path: Option<PathBuf>,
     intensity_ratio: f32,
     use_default_gpu: bool,
@@ -354,23 +355,17 @@ impl EchoProcessor for NvidiaAfxAec {
         self.last_error = None;
         self.last_process_time_ms = 0.0;
 
-        let report = doctor_report()?;
-        if !report.ok() {
-            bail!("nvidia_afx_aec is not available yet; run `echoless nvafx doctor` to fix dependencies first");
-        }
-
-        let selection = resolve_runtime_selection(self.cfg.model_path.as_deref())?;
-
         #[cfg(not(windows))]
-        {
-            let _ = selection;
-            bail!("nvidia_afx_aec currently supports Windows x64 only");
-        }
+        bail!("nvidia_afx_aec currently supports Windows x64 only");
 
         #[cfg(windows)]
         {
+            const DOCTOR_HINT: &str = "run `echoless nvafx doctor` for details";
+            let selection = resolve_runtime_selection(self.cfg.model_path.as_deref())
+                .with_context(|| format!("RTX AEC runtime is not ready; {DOCTOR_HINT}"))?;
             let effect =
-                AfxAecEffect::new(&selection.runtime_dir, &selection.model_path, &self.cfg)?;
+                AfxAecEffect::new(&selection.runtime_dir, &selection.model_path, &self.cfg)
+                    .with_context(|| format!("failed to start RTX AEC; {DOCTOR_HINT}"))?;
             self.effect = Some(effect);
             self.selection = Some(selection);
             Ok(())
@@ -459,7 +454,7 @@ pub fn doctor_report() -> Result<DoctorReport> {
         ));
         Vec::new()
     });
-    let selected_arch = gpus.iter().find_map(|gpu| gpu.arch);
+    let selected_arch = select_gpu_arch(&gpus);
     checks.extend(check_gpus(&gpus));
     checks.extend(check_runtime_files(&runtime_dir, selected_arch));
 
@@ -485,10 +480,11 @@ fn runtime_dir_from_brand_root(base: &Path) -> PathBuf {
     base.join("nvafx").join(SDK_VERSION)
 }
 
+#[cfg_attr(not(windows), allow(dead_code))]
 fn resolve_runtime_selection(model_path_override: Option<&Path>) -> Result<RuntimeSelection> {
     let (runtime_dir, _runtime_dir_source) = resolve_runtime_dir();
     let gpus = detect_gpus().context("failed to detect NVIDIA GPU")?;
-    let selected_arch = gpus.iter().find_map(|gpu| gpu.arch);
+    let selected_arch = select_gpu_arch(&gpus);
     let model_path = if let Some(path) = model_path_override {
         path.to_path_buf()
     } else {
@@ -707,6 +703,22 @@ fn parse_nvidia_smi_gpu_line(line: &str) -> Option<GpuInfo> {
     })
 }
 
+fn driver_meets_minimum(gpu: &GpuInfo) -> bool {
+    !compare_versions(&gpu.driver_version, MIN_DRIVER_VERSION).is_some_and(|ord| ord.is_lt())
+}
+
+fn is_usable_gpu(gpu: &GpuInfo) -> bool {
+    gpu.arch.is_some() && driver_meets_minimum(gpu)
+}
+
+/// Prefer a supported GPU with a recent driver; otherwise report the first known arch.
+fn select_gpu_arch(gpus: &[GpuInfo]) -> Option<GpuArch> {
+    gpus.iter()
+        .find(|gpu| is_usable_gpu(gpu))
+        .or_else(|| gpus.iter().find(|gpu| gpu.arch.is_some()))
+        .and_then(|gpu| gpu.arch)
+}
+
 fn check_gpus(gpus: &[GpuInfo]) -> Vec<DoctorCheck> {
     if gpus.is_empty() {
         return vec![DoctorCheck::missing(
@@ -716,19 +728,23 @@ fn check_gpus(gpus: &[GpuInfo]) -> Vec<DoctorCheck> {
         )];
     }
 
+    // With one usable GPU present, other cards only deserve a warning.
+    let has_usable_gpu = gpus.iter().any(is_usable_gpu);
     let mut checks = Vec::new();
     for (index, gpu) in gpus.iter().enumerate() {
         let label = format!("gpu:{index}");
-        if compare_versions(&gpu.driver_version, MIN_DRIVER_VERSION).is_some_and(|ord| ord.is_lt())
-        {
-            checks.push(DoctorCheck::missing(
-                format!("{label}:driver"),
-                format!(
-                    "{} driver={} is below the minimum {}",
-                    gpu.name, gpu.driver_version, MIN_DRIVER_VERSION
-                ),
-                "Update the NVIDIA graphics driver",
-            ));
+        let secondary = has_usable_gpu && !is_usable_gpu(gpu);
+        if !driver_meets_minimum(gpu) {
+            let detail = format!(
+                "{} driver={} is below the minimum {}",
+                gpu.name, gpu.driver_version, MIN_DRIVER_VERSION
+            );
+            let action = "Update the NVIDIA graphics driver";
+            checks.push(if secondary {
+                DoctorCheck::warning(format!("{label}:driver"), detail, action)
+            } else {
+                DoctorCheck::missing(format!("{label}:driver"), detail, action)
+            });
         } else {
             checks.push(DoctorCheck::ok(
                 format!("{label}:driver"),
@@ -743,14 +759,19 @@ fn check_gpus(gpus: &[GpuInfo]) -> Vec<DoctorCheck> {
                     gpu.name, gpu.compute_capability
                 ),
             )),
-            None => checks.push(DoctorCheck::unsupported(
-                format!("{label}:arch"),
-                format!(
+            None => {
+                let detail = format!(
                     "{} compute_cap={} is not in the supported list",
                     gpu.name, gpu.compute_capability
-                ),
-                "The RTX AEC backend requires a Turing/Ampere/Ada/Blackwell architecture",
-            )),
+                );
+                let action =
+                    "The RTX AEC backend requires a Turing/Ampere/Ada/Blackwell architecture";
+                checks.push(if secondary {
+                    DoctorCheck::warning(format!("{label}:arch"), detail, action)
+                } else {
+                    DoctorCheck::unsupported(format!("{label}:arch"), detail, action)
+                });
+            }
         }
     }
     checks
@@ -770,7 +791,7 @@ fn check_runtime_files(runtime_dir: &Path, selected_arch: Option<GpuArch>) -> Ve
                 "runtime directory does not exist: {}",
                 runtime_dir.display()
             ),
-            "Download and extract echoless-rtx-aec-common-runtime-win64-2.1.0.zip",
+            format!("Download and extract echoless-rtx-aec-common-runtime-win64-{SDK_VERSION}.zip"),
         ));
     }
 
@@ -894,13 +915,14 @@ fn parse_version_parts(value: &str) -> Option<Vec<u32>> {
 #[cfg(windows)]
 mod ffi {
     use std::ffi::{c_char, c_float, c_int, c_uint, c_void, CString};
-    use std::path::{Path, PathBuf};
+    use std::path::Path;
     use std::ptr;
 
     use anyhow::{bail, Context, Result};
     use libloading::Library;
 
     use super::{AecConfig, NVAFX_FRAME_SAMPLES, NVAFX_SAMPLE_RATE};
+    use crate::win_dll::DllDirectoryGuard;
 
     type NvafxStatus = c_int;
     type NvafxHandle = *mut c_void;
@@ -1277,64 +1299,6 @@ mod ffi {
             _ => "NVAFX_STATUS_UNKNOWN",
         }
     }
-
-    struct DllDirectoryGuard {
-        cookies: Vec<*mut c_void>,
-        _paths: Vec<Vec<u16>>,
-    }
-
-    impl DllDirectoryGuard {
-        fn new(paths: &[PathBuf]) -> Result<Self> {
-            use std::os::windows::ffi::OsStrExt;
-            use windows_sys::Win32::System::LibraryLoader::{
-                AddDllDirectory, SetDefaultDllDirectories, LOAD_LIBRARY_SEARCH_DEFAULT_DIRS,
-                LOAD_LIBRARY_SEARCH_USER_DIRS,
-            };
-
-            let ok = unsafe {
-                SetDefaultDllDirectories(
-                    LOAD_LIBRARY_SEARCH_DEFAULT_DIRS | LOAD_LIBRARY_SEARCH_USER_DIRS,
-                )
-            };
-            if ok == 0 {
-                return Err(std::io::Error::last_os_error())
-                    .context("failed to set the Windows DLL default search path");
-            }
-
-            let mut cookies = Vec::new();
-            let mut wide_paths = Vec::new();
-            for path in paths {
-                let wide: Vec<u16> = path
-                    .as_os_str()
-                    .encode_wide()
-                    .chain(std::iter::once(0))
-                    .collect();
-                let cookie = unsafe { AddDllDirectory(wide.as_ptr()) };
-                if cookie.is_null() {
-                    return Err(std::io::Error::last_os_error()).with_context(|| {
-                        format!("failed to add DLL search path: {}", path.display())
-                    });
-                }
-                cookies.push(cookie);
-                wide_paths.push(wide);
-            }
-            Ok(Self {
-                cookies,
-                _paths: wide_paths,
-            })
-        }
-    }
-
-    impl Drop for DllDirectoryGuard {
-        fn drop(&mut self) {
-            use windows_sys::Win32::System::LibraryLoader::RemoveDllDirectory;
-            for cookie in self.cookies.drain(..) {
-                unsafe {
-                    RemoveDllDirectory(cookie);
-                }
-            }
-        }
-    }
 }
 
 #[cfg(windows)]
@@ -1519,20 +1483,51 @@ mod tests {
         assert!(RuntimeErrorMode::parse(Some(&toml::Value::String("fail".into()))).is_err());
     }
 
+    fn gpu(name: &str, driver_version: &str, compute_capability: &str) -> GpuInfo {
+        GpuInfo {
+            name: name.into(),
+            driver_version: driver_version.into(),
+            compute_capability: compute_capability.into(),
+            arch: GpuArch::from_compute_capability(compute_capability),
+        }
+    }
+
     #[test]
-    fn removed_runtime_param_cannot_override_fixed_runtime() {
-        let mut params = toml::Table::new();
-        params.insert(
-            "runtime_dir".into(),
-            toml::Value::String("/outside/fixed/root".into()),
-        );
-        params.insert("model_path".into(), toml::Value::String(" ".into()));
-        let cfg = AecConfig::from_params(&params).unwrap();
-        assert!(cfg.model_path.is_none());
-        assert_eq!(
-            runtime_dir_from_brand_root(Path::new("/brand-root")),
-            Path::new("/brand-root").join("nvafx").join(SDK_VERSION)
-        );
+    fn check_gpus_downgrades_legacy_card_next_to_usable_rtx() {
+        let gpus = [
+            gpu("GTX 1080", "576.02", "6.1"),
+            gpu("RTX 4070", "576.02", "8.9"),
+        ];
+
+        let checks = check_gpus(&gpus);
+
+        assert!(checks.iter().all(|check| !check.status.is_problem()));
+        assert!(checks.iter().any(
+            |check| check.name == "gpu:0:arch" && matches!(check.status, CheckStatus::Warning)
+        ));
+        assert_eq!(select_gpu_arch(&gpus), Some(GpuArch::Ada));
+    }
+
+    #[test]
+    fn check_gpus_rejects_machine_without_usable_gpu() {
+        let legacy_only = [gpu("GTX 1080", "576.02", "6.1")];
+        assert!(check_gpus(&legacy_only)
+            .iter()
+            .any(|check| check.name == "gpu:0:arch"
+                && matches!(check.status, CheckStatus::Unsupported)));
+
+        let old_driver = [
+            gpu("GTX 1080", "576.02", "6.1"),
+            gpu("RTX 4070", "531.00", "8.9"),
+        ];
+        let checks = check_gpus(&old_driver);
+        assert!(checks
+            .iter()
+            .any(|check| check.name == "gpu:0:arch"
+                && matches!(check.status, CheckStatus::Unsupported)));
+        assert!(checks
+            .iter()
+            .any(|check| check.name == "gpu:1:driver" && check.status.is_problem()));
     }
 
     #[test]

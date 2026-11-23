@@ -364,11 +364,8 @@ impl SignalDependentErleEstimator {
                 let block_limit = self.section_boundaries_blocks[section + 1].min(ffr_ch.len());
                 let ffr_slice = &ffr_ch[self.section_boundaries_blocks[section]..block_limit];
                 for ffr_block in ffr_slice {
-                    for render_ch in 0..spectrum_buffer.buffer[idx_render].len() {
-                        for (x2_k, &sb_k) in x2_section
-                            .iter_mut()
-                            .zip(spectrum_buffer.buffer[idx_render][render_ch].iter())
-                        {
+                    for render_spectrum in &spectrum_buffer.buffer[idx_render] {
+                        for (x2_k, &sb_k) in x2_section.iter_mut().zip(render_spectrum.iter()) {
                             *x2_k += sb_k * one_by_num_render_channels;
                         }
                     }
@@ -472,11 +469,9 @@ mod tests {
         let mut spectrum_buffer = SpectrumBuffer::new(buf_size, num_render_channels);
         let fft_buffer = FftBuffer::new(buf_size, num_render_channels);
 
-        for slot in 0..buf_size {
-            for ch in 0..num_render_channels {
-                for k in 0..FFT_LENGTH_BY_2_PLUS_1 {
-                    spectrum_buffer.buffer[slot][ch][k] = 500.0 * 1000.0 * 1000.0;
-                }
+        for entry in spectrum_buffer.buffer.iter_mut().take(buf_size) {
+            for ch_spec in entry.iter_mut().take(num_render_channels) {
+                ch_spec[..FFT_LENGTH_BY_2_PLUS_1].fill(500.0 * 1000.0 * 1000.0);
             }
         }
 

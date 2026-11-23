@@ -43,8 +43,8 @@ impl WebRtcNs {
         let mut offset = 0;
         while offset < frames {
             let block_len = (frames - offset).min(FRAME_SAMPLES);
-            for index in 0..FRAME_SAMPLES {
-                self.inner.input[index] = if index < block_len {
+            for (index, slot) in self.inner.input.iter_mut().enumerate().take(FRAME_SAMPLES) {
+                *slot = if index < block_len {
                     finite_or_zero(near.get(offset + index).copied().unwrap_or(0.0))
                 } else {
                     0.0

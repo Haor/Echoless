@@ -258,11 +258,17 @@ impl SuppressionFilter {
             }
 
             // Delay upper bands to match the delay of the filter bank.
-            for b in 1..e.num_bands() {
+            for (b, e_old_band) in self
+                .e_output_old
+                .iter_mut()
+                .enumerate()
+                .take(e.num_bands())
+                .skip(1)
+            {
                 let e_band = e.view_mut(b, ch);
                 for (e_sample, old_sample) in e_band[..FFT_LENGTH_BY_2]
                     .iter_mut()
-                    .zip(self.e_output_old[b][ch][..FFT_LENGTH_BY_2].iter_mut())
+                    .zip(e_old_band[ch][..FFT_LENGTH_BY_2].iter_mut())
                 {
                     swap(e_sample, old_sample);
                 }

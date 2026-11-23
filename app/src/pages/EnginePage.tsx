@@ -7,16 +7,12 @@ import type {
   Processor,
 } from "../types";
 import {
-  downloadLocalvqeModel,
-  localvqeAssets,
   macSystemInfo,
-  onLocalvqeProgress,
   openPath,
   type LocalvqeAssets,
   type MacSystemInfo,
 } from "../api";
 import { useI18n } from "../i18n";
-import { createAsyncListenerScope } from "../asyncListener";
 
 // macOS 主版本号 → 代号(sw_vers 只给版本号,代号本地映射)。落不到映射时只显版本号。
 function macOsName(version?: string | null): string | null {
@@ -93,7 +89,7 @@ const PROFILES: Profile[] = [
     echo: 9,
     voice: 5,
     cost: "CPU · neural",
-    sr: "48k (src) / 16k", // 模型原生 16k;48k 管线经 SRC 重采样进出(A6)
+    sr: "48k (src) / 16k", // 模型原生 16k;48k 管线经 SRC 重采样进出
     os: "Win · mac · Linux",
   },
   {
@@ -103,7 +99,7 @@ const PROFILES: Profile[] = [
     echo: 7,
     voice: 9,
     cost: "GPU · Tensor Core",
-    sr: "48k / 16k",
+    sr: "48k",
     os: "Win only",
   },
 ];
@@ -143,13 +139,23 @@ interface Props {
   onSelect: (kind: string) => void;
   onPickModel: (path: string) => void;
   localvqeModel: string | null;
+  lvAssets: LocalvqeAssets | null;
+  lvDl: Record<string, number | null>;
+  lvErr: string | null;
+  onDownloadModel: (file: string) => void;
+  onRefreshLvAssets: () => void;
   onRecheck: () => void;
   onSetup: () => void;
 }
 
-// 本机系统信息整段会话不变:模块级缓存,避免每次进 Engine 页 NvafxCard 重挂载都
-// 异步重取致「空 → 延迟 pop」的闪现。首取后缓存,重进用缓存同步初始化 state。
 let macSysInfoCache: MacSystemInfo | null = null;
+const DEV_MAC_SYS_INFO: MacSystemInfo = {
+  model: "MacBook Pro",
+  os_version: "26.5.1",
+  chip: "Apple M4",
+  memory_gb: 24,
+  cores: 10,
+};
 
 function NvafxCard({
   kind,
@@ -178,30 +184,21 @@ function NvafxCard({
   const nv = doctor?.report;
   const active = kind === "nvidia_afx_aec";
 
-  // 不可用态(仅 macOS)拉本机系统信息填充右栏。dev 模拟给一份样例。
-  const [sysInfo, setSysInfo] = useState<MacSystemInfo | null>(macSysInfoCache);
+  // 不可用态(仅 macOS)拉本机系统信息填充右栏;dev 模拟使用临时样例,不污染真实缓存。
+  const [realSysInfo, setRealSysInfo] = useState<MacSystemInfo | null>(
+    macSysInfoCache,
+  );
   useEffect(() => {
-    if (nvSupported || platform !== "macos") return;
-    if (sysInfo) return; // 缓存命中,已同步渲染,无需再取
-    if (dev) {
-      const info: MacSystemInfo = {
-        model: "MacBook Pro",
-        os_version: "26.5.1",
-        chip: "Apple M4",
-        memory_gb: 24,
-        cores: 10,
-      };
-      macSysInfoCache = info;
-      setSysInfo(info);
-      return;
-    }
+    if (nvSupported || platform !== "macos" || dev) return;
+    if (realSysInfo) return;
     macSystemInfo()
       .then((info) => {
         macSysInfoCache = info;
-        setSysInfo(info);
+        setRealSysInfo(info);
       })
       .catch(() => {});
-  }, [nvSupported, platform, dev, sysInfo]);
+  }, [nvSupported, platform, dev, realSysInfo]);
+  const sysInfo = dev ? DEV_MAC_SYS_INFO : realSysInfo;
 
   return (
     <div
@@ -358,58 +355,34 @@ export function EnginePage({
   onSelect,
   onPickModel,
   localvqeModel,
+  lvAssets,
+  lvDl,
+  lvErr,
+  onDownloadModel,
+  onRefreshLvAssets,
   onRecheck,
   onSetup,
 }: Props) {
   const { t, lang } = useI18n();
 
-  // Available LocalVQE models/native runtime.
-  const [lvAssets, setLvAssets] = useState<LocalvqeAssets | null>(null);
-  // 按文件名跟踪在下载的模型:键存在=下载中,值=百分比(null=还没进度)。
-  // 单槽会串台——点了 B 就把 A 的按钮重新启用,允许对 A 发起第二次并发下载,
-  // 两个下载写同一个 .part 互相踩,导致大小/SHA 不匹配。
-  const [lvDl, setLvDl] = useState<Record<string, number | null>>({});
-  const [lvErr, setLvErr] = useState<string | null>(null);
   useEffect(() => {
-    localvqeAssets().then(setLvAssets).catch(() => {});
-  }, []);
-  // 下载进度事件:只更新仍在下载的文件的百分比。
-  useEffect(() => {
-    const listeners = createAsyncListenerScope();
-    listeners.listen(onLocalvqeProgress, (p) => {
-      setLvDl((cur) =>
-        p.filename in cur ? { ...cur, [p.filename]: p.pct } : cur,
-      );
-    });
-    return () => listeners.dispose();
-  }, []);
-  async function downloadModel(file: string) {
-    // 同名下载进行中则忽略(按钮已 disabled,这里再兜一层快速双击竞态)。
-    if (file in lvDl) return;
-    setLvDl((cur) => ({ ...cur, [file]: null }));
-    setLvErr(null);
-    try {
-      const path = await downloadLocalvqeModel(file);
-      onPickModel(path);
-      setLvAssets(await localvqeAssets());
-    } catch (e) {
-      setLvErr(String(e));
-    } finally {
-      setLvDl((cur) => {
-        const next = { ...cur };
-        delete next[file];
-        return next;
-      });
-    }
-  }
+    onRefreshLvAssets();
+  }, [onRefreshLvAssets]);
+
   const proc = (k: string) => processors.find((p) => p.kind === k);
   // 开发态(dev)临时解开 NVAFX 平台/doctor 门槛,用于走通前端流程。
   const supported = (k: string) =>
     dev || (proc(k)?.platforms.includes(platform) ?? true);
-  // 就绪判定:AEC3 永远就绪;LocalVQE 需模型;NVAFX 需 doctor 通过(dev 跳过)。
+  // 就绪判定:AEC3 永远就绪;LocalVQE 需模型文件实际存在且 native_ready;NVAFX 需 doctor 通过(dev 跳过)。
   const ready = (k: string): boolean => {
     if (!supported(k)) return false;
-    if (k === "localvqe") return Boolean(localvqeModel && lvAssets?.native_ready);
+    if (k === "localvqe") {
+      return Boolean(
+        localvqeModel &&
+          lvAssets?.native_ready &&
+          lvAssets.models.some((m) => m.path === localvqeModel),
+      );
+    }
     if (k === "nvidia_afx_aec") return dev || Boolean(doctor?.ok);
     return true;
   };
@@ -429,7 +402,8 @@ export function EnginePage({
               ? "NS"
               : null;
         const found = lvAssets?.models.find((x) => x.filename === m.file);
-        const selected = !!found && localvqeModel === found.path;
+        const selected =
+          kind === "localvqe" && !!found && localvqeModel === found.path;
         const downloading = m.file in lvDl;
         const pct = lvDl[m.file];
         const box = downloading
@@ -450,7 +424,7 @@ export function EnginePage({
             onClick={(e) => {
               e.stopPropagation();
               if (selected) return;
-              found ? onPickModel(found.path) : downloadModel(m.file);
+              found ? onPickModel(found.path) : onDownloadModel(m.file);
             }}
             title={`${m.ver} · ${m.params} · ${t(m.descriptionKey)}`}
           >
@@ -477,8 +451,7 @@ export function EnginePage({
           {t("lvqeOpenDir")} <span className="mk">↗</span>
         </button>
       </div>
-      {/* native runtime 随包分发(2026-07-05 定案),正常永远就绪;
-          这条 warn 只兜 dev 环境资源缺失的病态 case,不提供下载按钮 */}
+      {/* Native runtime is bundled with the app; warn only if missing in dev environments. */}
       {lvAssets && !lvAssets.native_ready && (
         <div className="cdetail warn" title={lvAssets.native_dir ?? undefined}>
           {t("lvqeRuntimeMissing")}
@@ -498,7 +471,7 @@ export function EnginePage({
     const rdy = ready(p.kind);
     const isLvqe = p.kind === "localvqe";
     const status = !sup
-      ? "UNAVAILABLE"
+      ? t("unavailable")
       : rdy
         ? active
           ? t("active")

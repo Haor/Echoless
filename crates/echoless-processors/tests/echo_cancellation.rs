@@ -3,12 +3,12 @@
 //!   (2) 经 fork 开放的 tail 调参口能注入、跑通、不劣化。
 //! 无外部 WAV,纯合成。仅在 aec3-engine 特性下运行(默认开)。
 //!
-//! 关键经验(调研得来,见 research/aec3_internal_map.md):
+//! 关键经验:
 //!   - 激励必须是**非平稳语音类**信号。AEC3 有 stationarity gate,平稳白噪声会被当
 //!     背景噪声、抑制滤波器自适应(实测平稳白噪声仅 ~8dB,非平稳语音类 20–41dB)。
-//!   - `erle_db` 统计在本路径下恒为常数、不可信(§7);效果以输出能量下降为准。
+//!   - `erle_db` 统计在本路径下恒为常数、不可信;效果以输出能量下降为准。
 //!   - 合成长跑(>10s)效果会随 pause 段累积退化,疑为合成信号 artifact;真实退化
-//!     行为待真实录音验证(Phase 1)。故本测试用 5s 短窗稳定断言。
+//!     行为待真实录音验证。故本测试用 5s 短窗稳定断言。
 
 #![cfg(feature = "aec3-engine")]
 
@@ -256,11 +256,11 @@ fn delay_hold_recovers_faster_after_reference_hole() {
 #[test]
 #[ignore = "heavy >60s synthetic AEC3 regression check"]
 fn long_run_energy_reduction_stays_stable_over_60s() {
-    // 2026-07-05 调查定案(三窗口实测 41.1 → 38.3 → 38.1 dB):
+    // 三窗口实测 41.1 → 38.3 → 38.1 dB:
     //   - 所谓「长跑退化」= 刚收敛后的蜜月峰值(5-15s)一次性回落 ~3dB 进入稳态
     //     平台,25s 后平台平稳(38.3→38.1,Δ0.26dB),不是发散趋势;
-    //   - 与 P4 delay_hold 无关:同 harness 关掉 delay_hold 是 9.6→5.6dB
-    //     (即 §11.6 的严重退化),P4 反而把长跑从 9.6dB 拉到 41dB;
+    //   - 与 delay_hold 无关:同 harness 关掉 delay_hold 是 9.6→5.6dB 的严重退化,
+    //     开启 delay_hold 反而把长跑从 9.6dB 拉到 41dB;
     //   - 故断言语义改为「平台稳定 + 绝对效果」,不再拿蜜月峰值当基线。
     let windows = [(SR * 5, SR * 15), (SR * 25, SR * 35), (SR * 55, SR * 65)];
     let db = run_windowed(toml::Table::new(), &[(2400, 0.5)], &windows);

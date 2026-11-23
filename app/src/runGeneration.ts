@@ -8,61 +8,35 @@ export const INITIAL_RUN_GENERATION: RunGeneration = {
   latestRunId: 0,
 };
 
-type RunIdentity = {
-  run_id: number;
-};
-
-type RunEventIdentity = RunIdentity & {
-  type: string;
-};
-
-export type RunGenerationDecision = {
-  generation: RunGeneration;
-  accepted: boolean;
-};
-
-function validRunId(runId: number): boolean {
-  return Number.isSafeInteger(runId) && runId > 0;
-}
-
 export function observeRunStart(
-  generation: RunGeneration,
+  gen: RunGeneration,
   runId: number,
 ): RunGeneration {
-  if (!validRunId(runId) || runId <= generation.latestRunId) {
-    return generation;
+  if (!Number.isSafeInteger(runId) || runId <= 0 || runId <= gen.latestRunId) {
+    return gen;
   }
   return { activeRunId: runId, latestRunId: runId };
 }
 
 export function acceptRunEvent(
-  generation: RunGeneration,
-  event: RunEventIdentity,
-): RunGenerationDecision {
-  if (!validRunId(event.run_id)) {
-    return { generation, accepted: false };
+  gen: RunGeneration,
+  event: { run_id: number; type: string },
+): { generation: RunGeneration; accepted: boolean } {
+  if (!Number.isSafeInteger(event.run_id) || event.run_id <= 0) {
+    return { generation: gen, accepted: false };
   }
-
-  if (event.type === "started" && event.run_id > generation.latestRunId) {
-    const next = observeRunStart(generation, event.run_id);
-    return { generation: next, accepted: true };
+  if (event.type === "started" && event.run_id > gen.latestRunId) {
+    return { generation: observeRunStart(gen, event.run_id), accepted: true };
   }
-
-  return {
-    generation,
-    accepted: event.run_id === generation.activeRunId,
-  };
+  return { generation: gen, accepted: event.run_id === gen.activeRunId };
 }
 
 export function acceptRunExit(
-  generation: RunGeneration,
-  event: RunIdentity,
-): RunGenerationDecision {
-  if (!validRunId(event.run_id) || event.run_id !== generation.activeRunId) {
-    return { generation, accepted: false };
+  gen: RunGeneration,
+  event: { run_id: number },
+): { generation: RunGeneration; accepted: boolean } {
+  if (event.run_id !== gen.activeRunId) {
+    return { generation: gen, accepted: false };
   }
-  return {
-    generation: { ...generation, activeRunId: null },
-    accepted: true,
-  };
+  return { generation: { ...gen, activeRunId: null }, accepted: true };
 }

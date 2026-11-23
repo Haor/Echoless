@@ -4,38 +4,32 @@ const RECOVERY_WINDOW_MS = 30_000;
 export type StreamRecoveryState = {
   attempts: number;
   windowStartedAtMs: number | null;
-  pendingDelayMs: number | null;
+  recovering: boolean;
 };
 
 export const INITIAL_STREAM_RECOVERY: StreamRecoveryState = {
   attempts: 0,
   windowStartedAtMs: null,
-  pendingDelayMs: null,
+  recovering: false,
 };
 
-export function requestStreamRecovery(
+export function nextStreamRecovery(
   state: StreamRecoveryState,
   nowMs: number,
-): StreamRecoveryState {
+): { state: StreamRecoveryState; delayMs: number | null } {
   const inCurrentWindow =
     state.windowStartedAtMs != null &&
     nowMs - state.windowStartedAtMs <= RECOVERY_WINDOW_MS;
   const attempts = inCurrentWindow ? state.attempts : 0;
   const windowStartedAtMs = inCurrentWindow ? state.windowStartedAtMs : nowMs;
-  const pendingDelayMs = RECOVERY_DELAYS_MS[attempts] ?? null;
+  const delayMs = RECOVERY_DELAYS_MS[attempts] ?? null;
 
   return {
-    attempts: pendingDelayMs == null ? attempts : attempts + 1,
-    windowStartedAtMs,
-    pendingDelayMs,
-  };
-}
-
-export function consumeStreamRecovery(
-  state: StreamRecoveryState,
-): { state: StreamRecoveryState; delayMs: number | null } {
-  return {
-    state: { ...state, pendingDelayMs: null },
-    delayMs: state.pendingDelayMs,
+    state: {
+      attempts: delayMs == null ? attempts : attempts + 1,
+      windowStartedAtMs,
+      recovering: delayMs != null,
+    },
+    delayMs,
   };
 }

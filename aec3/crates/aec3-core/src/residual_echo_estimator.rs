@@ -101,8 +101,7 @@ fn echo_generating_power(
         let mut k = idx_start;
         while k != idx_stop {
             let mut render_power = [0.0f32; FFT_LENGTH_BY_2_PLUS_1];
-            for ch in 0..num_render_channels {
-                let channel_power = &spectrum_buffer.buffer[k][ch];
+            for channel_power in spectrum_buffer.buffer[k].iter().take(num_render_channels) {
                 for (rp_j, &cp_j) in render_power.iter_mut().zip(channel_power.iter()) {
                     *rp_j += cp_j;
                 }
@@ -332,9 +331,7 @@ impl ResidualEchoEstimator {
         // Compute render power for the reverb.
         let x2 = render_buffer.spectrum(first_reverb_partition);
         let render_power: [f32; FFT_LENGTH_BY_2_PLUS_1];
-        let render_power_ref: &[f32];
-
-        if self.num_render_channels > 1 {
+        let render_power_ref: &[f32] = if self.num_render_channels > 1 {
             let mut power_data = [0.0f32; FFT_LENGTH_BY_2_PLUS_1];
             for channel_power in &x2[..self.num_render_channels] {
                 for (pd_k, &cp_k) in power_data.iter_mut().zip(channel_power.iter()) {
@@ -342,10 +339,10 @@ impl ResidualEchoEstimator {
                 }
             }
             render_power = power_data;
-            render_power_ref = &render_power;
+            &render_power
         } else {
-            render_power_ref = &x2[0];
-        }
+            &x2[0]
+        };
 
         // Update the reverb estimate.
         let reverb_decay = aec_state.reverb_decay(dominant_nearend);

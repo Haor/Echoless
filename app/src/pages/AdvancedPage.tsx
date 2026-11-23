@@ -17,6 +17,7 @@ import { useI18n, type Lang } from "../i18n";
 import { Hint } from "../components/Hint";
 import { Field, SegButtons } from "../components/Controls";
 import { probeAutofill } from "../probeQuality";
+import { requiresTenMsFrames } from "../engineLogic";
 
 interface Props {
   processors: Processor[];
@@ -27,7 +28,7 @@ interface Props {
   pipeline: PipelineCfg;
   params: Record<string, unknown>;
   onPipeline: (patch: Partial<PipelineCfg>) => void;
-  onParam: (key: string, val: unknown) => void;
+  onParam: (key: string, val: unknown, targetKind?: string) => void;
   onNoiseParam: (key: string, val: unknown) => void;
   platform: Platform;
   // 延迟侦测用:当前设备 selector(透传给 probe-delay)+ 是否在跑 + 停/起引擎回调。
@@ -36,6 +37,7 @@ interface Props {
   output: string;
   running: boolean;
   onSetRun: (on: boolean) => Promise<void>;
+  onProbingChange?: (probing: boolean) => void;
   visible: boolean;
   // Windows 托盘偏好(SESSION 段,仅 windows 平台渲染)。
   trayPrefs: TrayPrefsState;
@@ -45,9 +47,9 @@ interface Props {
   onAutoStart: (enabled: boolean) => void;
 }
 
-// C3/C5 减参:专家级/与引擎页重复的字段不在高级页暴露 ——
-//   LocalVQE:model(引擎页模型清单管理)、library/backend/device(auto 即可);
-//   NVAFX:model_path/use_default_gpu/disable_cuda_graph(专家字段,走配置文件)。
+// 专家级/与引擎页重复的字段不在高级页暴露:
+//   LocalVQE: model(引擎页管理)、library/backend/device(auto 即可);
+//   NVAFX: model_path/use_default_gpu/disable_cuda_graph(走配置文件)。
 const HIDDEN_PARAMS: Record<string, Set<string>> = {
   localvqe: new Set(["model", "library", "backend", "device"]),
   nvidia_afx_aec: new Set([
@@ -174,6 +176,7 @@ function ProbeSection({
   output,
   running,
   onSetRun,
+  onProbingChange,
   visible,
 }: Pick<
   Props,
@@ -187,6 +190,7 @@ function ProbeSection({
   | "output"
   | "running"
   | "onSetRun"
+  | "onProbingChange"
   | "visible"
 >) {
   const { t, lang } = useI18n();
@@ -194,15 +198,22 @@ function ProbeSection({
   const { probing, phase, lit, probe, probeErr } = state;
   const timer = useRef<number | null>(null);
   const mounted = useRef(true);
+  const kindRef = useRef(kind);
+  kindRef.current = kind;
+  const platformRef = useRef(platform);
+  platformRef.current = platform;
+  const onPipelineRef = useRef(onPipeline);
+  onPipelineRef.current = onPipeline;
+  const onParamRef = useRef(onParam);
+  onParamRef.current = onParam;
+  const onProbingChangeRef = useRef(onProbingChange);
+  onProbingChangeRef.current = onProbingChange;
 
   useEffect(() => {
-    // setup 必须把 mounted 设回 true:StrictMode(dev)会 mount→cleanup→再 mount,
-    // 首次 cleanup 已把 mounted 翻 false;若 setup 不重置,mounted 永久 false,
-    // 之后 runProbe 里所有 updateProbeIfMounted 全 no-op —— 进度灯不亮、结果不填、
-    // PROBING 永不清除(表现为「有声音但前端卡死」)。
     mounted.current = true;
     return () => {
       mounted.current = false;
+      onProbingChangeRef.current?.(false);
       if (timer.current != null) window.clearInterval(timer.current);
     };
   }, []);
@@ -217,6 +228,7 @@ function ProbeSection({
 
   async function runProbe() {
     if (probing) return;
+    onProbingChangeRef.current?.(true);
     updateProbe({ probing: true, probe: null, probeErr: null, lit: 0 });
     // 引擎在跑 → probe 要独占设备:先自动停机,跑完在 finally 自动恢复。
     const wasRunning = running;
@@ -227,8 +239,6 @@ function ProbeSection({
         if (!mounted.current) return;
       }
       updateProbeIfMounted({ phase: "probing" });
-      // 进度只以 CLI 的真实开播事件为时钟源。不能先按墙钟猜测再在事件到达时
-      // 重置,否则子进程启动稍慢时会出现「无声先亮两格 → 倒退 → 正常播放」。
       const unProgress = await onProbeProgress((p) => {
         if (!mounted.current) return;
         if (p.stage !== "beep_train_start") return;
@@ -261,12 +271,13 @@ function ProbeSection({
       }
       if (!mounted.current) return;
       updateProbeIfMounted({ probe: r });
-      const fill = probeAutofill(r, platform, kind);
+      const latestKind = kindRef.current;
+      const fill = probeAutofill(r, platformRef.current, latestKind);
       if (fill.nearDelayMs != null) {
-        onPipeline({ near_delay_ms: fill.nearDelayMs });
+        onPipelineRef.current({ near_delay_ms: fill.nearDelayMs });
       }
       if (fill.initialDelayMs != null) {
-        onParam("initial_delay_ms", fill.initialDelayMs);
+        onParamRef.current("initial_delay_ms", fill.initialDelayMs, latestKind);
       }
     } catch (e) {
       updateProbeIfMounted({ probeErr: String(e) });
@@ -286,6 +297,7 @@ function ProbeSection({
           /* 恢复失败时用户可手动开机 */
         }
       }
+      onProbingChangeRef.current?.(false);
       updateProbeIfMounted({ phase: "", probing: false });
     }
   }
@@ -434,6 +446,7 @@ export function AdvancedPage({
   output,
   running,
   onSetRun,
+  onProbingChange,
   visible,
   trayPrefs,
   onTrayPrefs,
@@ -451,6 +464,8 @@ export function AdvancedPage({
   );
   const desc = (k: string) => DESC[k]?.[lang];
   const pipelineDisabled = kind === "nvidia_afx_aec";
+  const frameMsDisabled =
+    pipelineDisabled || requiresTenMsFrames(kind, noiseMode);
 
   const reqMet = (spec: ParamSpec) =>
     !spec.requires ||
@@ -501,7 +516,9 @@ export function AdvancedPage({
       <Field
         value={val}
         numeric={spec.type === "number"}
-        placeholder={spec.required ? "required" : t("auto")}
+        min={spec.min}
+        max={spec.max}
+        placeholder={spec.required ? t("required") : t("auto")}
         onCommit={(v) => onChange(key, v)}
       />
     );
@@ -559,7 +576,7 @@ export function AdvancedPage({
           <span className="aval">
             <SegButtons
               value={String(pipeline.frame_ms)}
-              disabled={pipelineDisabled}
+              disabled={frameMsDisabled}
               options={[10, 20].map((n) => ({
                 value: String(n),
                 label: `${n} MS`,
@@ -595,7 +612,7 @@ export function AdvancedPage({
       <div className="asec">{backendLabel(kind, proc)}</div>
       <div className="acols">
         {backendParams.length === 0 && (
-          <div className="pnote">no parameters</div>
+          <div className="pnote">{t("noParameters")}</div>
         )}
         {backendParams.map(([key, spec]) => arow(key, key, spec))}
       </div>
@@ -673,6 +690,7 @@ export function AdvancedPage({
           output={output}
           running={running}
           onSetRun={onSetRun}
+          onProbingChange={onProbingChange}
           visible={visible}
         />
       </div>

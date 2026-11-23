@@ -6,7 +6,7 @@ use crate::{
 };
 
 pub fn build(kind: &str) -> anyhow::Result<Box<dyn EchoProcessor>> {
-    Ok(match canonical_kind(kind) {
+    Ok(match kind {
         "passthrough" => Box::new(Passthrough::new()),
         "aec3" => Box::new(Aec3Engine::new()),
         "localvqe" => Box::new(LocalVqe::new()),
@@ -17,14 +17,6 @@ pub fn build(kind: &str) -> anyhow::Result<Box<dyn EchoProcessor>> {
             "unknown processor kind: {other} (available: passthrough / aec3 / localvqe / nvidia_afx_aec / webrtc_ns / rnnoise)"
         ),
     })
-}
-
-/// Normalizes legacy kind aliases kept for existing user configs.
-pub fn canonical_kind(kind: &str) -> &str {
-    match kind {
-        "sonora_aec3" => "aec3", // legacy alias, remove after 2 releases
-        other => other,
-    }
 }
 
 /// 已注册的处理器种类(供 CLI/前端列出)。

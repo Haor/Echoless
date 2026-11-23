@@ -1,5 +1,4 @@
-// 单色线稿图标。行尾功能图标须有语义;v6 起为工业蓝图线稿风
-// (设计稿 overview.html v6 重绘,bh_037/060 母题),SVG 原样移植。
+// 单色蓝图线稿图标。
 
 export function AppIcon() {
   // Level-Bars / E:三条递减电平横杠 = 字母 E + 音频电平。

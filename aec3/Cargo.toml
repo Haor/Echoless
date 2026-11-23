@@ -23,7 +23,6 @@ repository = "https://github.com/Haor/echoless"
 
 [workspace.dependencies]
 # Internal crates
-aec3-apm = { version = "0.1.0", path = "crates/aec3-apm" }
 aec3-common-audio = { version = "0.1.0", path = "crates/aec3-common-audio" }
 aec3-core = { version = "0.1.0", path = "crates/aec3-core" }
 aec3-agc2 = { version = "0.1.0", path = "crates/aec3-agc2" }

@@ -428,11 +428,11 @@ mod tests {
         let mut fb = FftBuffer::new(num_partitions, num_channels);
 
         // Fill FFT buffer with simple test data.
-        for p in 0..num_partitions {
-            for ch in 0..num_channels {
+        for (p, part) in fb.buffer.iter_mut().enumerate().take(num_partitions) {
+            for (ch, fft) in part.iter_mut().enumerate().take(num_channels) {
                 for k in 0..FFT_LENGTH_BY_2_PLUS_1 {
-                    fb.buffer[p][ch].re[k] = (p * num_channels + ch + k) as f32 * 0.01;
-                    fb.buffer[p][ch].im[k] = (p * num_channels + ch + k) as f32 * 0.005;
+                    fft.re[k] = (p * num_channels + ch + k) as f32 * 0.01;
+                    fft.im[k] = (p * num_channels + ch + k) as f32 * 0.005;
                 }
             }
         }

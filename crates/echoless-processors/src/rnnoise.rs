@@ -136,14 +136,10 @@ impl EchoProcessor for RnNoise {
     }
 
     fn configure(&mut self, params: &toml::Table) -> anyhow::Result<()> {
+        // try_new() already created and primed the native state.
         ensure!(
             params.is_empty(),
             "RNNoise does not accept configuration parameters"
-        );
-        self.reset();
-        ensure!(
-            self.last.runtime_error_count == 0,
-            "failed to reset RNNoise state"
         );
         Ok(())
     }
@@ -156,7 +152,7 @@ impl EchoProcessor for RnNoise {
         let requested_frames = frames as usize;
         while offset < requested_frames {
             let block_len = (requested_frames - offset).min(FRAME_SAMPLES);
-            for index in 0..FRAME_SAMPLES {
+            for (index, slot) in self.input.iter_mut().enumerate().take(FRAME_SAMPLES) {
                 let normalized = if index < block_len {
                     near.get(offset + index)
                         .copied()
@@ -166,7 +162,7 @@ impl EchoProcessor for RnNoise {
                 } else {
                     0.0
                 };
-                self.input[index] = normalized * PCM_SCALE;
+                *slot = normalized * PCM_SCALE;
             }
 
             self.native.process(&mut self.output, &self.input);

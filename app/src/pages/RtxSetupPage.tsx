@@ -23,14 +23,14 @@ const VC_URL = "https://aka.ms/vs/17/release/vc_redist.x64.exe";
 
 const base = (p: string) => p.split(/[\\/]/).pop() ?? p;
 
-const LADDER_LABEL: Record<LadderKey, string> = {
-  platform: "platform",
-  driver: "driver",
-  gpu: "gpu",
-  "vc++": "vc++",
-  runtime: "runtime",
-  model: "model",
-  ready: "ready",
+const LADDER_LABEL_KEY: Record<LadderKey, string> = {
+  platform: "rtxNodePlatform",
+  driver: "rtxNodeDriver",
+  gpu: "rtxNodeGpu",
+  "vc++": "rtxNodeVc",
+  runtime: "rtxNodeRuntime",
+  model: "rtxNodeModel",
+  ready: "rtxNodeReady",
 };
 
 async function pickZip(set: (v: string) => void) {
@@ -361,7 +361,7 @@ export function RtxSetupPage({
         {RTX_LADDER.map((k) => (
           <span key={k} className={`wznode ${ladder[k]}`}>
             <i className="d" />
-            {LADDER_LABEL[k]}
+            {t(LADDER_LABEL_KEY[k])}
           </span>
         ))}
       </div>

@@ -14,6 +14,7 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 use zip::ZipArchive;
 
+use crate::config_validate::ensure_valid_pipeline_config;
 use echoless_audio_io::file::{WavFileSink, WavFileSource};
 use echoless_core::{
     default_output_level, run_offline, DiagnosticsConfig, PipelineConfig, ReferenceChannels,
@@ -152,61 +153,8 @@ fn cmd_nvafx_doctor(args: NvafxDoctorArgs) -> Result<()> {
                 "report": report,
             }))?
         );
-        return Ok(());
-    }
-
-    println!("NVIDIA AFX / RTX AEC doctor");
-    println!(
-        "SDK {} · runtime file {} · minimum driver {}",
-        echoless_processors::nvafx::SDK_VERSION,
-        echoless_processors::nvafx::RUNTIME_FILE_VERSION,
-        echoless_processors::nvafx::MIN_DRIVER_VERSION,
-    );
-    println!(
-        "Runtime: {} ({})",
-        report.runtime_dir.display(),
-        report.runtime_dir_source
-    );
-    if report.gpus.is_empty() {
-        println!("GPU:     no NVIDIA GPU detected");
     } else {
-        println!("GPU:");
-        for (index, gpu) in report.gpus.iter().enumerate() {
-            let arch = gpu
-                .arch
-                .map(|arch| arch.as_str().to_string())
-                .unwrap_or_else(|| "unsupported".to_string());
-            println!(
-                "  [{index}] {} · driver {} · compute_cap {} · arch {}",
-                gpu.name, gpu.driver_version, gpu.compute_capability, arch
-            );
-        }
-    }
-    if let Some(asset) = report.expected_model_asset() {
-        println!("Model asset: {asset}");
-    }
-    println!();
-
-    let mut problems = 0usize;
-    for check in &report.checks {
-        if check.status.is_problem() {
-            problems += 1;
-        }
-        println!(
-            "[{}] {} — {}",
-            check.status.label(),
-            check.name,
-            check.detail
-        );
-        if let Some(action) = &check.action {
-            println!("      action: {action}");
-        }
-    }
-
-    if problems == 0 {
-        println!("\nRTX AEC runtime preflight passed.");
-    } else {
-        println!("\nRTX AEC runtime preflight failed: {problems} issues to resolve.");
+        print_nvafx_doctor_report(&report);
     }
     Ok(())
 }
@@ -238,14 +186,13 @@ fn cmd_nvafx_offline(a: NvafxOfflineArgs) -> Result<()> {
         near_delay_ms: 0,
         output_level: default_output_level(),
         bypass: false,
-        output_rate_match: echoless_core::default_output_rate_match(),
         diagnostics: DiagnosticsConfig::default(),
         chain: vec![NodeConfig {
             kind: "nvidia_afx_aec".into(),
             params,
         }],
     };
-    validate_nvafx_constraints(&cfg)?;
+    ensure_valid_pipeline_config(&cfg)?;
 
     let frame = cfg.frame_size();
     let mic = WavFileSource::new(&a.mic, frame)?;
@@ -327,12 +274,17 @@ fn cmd_nvafx_download_install(a: NvafxDownloadInstallArgs) -> Result<()> {
 
     let release_sha256sums = match fetch_release_sha256sums(tag, &download_dir, a.json) {
         Ok(sums) => sums,
-        Err(err) => {
+        Err(err) if tag == DEFAULT_NVAFX_RELEASE_TAG => {
             install_log(
                 a.json,
-                format!("failed to read SHA256SUMS.txt: {err:#}; will fall back to built-in hashes or only record actual hashes"),
+                format!("failed to read SHA256SUMS.txt: {err:#}; falling back to built-in pins"),
             );
             HashMap::new()
+        }
+        Err(err) => {
+            return Err(err).with_context(|| {
+                format!("refusing to download unverified custom NVAFX release {tag}: failed to read SHA256SUMS.txt")
+            });
         }
     };
 
@@ -349,7 +301,7 @@ fn cmd_nvafx_download_install(a: NvafxDownloadInstallArgs) -> Result<()> {
     download_release_asset(
         &common_url,
         &common_zip,
-        common_expected.as_deref(),
+        Some(common_expected.as_str()),
         common_size,
         "common runtime",
         a.json,
@@ -357,7 +309,7 @@ fn cmd_nvafx_download_install(a: NvafxDownloadInstallArgs) -> Result<()> {
     download_release_asset(
         &model_url,
         &model_zip,
-        model_expected.as_deref(),
+        Some(model_expected.as_str()),
         model_size,
         "model",
         a.json,
@@ -366,8 +318,8 @@ fn cmd_nvafx_download_install(a: NvafxDownloadInstallArgs) -> Result<()> {
     let report = install_nvafx_runtime(NvafxInstallRequest {
         common_zip: &common_zip,
         model_zip: &model_zip,
-        common_sha256: common_expected.as_deref(),
-        model_sha256: model_expected.as_deref(),
+        common_sha256: Some(common_expected.as_str()),
+        model_sha256: Some(model_expected.as_str()),
         install_source: json!({
             "kind": "github-release",
             "tag": tag,
@@ -459,13 +411,14 @@ fn install_nvafx_runtime(
             runtime_dir.display()
         ),
     );
-    let staging_dir = unique_install_staging_dir(&runtime_dir)?;
-    extract_zip(request.common_zip, &staging_dir)?;
+    let staging = StagingDirGuard(unique_install_staging_dir(&runtime_dir)?);
+    let staging_dir = staging.0.as_path();
+    extract_zip(request.common_zip, staging_dir)?;
     install_log(
         request.log_to_stderr,
         format!("extracting model to staging: {}", staging_dir.display()),
     );
-    extract_zip(request.model_zip, &staging_dir)?;
+    extract_zip(request.model_zip, staging_dir)?;
 
     let installed_at = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -493,7 +446,7 @@ fn install_nvafx_runtime(
     file.write_all(b"\n")?;
     drop(file);
 
-    replace_dir_with_staging(&runtime_dir, &staging_dir)?;
+    replace_dir_with_staging(&runtime_dir, staging_dir, request.log_to_stderr)?;
 
     install_log(
         request.log_to_stderr,
@@ -608,7 +561,7 @@ fn expected_sha256_for_release_asset(
     tag: &str,
     release_sha256sums: &HashMap<String, String>,
     asset: &str,
-) -> Result<Option<String>> {
+) -> Result<String> {
     if tag == DEFAULT_NVAFX_RELEASE_TAG {
         if let Some(embedded) = expected_sha256_for_asset(Path::new(asset)) {
             if let Some(release) = release_sha256sums.get(asset) {
@@ -617,11 +570,15 @@ fn expected_sha256_for_release_asset(
                     "SHA256SUMS.txt does not match the built-in pin: asset={asset}, release={release}, embedded={embedded}"
                 );
             }
-            return Ok(Some(embedded.to_string()));
+            return Ok(embedded.to_string());
         }
     }
 
-    Ok(release_sha256sums.get(asset).cloned())
+    release_sha256sums.get(asset).cloned().with_context(|| {
+        format!(
+            "refusing to extract unverified asset {asset} from release {tag}: missing entry in SHA256SUMS.txt"
+        )
+    })
 }
 
 fn expected_size_for_release_asset(tag: &str, asset: &str) -> Option<u64> {
@@ -705,19 +662,7 @@ fn download_file(
         )
     });
 
-    match download_with_powershell(url, &tmp) {
-        Ok(()) => Ok(()),
-        Err(power_shell_err) => {
-            let _ = std::fs::remove_file(&tmp);
-            install_log(
-                log_to_stderr,
-                format!("PowerShell download failed, trying curl.exe: {power_shell_err:#}"),
-            );
-            download_with_curl(url, &tmp)
-                .with_context(|| format!("PowerShell download also failed: {power_shell_err:#}"))
-        }
-    }?;
-
+    download_with_curl(url, &tmp)?;
     commit_downloaded_file(&tmp, dest, progress)?;
     let received = std::fs::metadata(dest).map(|meta| meta.len()).unwrap_or(0);
     emit_download_progress(log_to_stderr, label, received, expected_size);
@@ -844,33 +789,13 @@ fn download_progress_payload(label: &str, received: u64, total: Option<u64>) -> 
     })
 }
 
-fn download_with_powershell(url: &str, dest: &Path) -> Result<()> {
-    let output = Command::new("powershell.exe")
-        .arg("-NoLogo")
-        .arg("-NoProfile")
-        .arg("-ExecutionPolicy")
-        .arg("Bypass")
-        .arg("-Command")
-        .arg("$ProgressPreference = 'SilentlyContinue'; Invoke-WebRequest -Uri $args[0] -OutFile $args[1] -UseBasicParsing")
-        .arg(url)
-        .arg(dest)
-        .output()
-        .context("failed to launch powershell.exe")?;
-    if output.status.success() {
-        return Ok(());
-    }
-    bail!(
-        "powershell.exe exit={}; stderr={}; stdout={}",
-        output.status,
-        String::from_utf8_lossy(&output.stderr).trim(),
-        String::from_utf8_lossy(&output.stdout).trim()
-    )
-}
-
 fn download_with_curl(url: &str, dest: &Path) -> Result<()> {
+    // curl.exe ships with Windows 10 1803+ and receives URL/path as argv, not script text.
     let output = Command::new("curl.exe")
         .arg("-L")
         .arg("--fail")
+        .arg("--connect-timeout")
+        .arg("30")
         .arg("--retry")
         .arg("2")
         .arg("--output")
@@ -1014,9 +939,18 @@ fn extract_zip(zip_path: &Path, dest: &Path) -> Result<()> {
         let mut entry = archive.by_index(index).with_context(|| {
             format!("failed to read zip entry #{index}: {}", zip_path.display())
         })?;
-        let enclosed = entry
-            .enclosed_name()
-            .with_context(|| format!("unsafe zip entry path: {}", entry.name()))?;
+        if entry.is_symlink() {
+            bail!(
+                "refusing to extract symlink zip entry: {}",
+                String::from_utf8_lossy(entry.name_raw())
+            );
+        }
+        let enclosed = entry.enclosed_name().with_context(|| {
+            format!(
+                "unsafe zip entry path: {}",
+                String::from_utf8_lossy(entry.name_raw())
+            )
+        })?;
         let out_path = dest.join(enclosed);
         if entry.is_dir() {
             create_dir_all(&out_path)
@@ -1035,7 +969,26 @@ fn extract_zip(zip_path: &Path, dest: &Path) -> Result<()> {
     Ok(())
 }
 
-fn unique_install_staging_dir(runtime_dir: &Path) -> Result<PathBuf> {
+/// Removes a partially extracted staging tree (1-2 GB) when installation fails.
+/// After a successful commit the path has been renamed away, so drop is a no-op.
+struct StagingDirGuard(PathBuf);
+
+impl Drop for StagingDirGuard {
+    fn drop(&mut self) {
+        if self.0.exists() {
+            if let Err(err) = remove_dir_all(&self.0) {
+                eprintln!(
+                    "failed to remove staging directory {}: {err}",
+                    self.0.display()
+                );
+            }
+        }
+    }
+}
+
+/// Builds `<parent>/<runtime_dir name>.<suffix>`. `with_extension` would treat the
+/// `.0` of `2.1.0` as an extension and replace it.
+fn runtime_sibling_dir(runtime_dir: &Path, suffix: &str) -> Result<PathBuf> {
     let parent = runtime_dir
         .parent()
         .with_context(|| format!("runtime directory has no parent: {}", runtime_dir.display()))?;
@@ -1043,11 +996,21 @@ fn unique_install_staging_dir(runtime_dir: &Path) -> Result<PathBuf> {
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("nvafx-runtime");
-    let nanos = SystemTime::now()
+    Ok(parent.join(format!("{name}.{suffix}")))
+}
+
+fn unix_nanos() -> Result<u128> {
+    Ok(SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .context("system time is before UNIX_EPOCH")?
-        .as_nanos();
-    let staging = parent.join(format!("{name}.installing-{}-{nanos}", std::process::id()));
+        .as_nanos())
+}
+
+fn unique_install_staging_dir(runtime_dir: &Path) -> Result<PathBuf> {
+    let staging = runtime_sibling_dir(
+        runtime_dir,
+        &format!("installing-{}-{}", std::process::id(), unix_nanos()?),
+    )?;
     if staging.exists() {
         remove_dir_all(&staging).with_context(|| {
             format!(
@@ -1061,14 +1024,12 @@ fn unique_install_staging_dir(runtime_dir: &Path) -> Result<PathBuf> {
     Ok(staging)
 }
 
-fn replace_dir_with_staging(runtime_dir: &Path, staging_dir: &Path) -> Result<()> {
-    let backup_dir = runtime_dir.with_extension(format!(
-        "previous-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .context("system time is before UNIX_EPOCH")?
-            .as_nanos()
-    ));
+fn replace_dir_with_staging(
+    runtime_dir: &Path,
+    staging_dir: &Path,
+    log_to_stderr: bool,
+) -> Result<()> {
+    let backup_dir = runtime_sibling_dir(runtime_dir, &format!("previous-{}", unix_nanos()?))?;
     let had_previous = runtime_dir.exists();
     if had_previous {
         rename(runtime_dir, &backup_dir).with_context(|| {
@@ -1090,30 +1051,15 @@ fn replace_dir_with_staging(runtime_dir: &Path, staging_dir: &Path) -> Result<()
         );
     }
     if had_previous {
-        let _ = remove_dir_all(backup_dir);
-    }
-    Ok(())
-}
-
-pub(crate) fn validate_nvafx_constraints(cfg: &PipelineConfig) -> Result<()> {
-    if !cfg.chain.iter().any(|node| node.kind == "nvidia_afx_aec") {
-        return Ok(());
-    }
-    if cfg.sample_rate != echoless_processors::nvafx::NVAFX_SAMPLE_RATE {
-        bail!(
-            "nvidia_afx_aec v1 only supports {} Hz; current sample_rate={}",
-            echoless_processors::nvafx::NVAFX_SAMPLE_RATE,
-            cfg.sample_rate
-        );
-    }
-    if cfg.frame_ms != 10 {
-        bail!(
-            "nvidia_afx_aec v1 only supports 10ms frames; current frame_ms={}",
-            cfg.frame_ms
-        );
-    }
-    if cfg.reference_channels != ReferenceChannels::Mono {
-        bail!("nvidia_afx_aec v1 only supports mono reference; set reference_channels = \"mono\"");
+        if let Err(err) = remove_dir_all(&backup_dir) {
+            install_log(
+                log_to_stderr,
+                format!(
+                    "failed to remove previous runtime backup (remove it manually): {}: {err}",
+                    backup_dir.display()
+                ),
+            );
+        }
     }
     Ok(())
 }
@@ -1379,9 +1325,8 @@ mod tests {
                 &sums,
                 NVAFX_COMMON_RUNTIME_ASSET
             )
-            .unwrap()
-            .as_deref(),
-            Some("dcacac954b7973ae18369b252d13f24b973b10114d00e5293eab0713601c7bcb")
+            .unwrap(),
+            "dcacac954b7973ae18369b252d13f24b973b10114d00e5293eab0713601c7bcb"
         );
         assert_eq!(
             expected_sha256_for_release_asset(
@@ -1389,25 +1334,25 @@ mod tests {
                 &HashMap::new(),
                 NVAFX_COMMON_RUNTIME_ASSET,
             )
-            .unwrap()
-            .as_deref(),
-            Some("dcacac954b7973ae18369b252d13f24b973b10114d00e5293eab0713601c7bcb")
-        );
-        assert_eq!(
-            expected_sha256_for_release_asset(
-                "custom-tag",
-                &HashMap::new(),
-                NVAFX_COMMON_RUNTIME_ASSET
-            )
             .unwrap(),
-            None
+            "dcacac954b7973ae18369b252d13f24b973b10114d00e5293eab0713601c7bcb"
+        );
+        let missing_err = expected_sha256_for_release_asset(
+            "custom-tag",
+            &HashMap::new(),
+            NVAFX_COMMON_RUNTIME_ASSET,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            missing_err.contains("missing entry in SHA256SUMS.txt"),
+            "{missing_err}"
         );
 
         assert_eq!(
             expected_sha256_for_release_asset("custom-tag", &sums, NVAFX_COMMON_RUNTIME_ASSET)
-                .unwrap()
-                .as_deref(),
-            Some("dcacac954b7973ae18369b252d13f24b973b10114d00e5293eab0713601c7bcb")
+                .unwrap(),
+            "dcacac954b7973ae18369b252d13f24b973b10114d00e5293eab0713601c7bcb"
         );
     }
 
@@ -1449,7 +1394,7 @@ mod tests {
         std::fs::write(staging.join("new.txt"), b"new").unwrap();
         std::fs::write(&sentinel, b"keep").unwrap();
 
-        replace_dir_with_staging(&runtime, &staging).unwrap();
+        replace_dir_with_staging(&runtime, &staging, false).unwrap();
 
         assert!(!staging.exists());
         assert!(!runtime.join("old.txt").exists());
@@ -1476,7 +1421,7 @@ mod tests {
         std::fs::write(runtime.join("old.txt"), b"old").unwrap();
         std::fs::write(&sentinel, b"keep").unwrap();
 
-        let error = replace_dir_with_staging(&runtime, &missing_staging).unwrap_err();
+        let error = replace_dir_with_staging(&runtime, &missing_staging, false).unwrap_err();
 
         assert!(error
             .to_string()
@@ -1484,6 +1429,35 @@ mod tests {
         assert_eq!(std::fs::read(runtime.join("old.txt")).unwrap(), b"old");
         assert_eq!(std::fs::read(&sentinel).unwrap(), b"keep");
 
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn runtime_sibling_dir_keeps_dotted_version_name() {
+        let runtime = Path::new("brand").join("nvafx").join("2.1.0");
+
+        let backup = runtime_sibling_dir(&runtime, "previous-42").unwrap();
+
+        assert_eq!(
+            backup,
+            Path::new("brand").join("nvafx").join("2.1.0.previous-42")
+        );
+    }
+
+    #[test]
+    fn staging_guard_removes_partial_tree_on_failure() {
+        let root = env::temp_dir().join(format!(
+            "echoless-nvafx-guard-{}-{}",
+            std::process::id(),
+            unix_nanos().unwrap()
+        ));
+        let runtime = root.join("2.1.0");
+        let staging = unique_install_staging_dir(&runtime).unwrap();
+        std::fs::write(staging.join("partial.dll"), b"partial").unwrap();
+
+        drop(StagingDirGuard(staging.clone()));
+
+        assert!(!staging.exists());
         let _ = std::fs::remove_dir_all(root);
     }
 }

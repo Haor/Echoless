@@ -102,10 +102,7 @@ function nativeTargetTriple() {
 
 function rustTargetTriple() {
   const explicit =
-    valueOf("--target") ??
-    process.env.TAURI_TARGET_TRIPLE ??
-    process.env.CARGO_BUILD_TARGET ??
-    process.env.TARGET;
+    valueOf("--target") ?? process.env.TAURI_TARGET_TRIPLE ?? process.env.CARGO_BUILD_TARGET;
   if (explicit) return explicit;
   const native = nativeTargetTriple();
   if (native) return native;
@@ -263,13 +260,54 @@ function prepareLocalvqeNative() {
     return false;
   }
 
+  const sourceDir = path.dirname(library);
+  if (path.resolve(sourceDir) === path.resolve(nativeDir)) {
+    console.log(`asset: ${path.relative(repoRoot, nativeDir)} already present`);
+    return true;
+  }
+  const names = fs
+    .readdirSync(sourceDir)
+    .filter((name) => companionLibrary(name) && existsFile(path.join(sourceDir, name)));
   ensureDir(nativeDir);
-  for (const file of fs.readdirSync(path.dirname(library)).map((name) => path.join(path.dirname(library), name))) {
-    if (existsFile(file) && companionLibrary(file)) {
-      copyFile(file, path.join(nativeDir, path.basename(file)));
+  // Remove libraries from an older build: the runtime picks the first match by
+  // name and could load a stale one.
+  for (const name of fs.readdirSync(nativeDir)) {
+    if (companionLibrary(name) && !names.includes(name)) {
+      fs.rmSync(path.join(nativeDir, name), { force: true });
+      console.log(`asset: removed stale ${path.relative(repoRoot, path.join(nativeDir, name))}`);
     }
   }
+  for (const name of names) {
+    copyLibrary(path.join(sourceDir, name), path.join(nativeDir, name));
+  }
   return true;
+}
+
+// Version links (liblocalvqe.dylib -> liblocalvqe.0.dylib -> liblocalvqe.0.1.0.dylib)
+// stay links instead of becoming full copies. Only links to a sibling library
+// are kept; anything else is copied as a regular file.
+function siblingLinkTarget(file) {
+  if (process.platform === "win32" || !fs.lstatSync(file).isSymbolicLink()) return null;
+  const target = fs.readlinkSync(file);
+  return path.basename(target) === target && companionLibrary(target) ? target : null;
+}
+
+function copyLibrary(src, dest) {
+  const link = siblingLinkTarget(src);
+  const currentIsLink = fs.lstatSync(dest, { throwIfNoEntry: false })?.isSymbolicLink() ?? false;
+  if (!link) {
+    // copyFile compares contents through links; replace a stale link with a real file.
+    if (currentIsLink) fs.rmSync(dest, { force: true });
+    copyFile(src, dest);
+    return;
+  }
+  if (currentIsLink && fs.readlinkSync(dest) === link) {
+    console.log(`asset: ${path.relative(repoRoot, dest)} unchanged`);
+    return;
+  }
+  fs.rmSync(dest, { force: true });
+  fs.symlinkSync(link, dest);
+  console.log(`asset: ${path.relative(repoRoot, dest)} -> ${link}`);
 }
 
 function warnDegradedBundle() {

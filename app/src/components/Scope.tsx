@@ -119,7 +119,7 @@ export function Scope({
       const mid = h / 2;
       const maxA = h / 2 - 3;
 
-      // v13:点划中心线(机械制图 centerline;25/75 基准线已删,线条减法)
+      // 点划中心线(机械制图 centerline)
       x.setLineDash([9, 4, 2, 4]);
       x.strokeStyle = "rgba(214,213,205,0.08)";
       x.lineWidth = 1;
@@ -231,7 +231,7 @@ export function Scope({
   return <canvas ref={canvasRef} data-w={traceKey} />;
 }
 
-// footer 微型电平条:绑 out_dbfs(真实活动指示,非装饰)。
+// footer 微型电平条:绑 out_dbfs(真实活动指示,随遥测节拍更新,不跑无条件 60fps 循环)。
 const BAR_ENV = [0.45, 0.7, 1, 0.8, 0.55, 0.32];
 export function FooterBars({
   telRef,
@@ -243,60 +243,29 @@ export function FooterBars({
   revision: number;
 }) {
   const wrapRef = useRef<HTMLSpanElement>(null);
-  const activeRef = useRef(active);
-  const scheduleRef = useRef<() => void>(() => {});
-
-  activeRef.current = active;
+  const phaseRef = useRef(0);
+  const lastAtRef = useRef(0);
 
   useEffect(() => {
-    let raf = 0;
-    let t = 0;
-    let last = performance.now();
-    const reduce = matchMedia("(prefers-reduced-motion: reduce)").matches;
-    const frame = (now: number) => {
-      raf = 0;
-      const dt = Math.min(0.05, (now - last) / 1000);
-      last = now;
-      if (!reduce && activeRef.current && !document.hidden) t += dt;
-      const tel = telRef.current;
-      const eo = clamp01((tel.out + 60) / 60) * (tel.on ? 1 : 0.18);
-      const bars = wrapRef.current?.children;
-      if (!bars) return;
-      for (let i = 0; i < bars.length; i++) {
-        const j = 0.65 + Math.sin(t * 9 + i * 1.25) * 0.35;
-        const hgt = Math.min(12, 2 + eo * BAR_ENV[i] * j * 12);
-        (bars[i] as HTMLElement).style.height = `${hgt.toFixed(1)}px`;
-      }
-      if (!reduce && activeRef.current && !document.hidden) {
-        raf = requestAnimationFrame(frame);
-      }
-    };
-
-    const schedule = () => {
-      if (document.hidden || raf) return;
-      raf = requestAnimationFrame(frame);
-    };
-    const stop = () => {
-      if (raf) cancelAnimationFrame(raf);
-      raf = 0;
-    };
-    const onVisibility = () => {
-      if (document.hidden) stop();
-      else schedule();
-    };
-    document.addEventListener("visibilitychange", onVisibility);
-    scheduleRef.current = schedule;
-    schedule();
-    return () => {
-      stop();
-      document.removeEventListener("visibilitychange", onVisibility);
-      scheduleRef.current = () => {};
-    };
-  }, [telRef]);
-
-  useEffect(() => {
-    scheduleRef.current();
-  }, [active, revision]);
+    const bars = wrapRef.current?.children;
+    if (!bars) return;
+    const now = performance.now();
+    const dt =
+      lastAtRef.current > 0
+        ? Math.min(0.25, (now - lastAtRef.current) / 1000)
+        : 0.08;
+    lastAtRef.current = now;
+    if (active && !document.hidden) {
+      phaseRef.current += dt;
+    }
+    const tel = telRef.current;
+    const eo = clamp01((tel.out + 60) / 60) * (tel.on && active ? 1 : 0.18);
+    for (let i = 0; i < bars.length; i++) {
+      const j = 0.65 + Math.sin(phaseRef.current * 9 + i * 1.25) * 0.35;
+      const hgt = Math.min(12, 2 + eo * BAR_ENV[i] * j * 12);
+      (bars[i] as HTMLElement).style.height = `${hgt.toFixed(1)}px`;
+    }
+  }, [telRef, active, revision]);
 
   return (
     <span className="bg" ref={wrapRef}>

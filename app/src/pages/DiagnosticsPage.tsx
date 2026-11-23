@@ -1,17 +1,21 @@
-import type { Health } from "../runtimeTelemetry";
-import type { DoctorAudio, Platform } from "../types";
+import {
+  dash,
+  formatLostAudio,
+  formatRunClock,
+  healthVerdict,
+  type Health,
+} from "../runtimeTelemetry";
+import type { DeviceList, DoctorAudio, Platform } from "../types";
 import { openDiagnosticsDir, openPath, openUrl } from "../api";
 import { useI18n } from "../i18n";
 import { Field } from "../components/Controls";
 import { Hint } from "../components/Hint";
+import { SYS_AUDIO_PRIVACY_URL } from "../components/RuntimeStatusStrip";
 import { Toggle } from "../components/Toggle";
+import { resolveVirtualRoute } from "../virtualRoute";
 
-// macOS 隐私设置深链。麦克风有专属锚点;系统录音(14.4+ Audio Capture)无稳定
-// 专属锚点,回退到隐私根面板。
 const MIC_PRIVACY_URL =
   "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone";
-const SYS_AUDIO_PRIVACY_URL =
-  "x-apple.systempreferences:com.apple.preference.security?Privacy";
 
 export interface DiagnosticsPageProps {
   rec: boolean;
@@ -20,6 +24,8 @@ export interface DiagnosticsPageProps {
   running: boolean;
   health: Health;
   doctor: DoctorAudio | null;
+  devices: DeviceList | null;
+  selectedOutput: string;
   platform: Platform;
   onMicSetup: () => void;
   onRequestSystemAudio: () => void;
@@ -35,6 +41,8 @@ export function DiagnosticsPage({
   running,
   health,
   doctor,
+  devices,
+  selectedOutput,
   platform,
   onMicSetup,
   onRequestSystemAudio,
@@ -46,16 +54,20 @@ export function DiagnosticsPage({
   const active = rec && running;
   const isMac = platform === "macos";
 
-  // 虚拟麦路由摘要(诊断行):就绪? 通话软件该选哪个 mic?
-  const routeReady =
-    doctor?.virtual_route_ready ??
-    ((doctor?.candidate_outputs.length ?? 0) > 0 &&
-      (doctor?.candidate_inputs.length ?? 0) > 0);
-  const appMic =
-    doctor?.recommended_app_mic ??
-    doctor?.candidate_inputs.find((i) => /cable output|blackhole/i.test(i.name)) ??
-    doctor?.candidate_inputs[0] ??
-    null;
+  // 虚拟麦路由摘要(诊断行):基于当前选中 OUTPUT 与设备列表做确定性配对。
+  const route = resolveVirtualRoute({
+    selectedOutput,
+    devices,
+    doctor,
+    platform,
+  });
+  const routeReady = route.ready;
+  const appMic = route.appMic;
+  // A virtual output is selected and virtual mic inputs exist; only the
+  // automatic name match failed. The route works once the user picks the
+  // mic in the call app, so this is guidance, not "set up".
+  const routeManual =
+    !routeReady && route.selectedIsVirtual && route.hasVirtualInput;
 
   // macOS 权限态(麦克风 + 系统录音)。缺字段 → unknown;非 mac 不渲染此区块。
   type PermState = "granted" | "denied" | "undetermined" | "unknown";
@@ -70,6 +82,22 @@ export function DiagnosticsPage({
           ? t("permUndet")
           : t("permUnknown");
 
+  const lost = (frames: number) => formatLostAudio(frames, health.sample_rate);
+  const verdict = healthVerdict(health, running);
+  const verdictText =
+    verdict === "idle"
+      ? t("healthIdle")
+      : verdict === "waiting"
+        ? t("healthWaiting")
+        : verdict === "ok"
+          ? t("healthOk").replace("{t}", formatRunClock(health.elapsed_s ?? 0))
+          : t("healthIssue").replace(
+              "{t}",
+              formatRunClock(
+                Math.max(0, (health.elapsed_s ?? 0) - (health.last_issue_s ?? 0)),
+              ),
+            );
+
   // pos:"top" = 提示往上弹。列表按两列网格排布,最下两排(后 4 项)贴近窗口
   // 底缘,向下弹会被视口截掉。
   const counters: {
@@ -79,16 +107,19 @@ export function DiagnosticsPage({
     hint: string;
     pos?: "top";
   }[] = [
-    { label: "input drops", value: health.input_drops, warn: health.input_drops > 0, hint: t("hInputDrops") },
-    { label: "ref underruns", value: health.ref_underruns, warn: health.ref_underruns > 0, hint: t("hRefUnderruns") },
-    { label: "output underruns", value: health.output_underruns, warn: health.output_underruns > 0, hint: t("hOutputUnderruns") },
-    { label: "mic stale", value: health.mic_stale_drops, warn: health.mic_stale_drops > 0, hint: t("hMicStale") },
-    { label: "ref stale", value: health.ref_stale_drops, warn: health.ref_stale_drops > 0, hint: t("hRefStale"), pos: "top" },
+    { label: "input drops", value: lost(health.input_drops), warn: health.input_drops > 0, hint: t("hInputDrops") },
+    { label: "ref underruns", value: lost(health.ref_underruns), warn: health.ref_underruns > 0, hint: t("hRefUnderruns") },
+    { label: "output underruns", value: lost(health.output_underruns), warn: health.output_underruns > 0, hint: t("hOutputUnderruns") },
+    { label: "mic stale", value: lost(health.mic_stale_drops), warn: health.mic_stale_drops > 0, hint: t("hMicStale") },
+    { label: "ref stale", value: lost(health.ref_stale_drops), warn: health.ref_stale_drops > 0, hint: t("hRefStale"), pos: "top" },
     // stale drops(= mic stale + ref stale 的冗余和)让位给 clock skew:
     // 时钟漂移是断续/回声残留的常见根因,比一个可心算的加总更值得占一格。
     {
       label: "clock skew",
-      value: health.clock_skew_pct === null ? "—" : `${health.clock_skew_pct.toFixed(1)}%`,
+      value:
+        health.clock_skew_pct === null
+          ? "—"
+          : `${dash(health.clock_skew_pct)}%`,
       warn: health.clock_skew_warning,
       hint: t("clockSkewHint"),
       pos: "top",
@@ -113,8 +144,20 @@ export function DiagnosticsPage({
       <div className="drow">
         <span className="dk">ROUTE</span>
         <span className={`dpath ${routeReady ? "live" : ""}`}>
-          {routeReady ? t("micReadyShort") : t("micSetupShort")}
-          {appMic ? ` · ${t("micPickShort")}: ${appMic.name}` : ""}
+          {routeReady
+            ? t("micReadyShort")
+            : routeManual
+              ? t("micManualShort")
+              : t("micSetupShort")}
+          {appMic
+            ? ` · ${t("micPickShort")}: ${appMic.name}`
+            : route.counterpartMissing && route.output
+              ? ` · ${route.output.name} (${
+                  route.hasVirtualInput
+                    ? t("micUnmatchedPickHint")
+                    : t("micCounterpartMissing")
+                })`
+              : ""}
         </span>
         <button type="button" className="dopen" onClick={onMicSetup}>
           {t("setupBtn")} <span className="mk">&raquo;</span>
@@ -189,6 +232,7 @@ export function DiagnosticsPage({
               numeric
               min={1}
               integer
+              disabled={active}
               placeholder={t("unlimited")}
               onCommit={(v) => onSeconds(v as number | null)}
             />
@@ -199,7 +243,7 @@ export function DiagnosticsPage({
       <div className="drow">
         <span className="dk">{t("recordDir")}</span>
         <span className="dpath" title={diagDir}>
-          {diagDir || t("choose")}
+          {diagDir || "—"}
         </span>
         <button type="button" className="dopen" onClick={() => openDiagnosticsDir()}>
           {t("openFolder")} <span className="mk">&raquo;</span>
@@ -212,7 +256,7 @@ export function DiagnosticsPage({
             <span className="dpath live">{health.session_dir}</span>
             {health.recording && (
               <span className="recbadge">
-                ● {health.rec_elapsed_s.toFixed(1)}s
+                ● {dash(health.rec_elapsed_s)}s
                 {seconds ? ` / ${seconds}s` : ""}
               </span>
             )}
@@ -235,6 +279,15 @@ export function DiagnosticsPage({
       </div>
 
       <div className="asec">{t("secHealth")}</div>
+      <div className="drow">
+        <span className="dk">STATUS</span>
+        <span
+          className={`dpath ${verdict === "ok" ? "live" : ""}`}
+          style={verdict === "issue" ? { color: "var(--warn)" } : undefined}
+        >
+          {verdictText}
+        </span>
+      </div>
       <div className={`acols ${running ? "" : "dim-soft"}`}>
         {counters.map((c) => (
           <div className="arow" key={c.label}>

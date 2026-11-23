@@ -2,6 +2,7 @@ import {
   createContext,
   useCallback,
   useContext,
+  useEffect,
   useMemo,
   useState,
   type ReactNode,
@@ -23,13 +24,27 @@ const D: Record<string, { en: string; zh: string }> = {
 
   removingEcho: { en: "Removing Echo", zh: "正在消除回声" },
   echoStopped: { en: "Echo Stopped", zh: "已停止" },
-  // P8-D1:OFF = 穿透 —— 强调 mic 仍然活着,只是 AEC 旁路。
+  // OFF = 穿透:强调 mic 仍然活着,只是 AEC 旁路。
   bypassLive: { en: "Bypass · Mic Live", zh: "直通 · 麦克风在线" },
   unstable: { en: "Unstable", zh: "不稳定" },
   noReference: { en: "No Reference", zh: "无参考信号" },
   ms: { en: "MS", zh: "毫秒" },
   stable: { en: "Stable", zh: "稳定" },
   checkSetup: { en: "Check Setup", zh: "检查设置" },
+  noDevices: { en: "no devices", zh: "无设备" },
+  unexpectedExit: {
+    en: "Run stopped: engine exited unexpectedly",
+    zh: "运行已停止:子进程意外退出",
+  },
+  clickToDismiss: { en: "click to dismiss", zh: "点击关闭" },
+  autoStartEngineUnready: {
+    en: "Auto Start could not run because the selected engine is not ready.",
+    zh: "开机自启未能运行:所选引擎尚未就绪。",
+  },
+  sysAudioNotGranted: {
+    en: "System audio permission was not granted",
+    zh: "未授予系统音频录制权限",
+  },
 
   input: { en: "Input", zh: "输入" },
   model: { en: "Model", zh: "模型" },
@@ -72,6 +87,7 @@ const D: Record<string, { en: string; zh: string }> = {
   rdyReady: { en: "READY", zh: "就绪" },
   rdySetup: { en: "SET UP", zh: "待配置" },
   rdyIssues: { en: "ISSUES", zh: "项待处理" },
+  unavailable: { en: "UNAVAILABLE", zh: "不可用" },
   engPair: {
     en: "pair with NVIDIA Broadcast",
     zh: "pair with NVIDIA Broadcast",
@@ -102,7 +118,6 @@ const D: Record<string, { en: string; zh: string }> = {
     en: "Smaller AEC model with built-in noise suppression.",
     zh: "体积更小、内置降噪的回声消除模型。",
   },
-  lvqeDownload: { en: "download", zh: "下载" },
   lvqeGet: { en: "GET", zh: "下载" },
   lvqeOpenDir: { en: "open model folder", zh: "打开模型目录" },
   lvqeRuntimeMissing: {
@@ -163,6 +178,13 @@ const D: Record<string, { en: string; zh: string }> = {
   wzDl: { en: "downloading", zh: "下载中" },
   wzUseEngine: { en: "use this engine", zh: "使用该引擎" },
   wzNoGpuArch: { en: "fix GPU / driver detection first", zh: "请先修复 GPU / 驱动检测" },
+  rtxNodePlatform: { en: "platform", zh: "平台" },
+  rtxNodeDriver: { en: "driver", zh: "驱动" },
+  rtxNodeGpu: { en: "gpu", zh: "显卡" },
+  rtxNodeVc: { en: "vc++", zh: "vc++" },
+  rtxNodeRuntime: { en: "runtime", zh: "运行时" },
+  rtxNodeModel: { en: "model", zh: "模型" },
+  rtxNodeReady: { en: "ready", zh: "就绪" },
 
   // 虚拟麦克风诊断 / 向导
   micSetup: { en: "MIC SETUP", zh: "虚拟麦配置" },
@@ -177,6 +199,7 @@ const D: Record<string, { en: string; zh: string }> = {
   micNodeDriver: { en: "driver", zh: "驱动" },
   micNodeRoute: { en: "route", zh: "路由" },
   micNodePerm: { en: "mic perm", zh: "麦权限" },
+  micNodeReady: { en: "ready", zh: "就绪" },
   // 状态摘要(Diagnostics 行)
   micReadyShort: { en: "route ready", zh: "路由就绪" },
   micSetupShort: { en: "set up", zh: "待配置" },
@@ -200,6 +223,29 @@ const D: Record<string, { en: string; zh: string }> = {
   micIncompleteHint: {
     en: "Only one side detected. Reopen the driver installer or finish setup.",
     zh: "只检测到一端。重开驱动安装器或完成安装。",
+  },
+  micCounterpartMissing: {
+    en: "no virtual mic input detected",
+    zh: "未检测到虚拟麦输入端",
+  },
+  micUnmatchedPickHint: {
+    en: "pick the matching virtual mic in your call app",
+    zh: "请在通话软件中选择对应的虚拟麦克风",
+  },
+  micCounterpartMissingHint: {
+    en: "no matching virtual mic input detected. If the driver is installed, make sure its recording device is enabled in the system sound settings; otherwise reinstall the driver.",
+    zh: "未检测到对应的虚拟麦输入端。若驱动已安装，请到系统声音设置的「录制」页确认它没有被禁用；否则重新安装驱动。",
+  },
+  micManualShort: { en: "virtual output set", zh: "已选虚拟输出" },
+  micManualTitle: { en: "Virtual output set", zh: "虚拟输出已就绪" },
+  micManualMicName: { en: "matching virtual mic", zh: "对应的虚拟麦克风" },
+  micManualCandidates: {
+    en: "Virtual mics on this system:",
+    zh: "本机可选的虚拟麦克风:",
+  },
+  micUnmatchedSetupHint: {
+    en: "Could not auto-match a recording device for this output. Verify its recording endpoint is enabled, or select the matching virtual mic in your call app.",
+    zh: "未自动匹配到该输出对应的录音端。请确认其录音设备已启用，或在通话软件中手动选择对应的虚拟麦克风。",
   },
   micMacRestartHint: {
     en: "Only one side detected. Restart CoreAudio, then recheck:",
@@ -236,6 +282,8 @@ const D: Record<string, { en: string; zh: string }> = {
   referenceChannels: { en: "Reference Channels", zh: "参考声道" },
   language: { en: "Language", zh: "语言" },
   auto: { en: "auto", zh: "自动" },
+  required: { en: "required", zh: "必填" },
+  noParameters: { en: "no parameters", zh: "无参数" },
   // Advanced · 延迟侦测 / AEC 链路诊断
   secProbe: { en: "Delay Probe", zh: "延迟侦测" },
   nearDelay: { en: "Near Delay", zh: "近端延迟" },
@@ -261,12 +309,11 @@ const D: Record<string, { en: string; zh: string }> = {
   probeOk: { en: "OK", zh: "OK" },
   probeNoSig: { en: "no beep", zh: "未检测到蜂鸣" },
   probeStable: { en: "stable", zh: "稳定" },
-  probeUnstable: { en: "unstable", zh: "不稳定" },
   probeUncertain: { en: "not measured", zh: "未测出" },
   probeInvalid: { en: "not measured", zh: "未测出" },
   probeRec: { en: "set", zh: "建议" },
   probeNoFix: {
-    // v8/C6:去掉「no fix needed」歧义 —— 正 lag 由 AEC3 自行追踪,near_delay 不动。
+    // 正 lag 由 AEC3 自行追踪,near_delay 保持 0ms。
     en: "aligned · near_delay kept at 0ms",
     zh: "已对齐 · 近端延迟保持 0ms",
   },
@@ -298,29 +345,40 @@ const D: Record<string, { en: string; zh: string }> = {
   secHealth: { en: "Health", zh: "健康" },
   // Health · clock skew 悬停提示(不点名任何具体虚拟音频软件)
   clockSkewHint: {
-    en: "Output clock drift vs. the microphone clock. High or unstable drift usually means a device in the audio chain runs at a mismatched sample rate — set every input/output device (including virtual audio devices) to the same rate, e.g. 48000 Hz.",
-    zh: "输出时钟相对麦克风时钟的漂移。漂移偏高或不稳定,通常说明音频链路中有设备采样率不一致——请把所有输入/输出设备(含虚拟音频设备)统一为同一采样率,如 48000 Hz。",
+    en: "Output clock drift vs. the microphone clock that automatic rate matching could not absorb. 0.0% is normal: small drift is corrected silently. High or unstable drift usually means a device in the audio chain runs at a mismatched sample rate — set every input/output device (including virtual audio devices) to the same rate, e.g. 48000 Hz.",
+    zh: "自动速率匹配吸收不了、残留下来的输出时钟相对麦克风时钟的漂移。0.0% 是正常读数:小幅漂移会被静默校正。漂移偏高或不稳定,通常说明音频链路中有设备采样率不一致——请把所有输入/输出设备(含虚拟音频设备)统一为同一采样率,如 48000 Hz。",
   },
-  // Health · 其余计数器悬停提示
+  // Health · 运行摘要
+  healthIdle: { en: "not running", zh: "未运行" },
+  healthWaiting: { en: "waiting for data…", zh: "等待数据…" },
+  healthOk: {
+    en: "OK · monitored {t} · no dropouts",
+    zh: "正常 · 已监测 {t} · 未发现断续或丢帧",
+  },
+  healthIssue: {
+    en: "check · last dropout or error {t} ago — see the counters below",
+    zh: "注意 · 最近一次断续或错误在 {t} 前——见下方计数",
+  },
+  // Health · 其余计数器悬停提示(计数均为本次启动以来的累计值,按丢失的音频时长显示)
   hInputDrops: {
-    en: "Microphone/reference frames dropped before processing — the capture side couldn't keep up. Occasional drops are harmless; a steadily growing count means CPU pressure or a misbehaving input device.",
-    zh: "进入处理前被丢弃的麦克风/参考帧——采集侧没跟上。偶发丢帧无碍;持续增长说明 CPU 吃紧或输入设备异常。",
+    en: "Microphone/reference audio dropped before processing since start — the capture side couldn't keep up. Occasional drops are harmless; a steadily growing total means CPU pressure or a misbehaving input device.",
+    zh: "本次启动以来进入处理前被丢弃的麦克风/参考音频——采集侧没跟上。偶发丢帧无碍;持续增长说明 CPU 吃紧或输入设备异常。",
   },
   hRefUnderruns: {
-    en: "The echo canceller needed reference audio (system playback) but none had arrived yet. Frequent underruns weaken echo cancellation — often a sign of reference capture stalling.",
-    zh: "回声消除需要参考音频(系统播放声)时参考还没到。频繁欠载会削弱回声消除效果——常见原因是参考采集卡顿。",
+    en: "Total time since start that the echo canceller needed reference audio (system playback) but none had arrived yet. Frequent underruns weaken echo cancellation — often a sign of reference capture stalling.",
+    zh: "本次启动以来,回声消除需要参考音频(系统播放声)时参考还没到的累计时长。频繁欠载会削弱回声消除效果——常见原因是参考采集卡顿。",
   },
   hOutputUnderruns: {
-    en: "The output device asked for audio but the processed stream wasn't ready — heard as clicks or dropouts. Usually clock drift or CPU pressure.",
-    zh: "输出设备要数据时处理后的音频还没就绪——听感为咔哒/断续。通常是时钟漂移或 CPU 吃紧。",
+    en: "Total time since start that the output device asked for audio but the processed stream wasn't ready — heard as clicks or dropouts. Usually clock drift or CPU pressure.",
+    zh: "本次启动以来,输出设备要数据时处理后的音频还没就绪的累计时长——听感为咔哒/断续。通常是时钟漂移或 CPU 吃紧。",
   },
   hMicStale: {
-    en: "Microphone frames discarded for arriving too late to be useful. Growing count points at input-side stalls (device sleep, USB hiccups, scheduling).",
-    zh: "因到得太晚而被丢弃的麦克风帧。持续增长指向输入侧卡顿(设备休眠、USB 抖动、系统调度)。",
+    en: "Microphone audio discarded since start for arriving too late to be useful. A growing total points at input-side stalls (device sleep, USB hiccups, scheduling).",
+    zh: "本次启动以来因到得太晚而被丢弃的麦克风音频。持续增长指向输入侧卡顿(设备休眠、USB 抖动、系统调度)。",
   },
   hRefStale: {
-    en: "Reference frames discarded for arriving too late to align with the microphone. Growing count degrades echo cancellation — check reference capture stability.",
-    zh: "因到得太晚、无法与麦克风对齐而被丢弃的参考帧。持续增长会劣化回声消除——检查参考采集是否稳定。",
+    en: "Reference audio discarded since start for arriving too late to align with the microphone. A growing total degrades echo cancellation — check reference capture stability.",
+    zh: "本次启动以来因到得太晚、无法与麦克风对齐而被丢弃的参考音频。持续增长会劣化回声消除——检查参考采集是否稳定。",
   },
   hRuntimeErrors: {
     en: "Errors thrown by the processing engine at runtime. Any non-zero value is worth a look — check the session log for details.",
@@ -349,7 +407,6 @@ const D: Record<string, { en: string; zh: string }> = {
     zh: "点按:静音/恢复 · 滚轮:调节",
   },
   recordDir: { en: "Output Dir", zh: "输出目录" },
-  choose: { en: "choose…", zh: "选择…" },
   recording: { en: "recording…", zh: "录制中…" },
   notRunning: { en: "turn ON to record", zh: "开启后开始录制" },
 };
@@ -375,6 +432,9 @@ export function LangProvider({ children }: { children: ReactNode }) {
       return "en";
     }
   });
+  useEffect(() => {
+    document.documentElement.lang = lang;
+  }, [lang]);
   const setLang = useCallback((l: Lang) => {
     setLangState(l);
     try {

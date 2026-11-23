@@ -4,9 +4,6 @@
 //   - run 的 --status-json 以 JSONL 流式解析,经事件推给前端
 //
 // 契约真理源:docs/CLI.md + CLI `--json` 实测。
-#[cfg(target_os = "windows")]
-use std::sync::Mutex;
-
 use tauri::{Manager, WebviewUrl, WebviewWindowBuilder, WindowEvent};
 #[cfg(target_os = "macos")]
 use tauri_plugin_decorum::WebviewWindowExt;
@@ -21,8 +18,6 @@ mod nvafx;
 mod platform;
 mod proc;
 mod sidecar;
-#[cfg(test)]
-mod single_instance_contract;
 mod startup;
 #[cfg(test)]
 mod tests;
@@ -36,14 +31,14 @@ use localvqe::{download_localvqe_model, localvqe_assets};
 use nvafx::{nvafx_doctor, nvafx_download_install, nvafx_install};
 use platform::{default_diag_dir, open_diagnostics_dir, open_path, open_url};
 use proc::{terminate_run, RunState};
-use sidecar::{probe_delay, send_run_control, set_bypass, start_run, stop_run, validate_config};
+use sidecar::{probe_delay, send_run_control, start_run, stop_run, validate_config};
 use startup::{
     get_autostart_enabled, get_startup_mode, set_autostart_enabled, settle_startup_launch,
     should_focus_existing_instance, StartupLaunch, AUTOSTART_WATCHDOG_TIMEOUT,
 };
-use tray::{close_to_tray_enabled, set_tray_prefs, TrayPrefs};
 #[cfg(target_os = "windows")]
-use tray::{register_windows_tray, TrayIconState};
+use tray::register_windows_tray;
+use tray::{close_to_tray_enabled, set_tray_prefs, TrayPrefs};
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -73,11 +68,6 @@ pub fn run() {
             .build(),
     );
 
-    #[cfg(target_os = "windows")]
-    let builder = builder.manage(TrayIconState(Mutex::new(None)));
-    #[cfg(target_os = "macos")]
-    let builder = builder.manage(device_watch::DeviceWatchState::default());
-
     builder
         .invoke_handler(tauri::generate_handler![
             get_platform,
@@ -100,7 +90,6 @@ pub fn run() {
             validate_config,
             start_run,
             send_run_control,
-            set_bypass,
             stop_run,
             set_tray_prefs,
             get_startup_mode,
@@ -112,10 +101,12 @@ pub fn run() {
             // 在 single-instance setup 成功后才打开/清理共享日志目录。第二实例会在
             // single-instance plugin 中退出，不再与主实例竞争日志文件。
             logging::init(env!("CARGO_PKG_VERSION"));
+            // Same single-instance guarantee: no live run of this app owns these files.
+            platform::remove_stale_transient_configs(app.handle());
 
-            // 默认打开基线 1040×640(v17 设计稿画布,布局按此定稿);
-            // B1:min 锁到默认尺寸 —— plate 分格在更小窗口必然破版。
-            // B3:builder 背景色 = 新色板 --bg #1d1d1b,resize 瞬间不露白边。
+            // 1040×640 is the layout baseline and also the minimum: the plate grid
+            // breaks in smaller windows. The background matches the frontend
+            // --bg #1d1d1b so a resize never flashes white.
             let mut builder =
                 WebviewWindowBuilder::new(app, "main", WebviewUrl::App("index.html".into()))
                     .title("Echoless")
@@ -145,12 +136,21 @@ pub fn run() {
 
             let window = builder.build()?;
 
-            // 手动启动兜底:前端正常会在首屏就绪后亮窗;万一前端完全崩溃也在 5s 后
-            // 强制显示。Windows autostart 必须保持隐藏,用户仍可从托盘或再次启动来显窗。
+            // Manual launch fallback: the frontend shows the window once its first
+            // screen is ready; if it never does (for example it crashed), show it
+            // after 5 s. Skip this when the window is already visible or the user
+            // already closed it to the tray (the launch is settled then).
+            // Windows autostart stays hidden; the tray or a second launch shows it.
             if !app.state::<StartupLaunch>().is_autostart() {
+                let fallback_app = app.handle().clone();
                 let w = window.clone();
                 std::thread::spawn(move || {
                     std::thread::sleep(std::time::Duration::from_secs(5));
+                    if fallback_app.state::<StartupLaunch>().is_settled()
+                        || w.is_visible().unwrap_or(false)
+                    {
+                        return;
+                    }
                     let _ = w.show();
                     let _ = w.set_focus();
                 });
@@ -181,11 +181,7 @@ pub fn run() {
                 register_windows_tray(app)?;
             }
             #[cfg(target_os = "macos")]
-            {
-                let device_watch_state = app.state::<device_watch::DeviceWatchState>();
-                device_watch::start(app.handle(), &device_watch_state);
-            }
-            let _ = &window;
+            device_watch::start(app.handle());
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -193,6 +189,8 @@ pub fn run() {
                 let prefs = window.state::<TrayPrefs>();
                 if close_to_tray_enabled(&prefs) {
                     api.prevent_close();
+                    // The user chose where the window goes; startup fallbacks must not reopen it.
+                    window.state::<StartupLaunch>().settle();
                     let _ = window.hide();
                 } else {
                     let state = window.state::<RunState>();
@@ -203,12 +201,10 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
         .run(|app_handle, event| {
-            // Cmd+Q / 菜单退出 / Dock Quit 不产生 CloseRequested(审计 B-01):
+            // Cmd+Q / 菜单退出 / Dock Quit 不产生 CloseRequested:
             // 统一在 ExitRequested 回收 sidecar,避免孤儿 CLI 占用麦克风/虚拟麦。
             if let tauri::RunEvent::ExitRequested { .. } = event {
                 let _ = terminate_run(&app_handle.state::<RunState>());
-                #[cfg(target_os = "macos")]
-                device_watch::stop(&app_handle.state::<device_watch::DeviceWatchState>());
             }
         });
 }

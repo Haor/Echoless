@@ -58,9 +58,6 @@ pub fn default_output_level() -> u32 {
 pub fn default_bypass() -> bool {
     false
 }
-pub fn default_output_rate_match() -> bool {
-    true
-}
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -130,12 +127,6 @@ pub struct PipelineConfig {
     /// Start realtime run in mic passthrough mode; processors may stay warm in realtime.
     #[serde(default = "default_bypass")]
     pub bypass: bool,
-    /// Adaptive output/reference rate matching (T3): track the output-ring water
-    /// level and trim the resampling ratio (±3%) so the mic-clock producer stays
-    /// aligned with the device consumer clock. Disable to fall back to fixed-ratio
-    /// passthrough (pre-T3 behaviour).
-    #[serde(default = "default_output_rate_match")]
-    pub output_rate_match: bool,
     /// Optional realtime diagnostic recordings.
     #[serde(default)]
     pub diagnostics: DiagnosticsConfig,
@@ -156,7 +147,6 @@ impl Default for PipelineConfig {
             near_delay_ms: default_near_delay_ms(),
             output_level: default_output_level(),
             bypass: default_bypass(),
-            output_rate_match: default_output_rate_match(),
             diagnostics: DiagnosticsConfig::default(),
             chain: Vec::new(),
         }
@@ -180,7 +170,7 @@ pub struct RunReport {
     pub node_stats: Vec<ProcessorStats>,
 }
 
-/// 离线跑通整条链:mic 源 + ref 源 → 处理链 → sink。当前可用(P1 离线评测)。
+/// 离线跑通整条链:mic 源 + ref 源 → 处理链 → sink。用于离线评测。
 pub fn run_offline<M, R, S>(
     cfg: &PipelineConfig,
     mut mic: M,
@@ -215,7 +205,6 @@ where
     let reference_channels = cfg.reference_channels.channel_count();
     let mut chain = chain_from_nodes(&chain_cfg, cfg.sample_rate, reference_channels)?;
     let chain_names = chain.names();
-    let total_latency_ms = chain.total_latency_ms();
 
     let timeout = Duration::from_millis(100);
     let mut total_frames: u64 = 0;
@@ -249,16 +238,14 @@ where
         frames: total_frames,
         seconds: total_frames as f64 / cfg.sample_rate as f64,
         chain: chain_names,
-        total_latency_ms,
+        // Boundary resamplers exist only after the first block has been processed.
+        total_latency_ms: chain.total_latency_ms(),
         node_stats: chain.stats(),
     })
 }
 
 pub fn apply_reference_channels_to_chain(nodes: &mut [NodeConfig], mode: ReferenceChannels) {
-    for node in nodes
-        .iter_mut()
-        .filter(|node| echoless_processors::registry::canonical_kind(&node.kind) == "aec3")
-    {
+    for node in nodes.iter_mut().filter(|node| node.kind == "aec3") {
         node.params.insert(
             "reference_channels".to_string(),
             toml::Value::String(mode.as_str().to_string()),
@@ -394,6 +381,12 @@ mod tests {
         .unwrap();
         assert!(bounded.diagnostics.recording_enabled());
         assert_eq!(bounded.diagnostics.max_seconds, Some(30));
+    }
+
+    #[test]
+    fn retired_output_rate_match_key_is_ignored() {
+        let cfg: PipelineConfig = toml::from_str("output_rate_match = false\n").unwrap();
+        assert_eq!(cfg.sample_rate, 48_000);
     }
 
     #[test]

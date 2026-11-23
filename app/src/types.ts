@@ -51,6 +51,7 @@ export interface ParamSpec {
   default?: unknown;
   values?: string[];
   min?: number;
+  max?: number;
   required?: boolean;
   advanced?: boolean;
   requires?: Record<string, unknown>;
@@ -141,7 +142,14 @@ export interface RuntimeStatus {
   output_underruns: number;
   output_overruns: number;
   stale_drops: number;
-  // 时钟漂移(2026-07 起 status 常驻):输出/参考时钟相对麦克风的偏差百分比。
+  // Totals since the run started. The fields above are per status interval
+  // (default 80 ms) and reset on every line. Older CLIs omit these fields.
+  input_drops_total?: number;
+  mic_stale_drops_total?: number;
+  ref_stale_drops_total?: number;
+  ref_underruns_total?: number;
+  output_underruns_total?: number;
+  // Clock drift of output/reference relative to microphone (%).
   // 旧 CLI 无此字段,须按可选处理。
   output_skew_pct?: number;
   ref_skew_pct?: number;
@@ -154,7 +162,7 @@ export interface RuntimeStatus {
   last_backend_error?: string | null;
   diagnostics_session_dir?: string | null;
 
-  // P8-D1:穿透中(OFF = mic 直通虚拟麦,AEC 保温)。status 常驻,默认 false。
+  // 穿透中(OFF = mic 直通虚拟麦,AEC 保温)。status 常驻,默认 false。
   bypassed?: boolean;
 
   // 诊断录制实时态(后端 2026-06 起):录制中为 true + 已录帧/秒 + writer 丢帧。
@@ -248,7 +256,7 @@ export interface LocalvqeNoiseGateChangedEvent {
   noise_gate: boolean;
   noise_gate_threshold_dbfs: number;
 }
-// set_bypass 实时生效后的回执(P8-D1:OFF = 穿透,mic 直通虚拟麦)。
+// set_bypass 实时生效后的回执(OFF = 穿透,mic 直通虚拟麦)。
 export interface BypassChangedEvent {
   type: "bypass_changed";
   bypassed: boolean;
@@ -321,7 +329,8 @@ export interface DoctorAudio {
   recommended_driver: string; // "vb-cable" | "blackhole-2ch" | "vb-cable-mac" ...
   install_status: "installed" | "missing" | "unknown";
   needs_reboot: boolean;
-  // 非 macOS 当前返回 "unknown";macOS 返回 granted/denied/undetermined。
+  virtual_driver_present?: boolean;
+  // CoreAudio 设备枚举不校验麦克风 TCC，当前各平台统一返回 "unknown"；保留完整枚举兼容旧版 CLI。
   permission_state: "granted" | "denied" | "undetermined" | "unknown";
   // 系统音频录制权限(mac Process Tap reference 用)。helper 可发现=undetermined;
   // 缺失/非 mac=unknown。普通 doctor 不主动触发系统弹窗(首次启动 tap 录制才触发)。
@@ -335,12 +344,6 @@ export interface DoctorAudio {
   } | null;
   hint?: string;
   reference_sources: ReferenceSource[];
-
-  // ↓ 后端建议补的字段(见 RTX/虚拟麦 handoff)。前端向后兼容:缺省时从上面字段派生。
-  virtual_route_ready?: boolean; // 同时检测到可输出虚拟设备 + 对应可作 mic 的输入端
-  route_status?: "ready" | "incomplete" | "missing" | string;
-  recommended_output?: DoctorCandidate | null; // Echoless 应输出到的设备(如 CABLE Input)
-  recommended_app_mic?: DoctorCandidate | null; // 通话软件里应选的麦(如 CABLE Output)
 }
 
 // ---- nvafx doctor --json(RTX AEC 引擎就绪探针) ----

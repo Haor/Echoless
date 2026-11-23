@@ -2,10 +2,10 @@
 name = "echoless-audio-io"
 edition.workspace = true
 version.workspace = true
+rust-version.workspace = true
 license.workspace = true
-description = "平台无关音频 I/O:AudioSource / AudioSink / Clock trait + 类型 + 文件/null 后端"
+description = "平台无关音频 I/O:AudioSource / AudioSink trait + WAV 文件后端"
 
 [dependencies]
 anyhow.workspace = true
 hound.workspace = true
-bitflags.workspace = true

@@ -121,14 +121,21 @@ impl ProcessorChain {
     }
 
     /// near = 原始 mic(base_rate,mono);far = 真实 ref(base_rate,base_far_channels);
-    /// out = 链尾(base_rate,mono),长度应 = frames。
+    /// out = 链尾(base_rate,mono)。只处理前 `frames` 帧,`out` 其余部分清零。
     pub fn process(
         &mut self,
         near_base_mono: &[f32],
         far_base: &[f32],
         out_base_mono: &mut [f32],
-        _frames: u32,
+        frames: u32,
     ) {
+        let frames = (frames as usize)
+            .min(near_base_mono.len())
+            .min(out_base_mono.len());
+        let near_base_mono = &near_base_mono[..frames];
+        let far_base = &far_base[..(frames * self.base_far_channels as usize).min(far_base.len())];
+        out_base_mono[frames..].fill(0.0);
+        let out_base_mono = &mut out_base_mono[..frames];
         if self.nodes.is_empty() {
             copy_or_zero(near_base_mono, out_base_mono);
             return;
@@ -287,7 +294,11 @@ impl BoundaryAdapter {
         }
     }
 
-    fn adapt(&mut self, input: &[f32]) -> &[f32] {
+    fn adapt<'a>(&'a mut self, input: &'a [f32]) -> &'a [f32] {
+        // Same rate and layout: pass the block through without copying it twice.
+        if self.in_rate == self.out_rate && self.in_channels == self.out_channels {
+            return input;
+        }
         let input_frames = input.len() / self.in_channels as usize;
         self.ensure_layout(input_frames);
         self.fill_planes(input, input_frames);
@@ -368,8 +379,8 @@ impl BoundaryAdapter {
                     frame_samples.iter().copied().sum::<f32>() / in_channels as f32;
             } else if in_channels == 1 {
                 let sample = frame_samples[0];
-                for channel in 0..out_channels {
-                    self.planes[channel][frame] = sample;
+                for plane in self.planes.iter_mut().take(out_channels) {
+                    plane[frame] = sample;
                 }
             } else {
                 for channel in 0..out_channels {
@@ -612,6 +623,27 @@ mod tests {
     }
 
     #[test]
+    fn chain_processes_only_the_requested_frames() {
+        let mut chain = ProcessorChain::new(48_000, 1);
+        chain.push(Box::new(IdentityNode {
+            spec: IoSpec {
+                sample_rate: 48_000,
+                near_channels: 1,
+                far_channels: 1,
+                algorithmic_latency_ms: 0.0,
+            },
+        }));
+        let near = vec![0.5; 480];
+        let far = vec![0.0; 480];
+        let mut out = vec![1.0; 480];
+
+        chain.process(&near, &far, &mut out, 240);
+
+        assert!(out[..240].iter().all(|sample| *sample == 0.5));
+        assert!(out[240..].iter().all(|sample| *sample == 0.0));
+    }
+
+    #[test]
     fn total_latency_includes_boundary_src_delay_after_warmup() {
         let mut chain = ProcessorChain::new(48_000, 1);
         chain.push(Box::new(IdentityNode {
@@ -731,7 +763,7 @@ mod tests {
         let captured = far_seen.lock().unwrap().clone();
         assert_eq!(captured.len(), 160 * 2);
         let (mut left_sum, mut right_sum) = (0.0f32, 0.0f32);
-        for frame in captured.chunks_exact(2).skip(8).take(144) {
+        for frame in captured.as_chunks::<2>().0.iter().skip(8).take(144) {
             left_sum += frame[0];
             right_sum += frame[1];
         }

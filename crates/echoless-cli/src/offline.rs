@@ -1,22 +1,18 @@
-use anyhow::{bail, Result};
+use anyhow::Result;
 
 use crate::cli::OfflineArgs;
-use crate::config_validate::validate_pipeline_config;
-use crate::nvafx_install::validate_nvafx_constraints;
+use crate::config_validate::ensure_valid_pipeline_config;
 use echoless_audio_io::file::{WavFileSink, WavFileSource};
-use echoless_core::{
-    default_output_level, run_offline, DiagnosticsConfig, PipelineConfig, ReferenceChannels,
-};
+use echoless_core::{run_offline, DiagnosticsConfig, PipelineConfig};
 use echoless_processors::NodeConfig;
 
-pub(crate) fn cmd_offline(a: OfflineArgs) -> Result<()> {
-    let (rate, frame_ms, config_output_level, chain): (u32, u32, u32, Vec<NodeConfig>) =
-        if let Some(cfg_path) = &a.config {
-            let s = std::fs::read_to_string(cfg_path)?;
-            let pc: PipelineConfig = toml::from_str(&s)?;
-            (pc.sample_rate, pc.frame_ms, pc.output_level, pc.chain)
-        } else {
-            let chain = a
+fn offline_pipeline_config(a: &OfflineArgs) -> Result<PipelineConfig> {
+    let mut cfg = match &a.config {
+        Some(path) => toml::from_str(&std::fs::read_to_string(path)?)?,
+        None => PipelineConfig {
+            sample_rate: a.rate,
+            frame_ms: a.frame_ms,
+            chain: a
                 .chain
                 .as_deref()
                 .unwrap_or("")
@@ -27,30 +23,26 @@ pub(crate) fn cmd_offline(a: OfflineArgs) -> Result<()> {
                     kind: k.to_string(),
                     params: toml::Table::new(),
                 })
-                .collect();
-            (a.rate, a.frame_ms, default_output_level(), chain)
-        };
-    let output_level = a.output_level.unwrap_or(config_output_level);
-
-    let cfg = PipelineConfig {
-        mic: a.mic.clone(),
-        reference: a.reference.clone(),
-        output: a.out.clone(),
-        sample_rate: rate,
-        frame_ms,
-        reference_channels: ReferenceChannels::Mono,
-        near_delay_ms: 0,
-        output_level,
-        bypass: false,
-        output_rate_match: echoless_core::default_output_rate_match(),
-        diagnostics: DiagnosticsConfig::default(),
-        chain,
+                .collect(),
+            ..PipelineConfig::default()
+        },
     };
-    let validation_errors = validate_pipeline_config(&cfg);
-    if let Some(error) = validation_errors.first() {
-        bail!("invalid config: {}: {}", error.path, error.message);
+    cfg.mic = a.mic.clone();
+    cfg.reference = a.reference.clone();
+    cfg.output = a.out.clone();
+    if let Some(level) = a.output_level {
+        cfg.output_level = level;
     }
-    validate_nvafx_constraints(&cfg)?;
+    // Offline inputs (e.g. diagnostics mic.wav) already carry the near delay.
+    cfg.near_delay_ms = 0;
+    cfg.bypass = false;
+    cfg.diagnostics = DiagnosticsConfig::default();
+    Ok(cfg)
+}
+
+pub(crate) fn cmd_offline(a: OfflineArgs) -> Result<()> {
+    let cfg = offline_pipeline_config(&a)?;
+    ensure_valid_pipeline_config(&cfg)?;
 
     let frame = cfg.frame_size();
     let mic = WavFileSource::new(&a.mic, frame)?;
@@ -68,8 +60,12 @@ pub(crate) fn cmd_offline(a: OfflineArgs) -> Result<()> {
     };
     println!("offline run: {} + {} -> {}", a.mic, a.reference, a.out);
     println!(
-        "sample_rate {} Hz · frame {} ms · output_level={} · chain: {}",
-        rate, frame_ms, output_level, chain_desc
+        "sample_rate {} Hz · frame {} ms · reference={} · output_level={} · chain: {}",
+        cfg.sample_rate,
+        cfg.frame_ms,
+        cfg.reference_channels.as_str(),
+        cfg.output_level,
+        chain_desc
     );
 
     let rep = run_offline(&cfg, mic, reference, sink)?;
@@ -98,4 +94,51 @@ pub(crate) fn cmd_offline(a: OfflineArgs) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use echoless_core::ReferenceChannels;
+
+    fn offline_args(config: Option<String>) -> OfflineArgs {
+        OfflineArgs {
+            mic: "mic.wav".into(),
+            reference: "ref.wav".into(),
+            out: "out.wav".into(),
+            config,
+            chain: Some("aec3".into()),
+            rate: 48_000,
+            frame_ms: 10,
+            output_level: None,
+        }
+    }
+
+    #[test]
+    fn offline_config_keeps_stereo_reference_and_drops_near_delay() {
+        let dir = std::env::temp_dir().join(format!("echoless-offline-cfg-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("stereo.toml");
+        std::fs::write(
+            &path,
+            "reference_channels = \"stereo\"\nnear_delay_ms = 40\n\n[[chain]]\nkind = \"aec3\"\n",
+        )
+        .unwrap();
+
+        let cfg = offline_pipeline_config(&offline_args(Some(path.display().to_string()))).unwrap();
+
+        assert_eq!(cfg.reference_channels, ReferenceChannels::Stereo);
+        assert_eq!(cfg.near_delay_ms, 0);
+        assert_eq!(cfg.mic, "mic.wav");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn offline_shortcut_chain_uses_mono_reference() {
+        let cfg = offline_pipeline_config(&offline_args(None)).unwrap();
+
+        assert_eq!(cfg.reference_channels, ReferenceChannels::Mono);
+        assert_eq!(cfg.chain.len(), 1);
+        assert_eq!(cfg.chain[0].kind, "aec3");
+    }
 }
