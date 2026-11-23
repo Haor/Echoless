@@ -121,7 +121,11 @@ export function DiagnosticsPage({
           {appMic
             ? ` · ${t("micPickShort")}: ${appMic.name}`
             : route.counterpartMissing && route.output
-              ? ` · ${route.output.name} (${t("micCounterpartMissing")})`
+              ? ` · ${route.output.name} (${
+                  route.hasVirtualInput
+                    ? t("micUnmatchedPickHint")
+                    : t("micCounterpartMissing")
+                })`
               : ""}
         </span>
         <button type="button" className="dopen" onClick={onMicSetup}>

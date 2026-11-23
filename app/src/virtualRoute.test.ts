@@ -412,4 +412,57 @@ describe("isSelfLoopReference", () => {
       ),
     ).toBe(false);
   });
+
+  it("falls back gently to a sole non-conflicting virtual input and distinguishes missing vs unmatched virtual inputs", () => {
+    const soleFallback: Pick<DeviceList, "inputs" | "outputs"> = {
+      outputs: [dev("output", "VoiceMeeter Virtual Send", "vm-out")],
+      inputs: [dev("input", "VoiceMeeter Virtual Mic", "vm-in")],
+    };
+    expect(
+      resolveVirtualRoute({
+        selectedOutput: "vm-out",
+        devices: soleFallback,
+        platform: "windows",
+      }),
+    ).toMatchObject({
+      ready: true,
+      appMic: { stable_id: "vm-in" },
+      hasVirtualInput: true,
+    });
+
+    const unmatchedButHasVirtualInput: Pick<DeviceList, "inputs" | "outputs"> = {
+      outputs: [
+        dev("output", "CABLE Input / VB-Audio Virtual Cable", "out-base"),
+        dev("output", "CABLE-B Input / VB-Audio Cable B", "out-b"),
+      ],
+      inputs: [dev("input", "CABLE Output / VB-Audio Virtual Cable", "in-base")],
+    };
+    expect(
+      resolveVirtualRoute({
+        selectedOutput: "out-b",
+        devices: unmatchedButHasVirtualInput,
+        platform: "windows",
+      }),
+    ).toMatchObject({
+      ready: false,
+      counterpartMissing: true,
+      hasVirtualInput: true,
+    });
+
+    const noVirtualInputAtAll: Pick<DeviceList, "inputs" | "outputs"> = {
+      outputs: [dev("output", "CABLE Input / VB-Audio Virtual Cable", "out-base")],
+      inputs: [dev("input", "USB Condenser Microphone", "mic-usb")],
+    };
+    expect(
+      resolveVirtualRoute({
+        selectedOutput: "out-base",
+        devices: noVirtualInputAtAll,
+        platform: "windows",
+      }),
+    ).toMatchObject({
+      ready: false,
+      counterpartMissing: true,
+      hasVirtualInput: false,
+    });
+  });
 });

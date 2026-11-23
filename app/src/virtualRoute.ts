@@ -16,6 +16,7 @@ export interface ResolvedVirtualRoute {
   ready: boolean;
   selectedIsVirtual: boolean;
   counterpartMissing: boolean;
+  hasVirtualInput: boolean;
 }
 
 const VIRTUAL_DESKTOP_RE = /\bvirtual\s+desktop\b/i;
@@ -25,11 +26,6 @@ const LINUX_VIRTUAL_OUTPUT_RE = /echoless|null/i;
 const LINUX_MONITOR_RE = /monitor/i;
 const WORD_INPUT_RE = /\binput\b/i;
 const CABLE_LINE_TOKEN_RE = /\b(?:cable-[a-z0-9]+|line\s+\d+)\b/i;
-// Single-cable VB-Audio adapters (base, Cable A/B/C/D, Hi-Fi Cable) have one
-// recording endpoint (CABLE Output) even when Windows exposes two playback pins
-// under the same adapter suffix (e.g. "CABLE Input" / localized "扬声器" + "CABLE In 16 Ch").
-const SINGLE_CABLE_VBAUDIO_SUFFIX_RE =
-  /^(?:\d+-\s*)?vb-?audio\s+(?:virtual\s+cable|hi-?fi\s+cable|cable(?:\s+[a-z0-9]+)?)$/i;
 const MULTICHANNEL_VIRTUAL_PIN_RE = /\b(?:in\s+)?(?:16|32|64)\s*ch\b/i;
 
 function normalizeName(name: string): string {
@@ -38,10 +34,6 @@ function normalizeName(name: string): string {
 
 export function isMultichannelVirtualPin(name: string): boolean {
   return MULTICHANNEL_VIRTUAL_PIN_RE.test(name);
-}
-
-function isSingleCableVbAudioSuffix(suffix: string | null): boolean {
-  return suffix != null && SINGLE_CABLE_VBAUDIO_SUFFIX_RE.test(suffix);
 }
 
 export function stripReferencePrefix(value: string): string {
@@ -124,29 +116,47 @@ export function pairVirtualAppMic<T extends NamedDevice>(
 
   // Tier 2: adapter/driver suffix match for virtual outputs (handles renamed or
   // localized endpoints such as "扬声器 / VB-Audio Virtual Cable" and companion
-  // multichannel pins such as "CABLE In 16 Ch / VB-Audio Virtual Cable").
+  // multichannel pins such as "CABLE In 16 Ch / VB-Audio Virtual Cable" without
+  // hardcoding driver whitelists). Only rejects inputs with a conflicting line
+  // token (e.g. VAC Line 1 vs Line 2) or owned by another explicit-token output.
   if (!isVirtualAudioOutput(output.name)) return null;
   const suffix = extractAdapterSuffix(output.name);
-  if (!suffix) return null;
+  const outToken = cableLineToken(output.name);
 
-  if (allOutputs && !isSingleCableVbAudioSuffix(suffix)) {
-    const outputsWithSameSuffix = allOutputs.filter(
-      (out) => extractAdapterSuffix(out.name) === suffix,
+  if (suffix) {
+    const siblingTokens = new Set(
+      (allOutputs ?? [])
+        .filter(
+          (out) =>
+            normalizeName(out.name) !== outNorm &&
+            extractAdapterSuffix(out.name) === suffix,
+        )
+        .map((out) => cableLineToken(out.name))
+        .filter((tok): tok is string => tok != null),
     );
-    if (outputsWithSameSuffix.length > 1) return null;
+    const suffixMatches = inputs.filter((inp) => {
+      if (extractAdapterSuffix(inp.name) !== suffix) return false;
+      const inpToken = cableLineToken(inp.name);
+      if (outToken && inpToken && outToken !== inpToken) return false;
+      if (!outToken && inpToken && siblingTokens.has(inpToken)) return false;
+      return true;
+    });
+
+    if (suffixMatches.length === 1) return suffixMatches[0];
   }
 
-  const outToken = cableLineToken(output.name);
-  const suffixMatches = inputs.filter((inp) => {
-    if (extractAdapterSuffix(inp.name) !== suffix) return false;
-    const inpToken = cableLineToken(inp.name);
-    if (outToken && inpToken && outToken !== inpToken) return false;
-    return true;
-  });
+  // Tier 3: gentle fallback when the machine has a single virtual mic input
+  // and neither its adapter suffix nor line token contradicts the output.
+  const virtualInputs = inputs.filter((inp) => isVirtualAudioInput(inp.name));
+  if (virtualInputs.length === 1) {
+    const sole = virtualInputs[0];
+    const soleSuffix = extractAdapterSuffix(sole.name);
+    const soleToken = cableLineToken(sole.name);
+    const suffixConflict = Boolean(suffix && soleSuffix && suffix !== soleSuffix);
+    const tokenConflict = Boolean(outToken && soleToken && outToken !== soleToken);
+    if (!suffixConflict && !tokenConflict) return sole;
+  }
 
-  if (suffixMatches.length === 1) return suffixMatches[0];
-
-  // Tier 3: honestly unpaired
   return null;
 }
 
@@ -170,9 +180,16 @@ export function resolveVirtualRoute(params: {
   const doctorOutIds = new Set(
     (doctor?.candidate_outputs ?? []).map((c) => c.stable_id),
   );
+  const doctorInIds = new Set(
+    (doctor?.candidate_inputs ?? []).map((c) => c.stable_id),
+  );
   const isVirtOut = (dev: NamedDevice) =>
     isVirtualAudioOutput(dev.name, platform) ||
     (dev.stable_id != null && doctorOutIds.has(dev.stable_id));
+  const isVirtIn = (dev: NamedDevice) =>
+    isVirtualAudioInput(dev.name, platform) ||
+    (dev.stable_id != null && doctorInIds.has(dev.stable_id));
+  const hasVirtualInput = activeInputs.some(isVirtIn);
 
   const selOutDev =
     selectedOutput && selectedOutput !== "default"
@@ -188,6 +205,7 @@ export function resolveVirtualRoute(params: {
         ready: true,
         selectedIsVirtual: true,
         counterpartMissing: false,
+        hasVirtualInput: true,
       };
     }
     return {
@@ -196,6 +214,7 @@ export function resolveVirtualRoute(params: {
       ready: false,
       selectedIsVirtual: true,
       counterpartMissing: true,
+      hasVirtualInput,
     };
   }
 
@@ -215,6 +234,7 @@ export function resolveVirtualRoute(params: {
         ready: true,
         selectedIsVirtual: false,
         counterpartMissing: false,
+        hasVirtualInput: true,
       };
     }
   }
@@ -226,6 +246,7 @@ export function resolveVirtualRoute(params: {
     ready: false,
     selectedIsVirtual: false,
     counterpartMissing: fallbackOut != null,
+    hasVirtualInput,
   };
 }
 
@@ -252,10 +273,17 @@ export function isSelfLoopReference(
   if (normalizeName(ref.label) === normalizeName(outDev.name)) return true;
 
   if (ref.kind === "output") {
-    const outSuffix = extractAdapterSuffix(outDev.name);
+    const outPaired = pairVirtualAppMic(outDev, inputs, outputs);
+    const refPaired = pairVirtualAppMic(
+      { name: ref.label, stable_id: bareRefStable },
+      inputs,
+      outputs,
+    );
     if (
-      isSingleCableVbAudioSuffix(outSuffix) &&
-      extractAdapterSuffix(ref.label) === outSuffix
+      outPaired &&
+      refPaired &&
+      (outPaired.stable_id === refPaired.stable_id ||
+        normalizeName(outPaired.name) === normalizeName(refPaired.name))
     ) {
       return true;
     }

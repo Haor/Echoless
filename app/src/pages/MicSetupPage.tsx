@@ -177,7 +177,11 @@ export function MicSetupPage({
           <div className="wzh warn">{t("micIncomplete")}</div>
           <div className="wznote">
             {route.selectedIsVirtual && route.counterpartMissing && outDev
-              ? `${outDev.name}: ${t("micCounterpartMissing")}`
+              ? `${outDev.name}: ${
+                  route.hasVirtualInput
+                    ? t("micUnmatchedSetupHint")
+                    : t("micCounterpartMissing")
+                }`
               : isMac
                 ? t("micMacRestartHint")
                 : doctor?.needs_reboot

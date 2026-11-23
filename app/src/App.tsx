@@ -2600,9 +2600,16 @@ export default function App() {
                 <span className="mk">!!!</span> {t("installCable")}:{" "}
                 <b>{doctorView.recommended_driver}</b>
               </span>
-            ) : outputRoute.selectedIsVirtual && outputRoute.counterpartMissing ? (
+            ) : outputRoute.selectedIsVirtual &&
+              outputRoute.counterpartMissing &&
+              !outputRoute.hasVirtualInput ? (
               <span className="meta" style={{ color: "var(--warn)" }}>
                 <span className="mk">!!!</span> {t("micCounterpartMissing")}
+              </span>
+            ) : outputRoute.selectedIsVirtual && outputRoute.counterpartMissing ? (
+              <span className="meta">
+                <span className="mk">&gt;&gt;&gt;</span>{" "}
+                {t("micUnmatchedPickHint")}
               </span>
             ) : (
               <span className="meta">

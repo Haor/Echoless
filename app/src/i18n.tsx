@@ -225,8 +225,16 @@ const D: Record<string, { en: string; zh: string }> = {
     zh: "只检测到一端。重开驱动安装器或完成安装。",
   },
   micCounterpartMissing: {
-    en: "paired mic input is missing or disabled",
-    zh: "配对的虚拟麦输入端缺失或已禁用",
+    en: "no virtual mic input detected",
+    zh: "未检测到虚拟麦输入端",
+  },
+  micUnmatchedPickHint: {
+    en: "pick the matching virtual mic in your call app",
+    zh: "请在通话软件中选择对应的虚拟麦克风",
+  },
+  micUnmatchedSetupHint: {
+    en: "Could not auto-match a recording device for this output. Verify its recording endpoint is enabled, or select the matching virtual mic in your call app.",
+    zh: "未自动匹配到该输出对应的录音端。请确认其录音设备已启用，或在通话软件中手动选择对应的虚拟麦克风。",
   },
   micMacRestartHint: {
     en: "Only one side detected. Restart CoreAudio, then recheck:",
