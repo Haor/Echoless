@@ -400,11 +400,12 @@ function initEngineState(): EngineState {
     output_level:
       typeof pl.output_level === "number" ? pl.output_level : undefined,
   };
+  const noiseMode = SAVED_ENGINE.noiseMode ?? "off";
   return {
     kind,
-    noiseMode: SAVED_ENGINE.noiseMode ?? "off",
+    noiseMode,
     noiseParamsByMode: SAVED_ENGINE.noiseParamsByMode ?? {},
-    pipeline: pipelineForEngineKind(kind, savedPipeline),
+    pipeline: pipelineForEngineKind(kind, savedPipeline, noiseMode),
     params: SAVED_ENGINE.paramsByKind?.[kind] ?? {},
   };
 }
@@ -738,12 +739,16 @@ function useEngineConfig({
       defaultParams(processors.find((p) => p.kind === target));
     paramsByKind.current[target] = np;
     paramsRef.current = np;
-    const nextPipeline = pipelineForEngineKind(target, pipelineRef.current);
     const nextNoiseMode = normalizeNoiseMode(
       noiseSuppression,
       target,
       np,
       noiseModeRef.current,
+    );
+    const nextPipeline = pipelineForEngineKind(
+      target,
+      pipelineRef.current,
+      nextNoiseMode,
     );
     pipelineRef.current = nextPipeline;
     noiseModeRef.current = nextNoiseMode;
@@ -834,18 +839,26 @@ function useEngineConfig({
       np,
       noiseModeRef.current,
     );
+    const nextPipeline = pipelineForEngineKind(
+      "localvqe",
+      pipelineRef.current,
+      nextNoiseMode,
+    );
     kindRef.current = "localvqe";
     paramsRef.current = np;
     noiseModeRef.current = nextNoiseMode;
+    pipelineRef.current = nextPipeline;
     updateEngine({
       kind: "localvqe",
       noiseMode: nextNoiseMode,
       params: np,
+      pipeline: nextPipeline,
     });
     applyChangeRef.current({
       kind: "localvqe",
       noiseMode: nextNoiseMode,
       params: np,
+      pipeline: nextPipeline,
     });
   }
 
@@ -903,9 +916,15 @@ function useEngineConfig({
       paramsRef.current,
     );
     if (noiseModeRef.current === next || !allowed.includes(next)) return;
+    const nextPipeline = pipelineForEngineKind(
+      kindRef.current,
+      pipelineRef.current,
+      next,
+    );
     noiseModeRef.current = next;
-    updateEngine({ noiseMode: next });
-    applyChangeRef.current({ noiseMode: next });
+    pipelineRef.current = nextPipeline;
+    updateEngine({ noiseMode: next, pipeline: nextPipeline });
+    applyChangeRef.current({ noiseMode: next, pipeline: nextPipeline });
   }
 
   function setNoiseParam(key: string, val: unknown) {
@@ -924,7 +943,7 @@ function useEngineConfig({
 
   // 改管线项。near_delay_ms 可运行中热控;采样率/帧长/参考声道仍需重启。
   function changePipeline(patch: Partial<PipelineCfg>) {
-    if (!canChangePipeline(kindRef.current, patch)) return;
+    if (!canChangePipeline(kindRef.current, patch, noiseModeRef.current)) return;
     const cur = pipelineRef.current;
     const entries = Object.entries(patch) as [keyof PipelineCfg, unknown][];
     if (entries.every(([k, v]) => Object.is(cur[k], v))) return;

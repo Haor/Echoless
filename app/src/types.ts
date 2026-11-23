@@ -323,7 +323,7 @@ export interface DoctorAudio {
   install_status: "installed" | "missing" | "unknown";
   needs_reboot: boolean;
   virtual_driver_present?: boolean;
-  // 非 macOS 当前返回 "unknown";macOS 返回 granted/denied/undetermined。
+  // CoreAudio 设备枚举不校验麦克风 TCC，当前各平台统一返回 "unknown"；保留完整枚举兼容旧版 CLI。
   permission_state: "granted" | "denied" | "undetermined" | "unknown";
   // 系统音频录制权限(mac Process Tap reference 用)。helper 可发现=undetermined;
   // 缺失/非 mac=unknown。普通 doctor 不主动触发系统弹窗(首次启动 tap 录制才触发)。

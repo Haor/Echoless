@@ -17,6 +17,7 @@ import { useI18n, type Lang } from "../i18n";
 import { Hint } from "../components/Hint";
 import { Field, SegButtons } from "../components/Controls";
 import { probeAutofill } from "../probeQuality";
+import { requiresTenMsFrames } from "../engineLogic";
 
 interface Props {
   processors: Processor[];
@@ -463,6 +464,8 @@ export function AdvancedPage({
   );
   const desc = (k: string) => DESC[k]?.[lang];
   const pipelineDisabled = kind === "nvidia_afx_aec";
+  const frameMsDisabled =
+    pipelineDisabled || requiresTenMsFrames(kind, noiseMode);
 
   const reqMet = (spec: ParamSpec) =>
     !spec.requires ||
@@ -573,7 +576,7 @@ export function AdvancedPage({
           <span className="aval">
             <SegButtons
               value={String(pipeline.frame_ms)}
-              disabled={pipelineDisabled}
+              disabled={frameMsDisabled}
               options={[10, 20].map((n) => ({
                 value: String(n),
                 label: `${n} MS`,

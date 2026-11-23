@@ -45,36 +45,67 @@ export function patchNoiseModeParam(
   };
 }
 
+export function requiresTenMsFrames(
+  kind: string,
+  noiseMode: NoiseMode = "off",
+): boolean {
+  return (
+    kind === "aec3" ||
+    kind === "nvidia_afx_aec" ||
+    noiseMode === "webrtc" ||
+    noiseMode === "rnnoise"
+  );
+}
+
 export function canChangePipeline(
   kind: string,
   patch: Partial<PipelineCfg>,
+  noiseMode: NoiseMode = "off",
 ): boolean {
-  if (kind !== "nvidia_afx_aec") return true;
-  return !(
-    "sample_rate" in patch ||
-    "frame_ms" in patch ||
-    "reference_channels" in patch
-  );
+  if (kind === "nvidia_afx_aec") {
+    return !(
+      "sample_rate" in patch ||
+      "frame_ms" in patch ||
+      "reference_channels" in patch
+    );
+  }
+  if (
+    "frame_ms" in patch &&
+    patch.frame_ms !== 10 &&
+    requiresTenMsFrames(kind, noiseMode)
+  ) {
+    return false;
+  }
+  return true;
 }
 
 export function pipelineForEngineKind(
   kind: string,
   pipeline: PipelineCfg,
+  noiseMode: NoiseMode = "off",
 ): PipelineCfg {
-  if (kind !== "nvidia_afx_aec") return pipeline;
-  if (
-    pipeline.sample_rate === 48_000 &&
-    pipeline.frame_ms === 10 &&
-    pipeline.reference_channels === "mono"
-  ) {
-    return pipeline;
+  if (kind === "nvidia_afx_aec") {
+    if (
+      pipeline.sample_rate === 48_000 &&
+      pipeline.frame_ms === 10 &&
+      pipeline.reference_channels === "mono"
+    ) {
+      return pipeline;
+    }
+    return {
+      ...pipeline,
+      sample_rate: 48_000,
+      frame_ms: 10,
+      reference_channels: "mono",
+    };
   }
-  return {
-    ...pipeline,
-    sample_rate: 48_000,
-    frame_ms: 10,
-    reference_channels: "mono",
-  };
+  if (requiresTenMsFrames(kind, noiseMode) && pipeline.frame_ms !== 10) {
+    return {
+      ...pipeline,
+      frame_ms: 10,
+    };
+  }
+  return pipeline;
 }
 
 export function hotInitialDelayValue(value: unknown): number | null {

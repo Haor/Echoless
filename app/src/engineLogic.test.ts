@@ -10,6 +10,7 @@ import {
   normalizeNoiseMode,
   patchNoiseModeParam,
   pipelineForEngineKind,
+  requiresTenMsFrames,
 } from "./engineLogic";
 import { normalizeFieldCommit } from "./components/Controls";
 import type { NoiseSuppressionManifest } from "./types";
@@ -107,8 +108,8 @@ describe("shared noise suppression compatibility", () => {
   });
 });
 
-describe("NVAFX pipeline constraints", () => {
-  it("blocks NVAFX fixed pipeline changes while keeping near_delay_ms editable", () => {
+describe("pipeline constraints", () => {
+  it("blocks NVAFX fixed pipeline changes and non-10ms frames for 10ms-only engines/NS", () => {
     expect(canChangePipeline("nvidia_afx_aec", { sample_rate: 16_000 })).toBe(false);
     expect(canChangePipeline("nvidia_afx_aec", { frame_ms: 20 })).toBe(false);
     expect(
@@ -116,10 +117,17 @@ describe("NVAFX pipeline constraints", () => {
     ).toBe(false);
     expect(canChangePipeline("nvidia_afx_aec", { near_delay_ms: 25 })).toBe(true);
     expect(canChangePipeline("aec3", { sample_rate: 16_000 })).toBe(true);
-    expect(canChangePipeline("localvqe", { frame_ms: 20 })).toBe(true);
+    expect(canChangePipeline("aec3", { frame_ms: 20 })).toBe(false);
+    expect(canChangePipeline("aec3", { frame_ms: 10 })).toBe(true);
+    expect(canChangePipeline("localvqe", { frame_ms: 20 }, "off")).toBe(true);
+    expect(canChangePipeline("localvqe", { frame_ms: 20 }, "webrtc")).toBe(false);
+    expect(canChangePipeline("localvqe", { frame_ms: 20 }, "rnnoise")).toBe(false);
+    expect(requiresTenMsFrames("aec3", "off")).toBe(true);
+    expect(requiresTenMsFrames("localvqe", "off")).toBe(false);
+    expect(requiresTenMsFrames("localvqe", "webrtc")).toBe(true);
   });
 
-  it("normalizes non-default pipeline values only when entering NVAFX", () => {
+  it("normalizes pipeline values for NVAFX and 10ms-only chains", () => {
     expect(
       pipelineForEngineKind("nvidia_afx_aec", {
         sample_rate: 16_000,
@@ -141,8 +149,17 @@ describe("NVAFX pipeline constraints", () => {
       frame_ms: 20,
       reference_channels: "stereo" as const,
     };
-    expect(pipelineForEngineKind("aec3", custom)).toBe(custom);
-    expect(pipelineForEngineKind("localvqe", custom)).toBe(custom);
+    expect(pipelineForEngineKind("aec3", custom)).toEqual({
+      sample_rate: 16_000,
+      frame_ms: 10,
+      reference_channels: "stereo",
+    });
+    expect(pipelineForEngineKind("localvqe", custom, "off")).toBe(custom);
+    expect(pipelineForEngineKind("localvqe", custom, "rnnoise")).toEqual({
+      sample_rate: 16_000,
+      frame_ms: 10,
+      reference_channels: "stereo",
+    });
   });
 });
 
