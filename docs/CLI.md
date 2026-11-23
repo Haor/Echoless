@@ -135,7 +135,9 @@ echoless offline --mic mic.wav --reference ref.wav --out clean.wav --config my.t
 `offline` validates processor topology and WAV-in/WAV-out behavior. It does not
 simulate the realtime device boundary, `near_delay_ms`, bypass crossfade, queue
 backpressure, or device sample-rate conversion path, so it should not be used as
-an exact live-latency or live-routing benchmark.
+an exact live-latency or live-routing benchmark. With `--config`, `offline` uses
+the configured `reference_channels`, so stereo references can be reproduced. The
+input WAV files are treated as already aligned; `near_delay_ms` is not applied.
 
 ## doctor / processors / config
 

@@ -125,11 +125,6 @@ fn processor_manifest() -> serde_json::Value {
                     "preferred_frame_ms": 10
                 },
                 "params": {
-                    "reference_channels": {
-                        "type": "select",
-                        "values": ["mono", "stereo"],
-                        "default": "mono"
-                    },
                     "agc": {
                         "type": "bool",
                         "default": false,
@@ -282,10 +277,6 @@ mod tests {
         assert_eq!(aec3["default"], true);
         assert!(aec3["params"].get("ns").is_none());
         assert!(aec3["params"].get("ns_level").is_none());
-        assert_eq!(
-            aec3["params"]["reference_channels"]["values"],
-            json!(["mono", "stereo"])
-        );
         assert_eq!(aec3["params"]["initial_delay_ms"]["min"], json!(0));
         assert_eq!(aec3["params"]["tail_ms"]["min"], json!(MIN_TAIL_MS));
         assert_eq!(

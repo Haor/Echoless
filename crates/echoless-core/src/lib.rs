@@ -215,7 +215,6 @@ where
     let reference_channels = cfg.reference_channels.channel_count();
     let mut chain = chain_from_nodes(&chain_cfg, cfg.sample_rate, reference_channels)?;
     let chain_names = chain.names();
-    let total_latency_ms = chain.total_latency_ms();
 
     let timeout = Duration::from_millis(100);
     let mut total_frames: u64 = 0;
@@ -249,7 +248,8 @@ where
         frames: total_frames,
         seconds: total_frames as f64 / cfg.sample_rate as f64,
         chain: chain_names,
-        total_latency_ms,
+        // Boundary resamplers exist only after the first block has been processed.
+        total_latency_ms: chain.total_latency_ms(),
         node_stats: chain.stats(),
     })
 }

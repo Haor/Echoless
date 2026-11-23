@@ -4,7 +4,7 @@ use crate::cli::RunArgs;
 use crate::config_validate::ensure_valid_pipeline_config;
 #[cfg(feature = "realtime")]
 use crate::realtime;
-use echoless_core::{apply_reference_channels_to_chain, PipelineConfig};
+use echoless_core::PipelineConfig;
 use echoless_processors::NodeConfig;
 
 #[cfg(feature = "realtime")]
@@ -78,7 +78,6 @@ fn apply_run_overrides(mut cfg: PipelineConfig, a: &RunArgs) -> Result<PipelineC
             })
             .collect();
     }
-    apply_reference_channels_to_chain(&mut cfg.chain, cfg.reference_channels);
 
     if a.no_ns && (a.ns || a.ns_level.is_some()) {
         bail!("--no-ns cannot be used with --ns or --ns-level");
@@ -227,10 +226,7 @@ mod tests {
         );
         assert_eq!(cfg.chain.len(), 2);
         assert_eq!(cfg.chain[0].kind, "aec3");
-        assert_eq!(
-            cfg.chain[0].params["reference_channels"].as_str(),
-            Some("stereo")
-        );
+        assert!(!cfg.chain[0].params.contains_key("reference_channels"));
         assert_eq!(cfg.chain[0].params["tail_ms"].as_integer(), Some(120));
         assert_eq!(cfg.chain[1].kind, "webrtc_ns");
         assert_eq!(cfg.chain[1].params["level"].as_str(), Some("high"));

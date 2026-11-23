@@ -16,6 +16,8 @@ pub mod passthrough;
 pub mod registry;
 pub mod rnnoise;
 pub mod webrtc_ns;
+#[cfg(windows)]
+mod win_dll;
 
 pub use chain::{chain_from_nodes, ProcessorChain};
 pub use noise_suppression::{validate_noise_suppression_chain, NoiseChainError};

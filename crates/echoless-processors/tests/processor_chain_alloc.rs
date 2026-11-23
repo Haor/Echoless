@@ -2,7 +2,8 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use echoless_processors::{
-    rnnoise::RnNoise, webrtc_ns::WebRtcNs, EchoProcessor, IoSpec, ProcessorChain, ProcessorStats,
+    aec3::Aec3Engine, rnnoise::RnNoise, webrtc_ns::WebRtcNs, EchoProcessor, IoSpec, ProcessorChain,
+    ProcessorStats,
 };
 
 struct CountingAllocator;
@@ -135,6 +136,37 @@ fn processor_chain_process_is_allocation_free_after_warmup() {
     assert_eq!(
         allocations, 0,
         "RNNoise allocated after audio-thread warmup"
+    );
+
+    let (clean, after_error) = std::thread::spawn(|| {
+        let near = sine_block(480, 440.0, 48_000);
+        let far = sine_block(480, 660.0, 48_000);
+        let mut out = vec![0.0; 480];
+        let mut aec3 = Aec3Engine::new();
+        for _ in 0..8 {
+            aec3.process(&near, &far, &mut out, 480);
+        }
+        ALLOCATIONS.store(0, Ordering::SeqCst);
+        aec3.process(&near, &far, &mut out, 480);
+        let clean = ALLOCATIONS.load(Ordering::SeqCst);
+
+        // A clamped stream delay records one backend error; later frames must not
+        // keep paying for it.
+        aec3.set_stream_delay_ms(600);
+        aec3.process(&near, &far, &mut out, 480);
+        assert_eq!(aec3.stats().runtime_error_count, 1);
+        aec3.process(&near, &far, &mut out, 480);
+        ALLOCATIONS.store(0, Ordering::SeqCst);
+        aec3.process(&near, &far, &mut out, 480);
+        (clean, ALLOCATIONS.load(Ordering::SeqCst))
+    })
+    .join()
+    .unwrap();
+
+    assert_eq!(clean, 0, "AEC3 allocated after warmup");
+    assert_eq!(
+        after_error, 0,
+        "AEC3 allocated on a clean frame after a backend error"
     );
 }
 

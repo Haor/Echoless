@@ -120,7 +120,9 @@ echoless offline --mic mic.wav --reference ref.wav --out clean.wav --config my.t
 
 `offline` 会校验处理器拓扑和 WAV 进 / WAV 出的行为。它不模拟实时设备
 边界、`near_delay_ms`、bypass 交叉淡化、队列背压,或设备采样率转换通路,
-因此不应把它当作精确的实时延迟或实时路由基准。
+因此不应把它当作精确的实时延迟或实时路由基准。使用 `--config` 时会沿用其中的
+`reference_channels`,立体声参考可以离线复现;输入 WAV 被视为已对齐,不再叠加
+`near_delay_ms`。
 
 ## doctor / processors / config
 

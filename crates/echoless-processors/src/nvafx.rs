@@ -915,13 +915,14 @@ fn parse_version_parts(value: &str) -> Option<Vec<u32>> {
 #[cfg(windows)]
 mod ffi {
     use std::ffi::{c_char, c_float, c_int, c_uint, c_void, CString};
-    use std::path::{Path, PathBuf};
+    use std::path::Path;
     use std::ptr;
 
     use anyhow::{bail, Context, Result};
     use libloading::Library;
 
     use super::{AecConfig, NVAFX_FRAME_SAMPLES, NVAFX_SAMPLE_RATE};
+    use crate::win_dll::DllDirectoryGuard;
 
     type NvafxStatus = c_int;
     type NvafxHandle = *mut c_void;
@@ -1296,64 +1297,6 @@ mod ffi {
             21 => "NVAFX_STATUS_OUT_OF_MEMORY",
             22 => "NVAFX_STATUS_REFERENCE_AUDIO_NOT_SET",
             _ => "NVAFX_STATUS_UNKNOWN",
-        }
-    }
-
-    struct DllDirectoryGuard {
-        cookies: Vec<*mut c_void>,
-        _paths: Vec<Vec<u16>>,
-    }
-
-    impl DllDirectoryGuard {
-        fn new(paths: &[PathBuf]) -> Result<Self> {
-            use std::os::windows::ffi::OsStrExt;
-            use windows_sys::Win32::System::LibraryLoader::{
-                AddDllDirectory, SetDefaultDllDirectories, LOAD_LIBRARY_SEARCH_DEFAULT_DIRS,
-                LOAD_LIBRARY_SEARCH_USER_DIRS,
-            };
-
-            let ok = unsafe {
-                SetDefaultDllDirectories(
-                    LOAD_LIBRARY_SEARCH_DEFAULT_DIRS | LOAD_LIBRARY_SEARCH_USER_DIRS,
-                )
-            };
-            if ok == 0 {
-                return Err(std::io::Error::last_os_error())
-                    .context("failed to set the Windows DLL default search path");
-            }
-
-            let mut cookies = Vec::new();
-            let mut wide_paths = Vec::new();
-            for path in paths {
-                let wide: Vec<u16> = path
-                    .as_os_str()
-                    .encode_wide()
-                    .chain(std::iter::once(0))
-                    .collect();
-                let cookie = unsafe { AddDllDirectory(wide.as_ptr()) };
-                if cookie.is_null() {
-                    return Err(std::io::Error::last_os_error()).with_context(|| {
-                        format!("failed to add DLL search path: {}", path.display())
-                    });
-                }
-                cookies.push(cookie);
-                wide_paths.push(wide);
-            }
-            Ok(Self {
-                cookies,
-                _paths: wide_paths,
-            })
-        }
-    }
-
-    impl Drop for DllDirectoryGuard {
-        fn drop(&mut self) {
-            use windows_sys::Win32::System::LibraryLoader::RemoveDllDirectory;
-            for cookie in self.cookies.drain(..) {
-                unsafe {
-                    RemoveDllDirectory(cookie);
-                }
-            }
         }
     }
 }
