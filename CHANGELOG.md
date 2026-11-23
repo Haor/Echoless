@@ -6,6 +6,63 @@ adheres to [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
+## [1.2.1-rc.1] — 2026-11-23
+
+A comprehensive reliability, device-routing, and security maintenance release
+built from a full codebase healthcheck.
+
+### Fixed
+- **Multi-VB-CABLE routing & self-loop protection (#3):** MIC SETUP, Overview,
+  and Diagnostics now deterministically pair the selected virtual output with
+  its matching app microphone (including `CABLE-A/B/C/D` and BlackHole),
+  detect self-loops accurately across prefixed reference IDs, and stop treating
+  `Virtual Desktop Audio` as a ready virtual audio driver.
+- **Remembered audio devices across reboots:** Device preferences are now stored
+  independently from temporary fallback selections (matching by `stable_id` and
+  device name). Transient unplugs or boot races no longer overwrite saved
+  choices, preferred devices automatically reclaim when they return online, and
+  default input selection skips virtual microphones.
+- **Windows RTX AEC installer & multi-GPU support:** Removed the broken
+  PowerShell download fallback in favor of `curl.exe` with connect timeouts,
+  cleaned up failed staging directories safely, and removed the redundant
+  `doctor_report()` gate during `nvidia_afx_aec` startup so custom
+  `model_path`, `disable_cuda_graph`, and multi-GPU systems work reliably.
+- **Delay Probe reliability:** Fixed Windows probe shutdown (`kill -INT` hang),
+  switched peak selection to positive correlation, defaulted CLI devices to
+  `"default"`, and prevented stale 15s probe callbacks from overwriting params
+  after switching engines.
+- **Audio & processor correctness:** Enforced 10 ms frames for AEC3, WebRTC NS,
+  and RNNoise across backend and UI; preserved stereo `reference_channels` in
+  offline processing; closed LocalVQE FFI context/DLL handle leaks; removed
+  per-frame error allocations in AEC3; moved diagnostics file creation and
+  teardown off the 10 ms audio thread; reported macOS microphone permission
+  honestly as `"unknown"`; and rejected unsupported Linux `reference = "system"`
+  explicitly.
+- **Desktop UI & lifecycle stability:** Eliminated 12.5 Hz full-tree re-renders
+  during live telemetry, locked `Max Seconds` while recording diagnostics,
+  revealed the window immediately on Windows `--autostart` startup failure,
+  queued hot-control updates during sidecar startup, fixed LocalVQE model
+  re-selection and stream-recovery backoff/busy resets, restored keyboard
+  `:focus-visible` navigation, and reduced idle canvas GPU usage.
+- **Windows uninstaller cleanup:** Added an NSIS post-uninstall hook so
+  checking "Delete the application data" also removes `logs`, `diagnostics`,
+  `localvqe`, and `nvafx` under `%LOCALAPPDATA%\Echoless` (preserving data on
+  upgrades).
+- **macOS CoreAudio watcher & bundling:** Eliminated a potential
+  use-after-free on exit in the CoreAudio device listener and preserved dylib
+  symlinks when preparing Tauri assets.
+
+### Security
+- Upgraded `zip` (`9.8.2`), `ringbuf` (`0.5.3`), `cookie` (`0.18.3`), and `url`
+  (`2.5.9`), rejected symlink entries during NVAFX zip extraction, and required
+  `SHA256SUMS.txt` verification for custom `--tag` NVAFX downloads.
+
+### Changed
+- Pinned Rust `1.100.0` via `rust-toolchain.toml` and CI workflows.
+- Always enable adaptive clock-drift rate matching (retired the unused
+  `output_rate_match = false` fallback) and streamlined Tauri sidecar
+  lifecycle, CLI runtime, and frontend helper modules.
+
 ## [1.2.0-rc.2] — 2026-07-15
 
 ### Fixed
