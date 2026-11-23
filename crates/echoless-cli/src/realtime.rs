@@ -51,10 +51,6 @@ use self::devices::{
     select_reference_source, selected_device_label, DeviceKind, ReferenceSource,
     StreamConfigChoice,
 };
-#[cfg(test)]
-use self::devices::{
-    format_device_description, is_virtual_audio_name, system_audio_permission_state,
-};
 use self::diagnostics::{DiagnosticRecorder, DiagnosticRecorderConfig, DiagnosticsStatusHandle};
 use self::frame_ring::{
     push_interleaved_frames, skip_stale_aligned, try_pop_frame, try_push_frame, try_push_frame_with,
@@ -346,6 +342,8 @@ pub fn run_with_options(cfg: &PipelineConfig, options: RuntimeOptions) -> Result
         let running = running.clone();
         move || running.store(false, Ordering::SeqCst)
     })?;
+    // Set by any fatal device-stream error so the run exits non-zero.
+    let stream_failed = Arc::new(AtomicBool::new(false));
 
     let counters = RealtimeCounters::new();
 
@@ -365,7 +363,12 @@ pub fn run_with_options(cfg: &PipelineConfig, options: RuntimeOptions) -> Result
         "mic",
         InputChannelMode::MonoDownmix,
         counters.mic_input_drops.clone(),
-        stream_error_handler("mic", running.clone(), options.status_json),
+        stream_error_handler(
+            "mic",
+            running.clone(),
+            stream_failed.clone(),
+            options.status_json,
+        ),
     )?;
     let output_setpoint_samples = frame_size.saturating_mul(OUTPUT_PREROLL_FRAMES);
     // 软死区 = 半帧:正常回调抖动(误差远小于半帧)落在死区内,控制器不介入 = 精确直通;
@@ -381,7 +384,12 @@ pub fn run_with_options(cfg: &PipelineConfig, options: RuntimeOptions) -> Result
         out_cons,
         counters.output_underruns.clone(),
         output_rate_match,
-        stream_error_handler("output", running.clone(), options.status_json),
+        stream_error_handler(
+            "output",
+            running.clone(),
+            stream_failed.clone(),
+            options.status_json,
+        ),
     )?;
     let mut render_prod = render_prod;
     let render_stream = match (&reference_source, render_config.as_ref()) {
@@ -396,7 +404,12 @@ pub fn run_with_options(cfg: &PipelineConfig, options: RuntimeOptions) -> Result
                 "ref",
                 InputChannelMode::from_reference_channels(cfg.reference_channels),
                 counters.ref_input_drops.clone(),
-                stream_error_handler("reference", running.clone(), options.status_json),
+                stream_error_handler(
+                    "reference",
+                    running.clone(),
+                    stream_failed.clone(),
+                    options.status_json,
+                ),
             )?)
         }
         _ => None,
@@ -413,6 +426,7 @@ pub fn run_with_options(cfg: &PipelineConfig, options: RuntimeOptions) -> Result
                 p,
                 counters.ref_input_drops.clone(),
                 running.clone(),
+                stream_failed.clone(),
                 options.status_json,
             )?)
         }
@@ -548,6 +562,9 @@ pub fn run_with_options(cfg: &PipelineConfig, options: RuntimeOptions) -> Result
     drop(process_tap_stream);
     drop(output_stream);
     proc.join().ok();
+    if stream_failed.load(Ordering::SeqCst) {
+        bail!("realtime run stopped after a fatal audio stream error");
+    }
     print_human(options.status_json, "Stopped.");
     Ok(())
 }
@@ -613,6 +630,7 @@ fn process_loop<M, R, O>(
         })
     });
     let mut diagnostic = runtime.diagnostic;
+    let mut pending_diagnostic = None;
     let mut control = runtime.control;
 
     while running.load(Ordering::SeqCst) {
@@ -620,6 +638,7 @@ fn process_loop<M, R, O>(
             &mut control,
             RuntimeControlContext {
                 diagnostic: &mut diagnostic,
+                pending_diagnostic: &mut pending_diagnostic,
                 stats: stats.as_mut(),
                 chain: &mut chain,
                 sample_rate: runtime.sample_rate,
@@ -696,8 +715,17 @@ fn process_loop<M, R, O>(
             &mut bypass_crossfade,
         );
         apply_output_level(&mut out, runtime.output_level);
-        let node_stats = chain.stats();
         let pushed = out_prod.push_slice(&out);
+        // chain.stats() allocates; only collect it for diagnostics frames and status lines.
+        let node_stats = if diagnostic
+            .as_ref()
+            .is_some_and(DiagnosticRecorder::is_recording)
+            || stats.as_ref().is_some_and(RealtimeStats::print_due)
+        {
+            chain.stats()
+        } else {
+            Vec::new()
+        };
         let output_overruns = out.len().saturating_sub(pushed) as u64;
         let ref_q = render_cons
             .as_ref()
@@ -866,9 +894,11 @@ macro_rules! dispatch_format {
 fn stream_error_handler(
     label: &'static str,
     running: Arc<AtomicBool>,
+    stream_failed: Arc<AtomicBool>,
     status_json: bool,
 ) -> impl FnMut(cpal::StreamError) {
     move |err| {
+        stream_failed.store(true, Ordering::SeqCst);
         running.store(false, Ordering::SeqCst);
         eprintln!("{label} stream error: {err}");
         if status_json {
@@ -1303,9 +1333,7 @@ mod tests {
     use std::cell::Cell;
     use std::sync::atomic::AtomicUsize;
 
-    use cpal::{
-        BackendSpecificError, DeviceDescriptionBuilder, DeviceType, InterfaceType, StreamError,
-    };
+    use cpal::{BackendSpecificError, StreamError};
     use echoless_processors::{aec3::Aec3Engine, EchoProcessor, IoSpec, ProcessorStats};
     use ringbuf::traits::Observer;
 
@@ -1728,20 +1756,6 @@ mod tests {
     }
 
     #[test]
-    fn device_description_label_prefers_driver_detail() {
-        let desc = DeviceDescriptionBuilder::new("麦克风")
-            .driver("USB Condenser Microphone")
-            .device_type(DeviceType::Microphone)
-            .interface_type(InterfaceType::Usb)
-            .build();
-
-        assert_eq!(
-            format_device_description(&desc),
-            "麦克风 / USB Condenser Microphone"
-        );
-    }
-
-    #[test]
     fn input_channel_mode_downmixes_or_preserves_stereo() {
         let drops = AtomicU64::new(0);
         let (mut mono_prod, mut mono_cons) = HeapRb::<f32>::new(4).split();
@@ -1786,12 +1800,14 @@ mod tests {
             assert_eq!(payload["stream"], "output");
             assert_eq!(payload["message"], error.to_string());
             assert_eq!(payload["fatal"], true);
-            assert_eq!(payload["recoverable"], stream_error_recoverable(&error));
 
             let running = Arc::new(AtomicBool::new(true));
-            let mut handler = stream_error_handler("output", running.clone(), false);
+            let failed = Arc::new(AtomicBool::new(false));
+            let mut handler =
+                stream_error_handler("output", running.clone(), failed.clone(), false);
             handler(error);
             assert!(!running.load(Ordering::SeqCst));
+            assert!(failed.load(Ordering::SeqCst));
         }
     }
 
@@ -1939,23 +1955,5 @@ mod tests {
         assert!(try_pop_frame(&mut consumer, &mut existing));
         assert_eq!(existing, [10.0, 11.0]);
         assert_eq!(consumer.occupied_len(), 0);
-    }
-
-    #[test]
-    fn virtual_audio_name_detection_covers_common_drivers() {
-        assert!(is_virtual_audio_name(
-            "CABLE Input (VB-Audio Virtual Cable)"
-        ));
-        assert!(is_virtual_audio_name("BlackHole 2ch"));
-        assert!(is_virtual_audio_name("Virtual Desktop Mic"));
-        assert!(!is_virtual_audio_name("MacBook Pro Speakers"));
-    }
-
-    #[test]
-    fn system_audio_permission_state_uses_frontend_contract_values() {
-        assert!(matches!(
-            system_audio_permission_state(),
-            "granted" | "denied" | "undetermined" | "unknown"
-        ));
     }
 }

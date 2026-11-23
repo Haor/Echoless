@@ -529,15 +529,23 @@ impl RealtimeStats {
         self.output_overruns += sample.output_overruns;
         self.output_underruns += sample.output_underruns;
         self.clock_frames = self.clock_frames.saturating_add(sample.frame_size as u64);
-        self.node_process_time_ms = self
-            .node_process_time_ms
-            .max(aggregate_process_time_ms(sample.node_stats));
-        self.node_runtime_errors = aggregate_runtime_errors(sample.node_stats);
-        self.aec_estimated_delay_ms = aggregate_estimated_delay_ms(sample.node_stats);
-        self.aec3_delay_blocks = aggregate_aec3_delay_blocks(sample.node_stats);
-        self.node_diverged = aggregate_diverged(sample.node_stats);
-        self.node_last_error = aggregate_last_error(sample.node_stats);
+        // Node stats are collected only on frames that print or record diagnostics.
+        if !sample.node_stats.is_empty() {
+            self.node_process_time_ms = self
+                .node_process_time_ms
+                .max(aggregate_process_time_ms(sample.node_stats));
+            self.node_runtime_errors = aggregate_runtime_errors(sample.node_stats);
+            self.aec_estimated_delay_ms = aggregate_estimated_delay_ms(sample.node_stats);
+            self.aec3_delay_blocks = aggregate_aec3_delay_blocks(sample.node_stats);
+            self.node_diverged = aggregate_diverged(sample.node_stats);
+            self.node_last_error = aggregate_last_error(sample.node_stats);
+        }
         self.maybe_print();
+    }
+
+    /// True when the next observed frame will emit a status line.
+    pub(super) fn print_due(&self) -> bool {
+        self.last_print.elapsed() >= self.interval
     }
 
     fn maybe_print(&mut self) {
