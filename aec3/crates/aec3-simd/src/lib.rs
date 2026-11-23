@@ -330,9 +330,19 @@ impl SimdBackend {
 
 // Runtime CPU feature detection via cpufeatures (atomic-cached).
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-cpufeatures::new!(has_avx2_fma, "avx2", "fma");
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-cpufeatures::new!(has_sse2, "sse2");
+#[allow(deprecated, reason = "cpufeatures 0.3.0 expands u8::max_value()")]
+mod cpu_detect {
+    cpufeatures::new!(has_avx2_fma, "avx2", "fma");
+    cpufeatures::new!(has_sse2, "sse2");
+
+    pub(super) fn avx2_fma() -> bool {
+        has_avx2_fma::get()
+    }
+
+    pub(super) fn sse2() -> bool {
+        has_sse2::get()
+    }
+}
 
 /// Return all SIMD backends supported by the current CPU.
 ///
@@ -344,10 +354,10 @@ pub fn available_backends() -> Vec<SimdBackend> {
 
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     {
-        if has_sse2::get() {
+        if cpu_detect::sse2() {
             backends.push(SimdBackend::Sse2);
         }
-        if has_avx2_fma::get() {
+        if cpu_detect::avx2_fma() {
             backends.push(SimdBackend::Avx2);
         }
     }
@@ -366,10 +376,10 @@ pub fn available_backends() -> Vec<SimdBackend> {
 pub fn detect_backend() -> SimdBackend {
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     {
-        if has_avx2_fma::get() {
+        if cpu_detect::avx2_fma() {
             return SimdBackend::Avx2;
         }
-        if has_sse2::get() {
+        if cpu_detect::sse2() {
             return SimdBackend::Sse2;
         }
     }

@@ -2,6 +2,7 @@ use std::collections::VecDeque;
 use std::io::BufRead;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, TryRecvError};
+use std::sync::Arc;
 use std::thread;
 
 use anyhow::{bail, Context, Result};
@@ -166,7 +167,25 @@ fn parse_runtime_control_command(line: &str) -> Result<RuntimeControlCommand> {
 }
 
 /// A diagnostics recorder being created off the audio thread, with its `max_seconds`.
-pub(super) type PendingDiagnostic = Receiver<(Option<u32>, Result<Option<DiagnosticRecorder>>)>;
+pub(super) struct PendingDiagnostic {
+    receiver: Receiver<(Option<u32>, Result<Option<DiagnosticRecorder>>)>,
+    cancelled: Arc<AtomicBool>,
+}
+
+impl PendingDiagnostic {
+    fn cancel(self) {
+        self.cancelled.store(true, Ordering::SeqCst);
+        if let Ok((_, Ok(Some(recorder)))) = self.receiver.try_recv() {
+            thread::spawn(move || drop(recorder));
+        }
+    }
+}
+
+impl Drop for PendingDiagnostic {
+    fn drop(&mut self) {
+        self.cancelled.store(true, Ordering::SeqCst);
+    }
+}
 
 pub(super) struct RuntimeControlContext<'a> {
     pub(super) diagnostic: &'a mut Option<DiagnosticRecorder>,
@@ -235,7 +254,7 @@ fn install_pending_diagnostic(ctx: &mut RuntimeControlContext<'_>) {
     let Some(pending) = ctx.pending_diagnostic.as_ref() else {
         return;
     };
-    let (max_seconds, result) = match pending.try_recv() {
+    let (max_seconds, result) = match pending.receiver.try_recv() {
         Ok(created) => created,
         Err(TryRecvError::Empty) => return,
         Err(TryRecvError::Disconnected) => {
@@ -328,7 +347,12 @@ fn handle_runtime_control_command(
             );
             let (near_delay_ms, output_level) = (*ctx.near_delay_ms, *ctx.output_level);
             let (sender, receiver) = channel();
+            let cancelled = Arc::new(AtomicBool::new(false));
+            let cancelled_worker = Arc::clone(&cancelled);
             thread::spawn(move || {
+                if cancelled_worker.load(Ordering::SeqCst) {
+                    return;
+                }
                 let created = DiagnosticRecorder::new(DiagnosticRecorderConfig {
                     enabled: true,
                     max_seconds,
@@ -340,11 +364,22 @@ fn handle_runtime_control_command(
                     node_stats: &node_stats,
                     status_json,
                 });
+                if cancelled_worker.load(Ordering::SeqCst) {
+                    drop(created);
+                    return;
+                }
                 let _ = sender.send((max_seconds, created));
             });
-            *ctx.pending_diagnostic = Some(receiver);
+            *ctx.pending_diagnostic = Some(PendingDiagnostic {
+                receiver,
+                cancelled,
+            });
         }
         RuntimeControlCommand::StopDiagnostics => {
+            if let Some(pending) = ctx.pending_diagnostic.take() {
+                pending.cancel();
+                return;
+            }
             let Some(recorder) = ctx.diagnostic.as_mut() else {
                 emit_control_error(
                     ctx.status_json,
@@ -693,5 +728,53 @@ mod tests {
 
         retune_near_delay_buffer(&mut delay, 0);
         assert!(delay.is_empty());
+    }
+
+    #[test]
+    fn stop_diagnostics_cancels_pending_setup() {
+        let (ctrl_tx, ctrl_rx) = channel();
+        let mut control = Some(ctrl_rx);
+        let running = AtomicBool::new(true);
+        let mut diagnostic = None;
+        let (_pending_tx, pending_rx) = channel();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let mut pending_diagnostic = Some(PendingDiagnostic {
+            receiver: pending_rx,
+            cancelled: Arc::clone(&cancelled),
+        });
+        let mut chain = ProcessorChain::new(48_000, 1);
+        let (mut near_delay_ms, mut near_delay_samples) = (0, 0);
+        let mut near_delay_buffer = VecDeque::new();
+        let (mut output_level, mut bypassed) = (50, false);
+
+        ctrl_tx
+            .send(RuntimeControlEvent::Command(
+                RuntimeControlCommand::StopDiagnostics,
+            ))
+            .unwrap();
+
+        handle_runtime_controls(
+            &mut control,
+            RuntimeControlContext {
+                diagnostic: &mut diagnostic,
+                pending_diagnostic: &mut pending_diagnostic,
+                stats: None,
+                chain: &mut chain,
+                sample_rate: 48_000,
+                reference_channels: 1,
+                frame_ms: 10,
+                near_delay_ms: &mut near_delay_ms,
+                near_delay_samples: &mut near_delay_samples,
+                near_delay_buffer: &mut near_delay_buffer,
+                output_level: &mut output_level,
+                bypassed: &mut bypassed,
+                status_json: true,
+                running: &running,
+            },
+        );
+
+        assert!(pending_diagnostic.is_none());
+        assert!(diagnostic.is_none());
+        assert!(cancelled.load(Ordering::SeqCst));
     }
 }

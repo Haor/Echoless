@@ -2342,23 +2342,37 @@ export default function App() {
   }, [trayPrefs]);
 
   // Windows 启动项以系统注册状态为真理源;窗口重新聚焦时同步实际状态。
+  // 读刷新与写操作使用独立代数，避免写进行中窗口聚焦把待决写结果作废卡死 pending。
   const [autostartPref, setAutostartPref] = useState<{
     enabled: boolean | null;
     pending: boolean | null;
   }>({ enabled: null, pending: null });
-  const autostartRequestRef = useRef(0);
+  const autostartWriteGenRef = useRef(0);
+  const autostartRefreshGenRef = useRef(0);
+  const autostartPendingRef = useRef(false);
   const refreshAutostart = useCallback(() => {
-    if (platform !== "windows") return;
-    const request = ++autostartRequestRef.current;
+    if (platform !== "windows" || autostartPendingRef.current) return;
+    const writeGen = autostartWriteGenRef.current;
+    const refreshGen = ++autostartRefreshGenRef.current;
     getAutostartEnabled()
       .then((enabled) => {
-        if (request !== autostartRequestRef.current) return;
-        setAutostartPref((cur) =>
-          cur.pending == null ? { enabled, pending: null } : cur,
-        );
+        if (
+          autostartPendingRef.current ||
+          writeGen !== autostartWriteGenRef.current ||
+          refreshGen !== autostartRefreshGenRef.current
+        ) {
+          return;
+        }
+        setAutostartPref({ enabled, pending: null });
       })
       .catch((e) => {
-        if (request === autostartRequestRef.current) noteError(String(e));
+        if (
+          !autostartPendingRef.current &&
+          writeGen === autostartWriteGenRef.current &&
+          refreshGen === autostartRefreshGenRef.current
+        ) {
+          noteError(String(e));
+        }
       });
   }, [noteError, platform]);
   useEffect(() => {
@@ -2373,15 +2387,18 @@ export default function App() {
       setAutostartPref({ enabled, pending: null });
       return;
     }
-    const request = ++autostartRequestRef.current;
+    const writeGen = ++autostartWriteGenRef.current;
+    autostartPendingRef.current = true;
     setAutostartPref((cur) => ({ enabled: cur.enabled, pending: enabled }));
     persistAutostartEnabled(enabled)
       .then((actual) => {
-        if (request !== autostartRequestRef.current) return;
+        if (writeGen !== autostartWriteGenRef.current) return;
+        autostartPendingRef.current = false;
         setAutostartPref({ enabled: actual, pending: null });
       })
       .catch((e) => {
-        if (request !== autostartRequestRef.current) return;
+        if (writeGen !== autostartWriteGenRef.current) return;
+        autostartPendingRef.current = false;
         setAutostartPref((cur) => ({ enabled: cur.enabled, pending: null }));
         noteError(String(e));
       });
