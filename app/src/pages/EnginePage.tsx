@@ -429,7 +429,8 @@ export function EnginePage({
               ? "NS"
               : null;
         const found = lvAssets?.models.find((x) => x.filename === m.file);
-        const selected = !!found && localvqeModel === found.path;
+        const selected =
+          kind === "localvqe" && !!found && localvqeModel === found.path;
         const downloading = m.file in lvDl;
         const pct = lvDl[m.file];
         const box = downloading

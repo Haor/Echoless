@@ -65,6 +65,20 @@ export function shouldRevealWindow(
   return booted && mode === "manual";
 }
 
+export function shouldRevealAutostartFailure(input: {
+  mode: StartupMode;
+  attempted: boolean;
+  running: boolean;
+  err: string | null;
+}): boolean {
+  return (
+    input.mode === "autostart" &&
+    input.attempted &&
+    !input.running &&
+    Boolean(input.err)
+  );
+}
+
 export function shouldAttemptAutoStart(input: {
   mode: StartupMode;
   dataReady: boolean;

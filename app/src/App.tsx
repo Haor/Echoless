@@ -109,7 +109,6 @@ import {
   settleBypassObservation,
   clearBypassPending,
   routeEngineKindSelection,
-  shouldPickLocalvqeModel,
   canChangePipeline,
   pipelineForEngineKind,
 } from "./engineLogic";
@@ -119,7 +118,6 @@ import {
   resetRuntimeLive,
   setDiagnosticsSessionDir,
 } from "./runtimeTelemetry";
-import { REQUIRED_RUN_CONTROLS } from "./runtimeControls";
 import { createAsyncListenerScope } from "./asyncListener";
 import { settleBootGate } from "./bootGate";
 import {
@@ -134,6 +132,7 @@ import {
   INITIAL_STARTUP_RUN_HANDSHAKE,
   observeStartupRunStarted,
   shouldAttemptAutoStart,
+  shouldRevealAutostartFailure,
   shouldRevealWindow,
   startupDataReady,
   type StartupMode,
@@ -604,6 +603,13 @@ function useDeviceEnumeration({
   };
 }
 
+type HotControlKey =
+  | "output_level"
+  | "near_delay_ms"
+  | "initial_delay_ms"
+  | "aec3_agc"
+  | "localvqe_noise_gate";
+
 type EngineConfigDeps = {
   processors: Processor[];
   noiseSuppression: NoiseSuppressionManifest | null;
@@ -611,12 +617,12 @@ type EngineConfigDeps = {
   dev: boolean;
   nvafx: NvafxDoctor | null;
   powerOnRef: MutableRefObject<boolean>;
+  runStartedRef: MutableRefObject<boolean>;
+  pendingHotControlsRef: MutableRefObject<Set<HotControlKey>>;
   applyChangeRef: MutableRefObject<(next: Override) => void>;
   stopForEngineSetupRef: MutableRefObject<() => void>;
   noteError: (err: string | null) => void;
   gotoView: (view: View) => void;
-  hasRunControl: (cmd: string) => boolean;
-  reportMissingRunControl: (cmd: string) => void;
 };
 
 function useEngineConfig({
@@ -626,12 +632,12 @@ function useEngineConfig({
   dev,
   nvafx,
   powerOnRef,
+  runStartedRef,
+  pendingHotControlsRef,
   applyChangeRef,
   stopForEngineSetupRef,
   noteError,
   gotoView,
-  hasRunControl,
-  reportMissingRunControl,
 }: EngineConfigDeps) {
   const [engineState, updateEngine] = useReducer(
     patchReducer<EngineState>,
@@ -653,6 +659,55 @@ function useEngineConfig({
   );
   const kindRef = useRef(kind);
   kindRef.current = kind;
+  const platformRef = useRef(platform);
+  platformRef.current = platform;
+
+  function hotNearDelayValue(next: PipelineCfg): number {
+    return next.near_delay_ms ?? platformNearDelayDefault(platformRef.current);
+  }
+
+  function dispatchHotControl(key: HotControlKey, send: () => void) {
+    if (!powerOnRef.current) return;
+    if (!runStartedRef.current) {
+      pendingHotControlsRef.current.add(key);
+      return;
+    }
+    send();
+  }
+
+  function flushPendingHotControls() {
+    if (pendingHotControlsRef.current.size === 0) return;
+    const keys = Array.from(pendingHotControlsRef.current);
+    pendingHotControlsRef.current.clear();
+    const activeKind = kindRef.current;
+    const pl = pipelineRef.current;
+    const curParams = paramsRef.current;
+    for (const key of keys) {
+      if (key === "output_level") {
+        setOutputLevel(pl.output_level ?? 50).catch((e) =>
+          noteError(String(e)),
+        );
+      } else if (key === "near_delay_ms") {
+        setNearDelayMs(hotNearDelayValue(pl)).catch((e) =>
+          noteError(String(e)),
+        );
+      } else if (key === "initial_delay_ms" && activeKind === "aec3") {
+        const delayMs = hotInitialDelayValue(curParams.initial_delay_ms);
+        if (delayMs != null) {
+          setInitialDelayMs(delayMs).catch((e) => noteError(String(e)));
+        }
+      } else if (key === "aec3_agc" && activeKind === "aec3") {
+        setAec3Agc(Boolean(curParams.agc)).catch((e) => noteError(String(e)));
+      } else if (key === "localvqe_noise_gate" && activeKind === "localvqe") {
+        const gate = hotLocalvqeNoiseGateValue(curParams);
+        if (gate != null) {
+          setLocalvqeNoiseGate(gate.enabled, gate.thresholdDbfs).catch((e) =>
+            noteError(String(e)),
+          );
+        }
+      }
+    }
+  }
 
   // 引擎就绪判定:AEC3 永远就绪;LocalVQE 需模型;NVAFX 需平台支持 + doctor 通过。
   // 开发态(dev)临时解开 NVAFX 的平台/doctor 门槛,用于走通前端流程。
@@ -714,66 +769,65 @@ function useEngineConfig({
   }
 
   // 改单个 chain 参数(NOISE / Advanced)。
-  function setParam(key: string, val: unknown) {
-    const np = { ...paramsRef.current, [key]: val };
-    paramsRef.current = np; // 同步更新 ref:探测后自动恢复引擎时能立刻读到新 initial_delay_ms
-    paramsByKind.current[kind] = np;
-    updateEngine({ params: np });
-    if (kind === "aec3" && key === "initial_delay_ms") {
-      if (powerOnRef.current) {
-        if (!hasRunControl("set_initial_delay_ms")) {
-          reportMissingRunControl("set_initial_delay_ms");
-          return;
-        }
-        const delayMs = hotInitialDelayValue(val);
-        if (delayMs == null) {
-          noteError("initial_delay_ms must be a finite number");
-          return;
-        }
-        setInitialDelayMs(delayMs).catch((e) => noteError(String(e)));
-      }
+  function setParam(key: string, val: unknown, targetKind?: string) {
+    const activeKind = kindRef.current;
+    if (targetKind != null && targetKind !== activeKind) return;
+    const prevVal = paramsRef.current[key];
+    if (
+      Object.is(prevVal, val) ||
+      (prevVal == null && val == null)
+    ) {
       return;
     }
-    if (kind === "aec3" && key === "agc") {
-      if (powerOnRef.current) {
-        if (!hasRunControl("set_aec3_agc")) {
-          reportMissingRunControl("set_aec3_agc");
-          return;
+    const np = { ...paramsRef.current, [key]: val };
+    paramsRef.current = np;
+    paramsByKind.current[activeKind] = np;
+    updateEngine({ params: np });
+    if (activeKind === "aec3" && key === "initial_delay_ms") {
+      const delayMs = hotInitialDelayValue(val);
+      if (delayMs == null) {
+        if (powerOnRef.current) {
+          noteError("initial_delay_ms must be a finite number");
         }
-        setAec3Agc(Boolean(val)).catch((e) => noteError(String(e)));
+        return;
       }
+      dispatchHotControl("initial_delay_ms", () => {
+        setInitialDelayMs(delayMs).catch((e) => noteError(String(e)));
+      });
+      return;
+    }
+    if (activeKind === "aec3" && key === "agc") {
+      dispatchHotControl("aec3_agc", () => {
+        setAec3Agc(Boolean(val)).catch((e) => noteError(String(e)));
+      });
       return;
     }
     if (
-      kind === "localvqe" &&
+      activeKind === "localvqe" &&
       (key === "noise_gate" || key === "noise_gate_threshold_dbfs")
     ) {
-      if (powerOnRef.current) {
-        if (!hasRunControl("set_localvqe_noise_gate")) {
-          reportMissingRunControl("set_localvqe_noise_gate");
-          return;
-        }
-        const gate = hotLocalvqeNoiseGateValue(np);
-        if (gate == null) {
+      const gate = hotLocalvqeNoiseGateValue(np);
+      if (gate == null) {
+        if (powerOnRef.current) {
           noteError("noise_gate_threshold_dbfs must be a finite number");
-          return;
         }
+        return;
+      }
+      dispatchHotControl("localvqe_noise_gate", () => {
         setLocalvqeNoiseGate(gate.enabled, gate.thresholdDbfs).catch((e) =>
           noteError(String(e)),
         );
-      }
+      });
       return;
     }
     applyChangeRef.current({ params: np });
   }
 
-  // 选 LocalVQE 模型(清单常驻):原子地切到 localvqe 引擎并设 model,避免把 model 写到当前引擎上。
+  // 选 LocalVQE 模型:原子地切到 localvqe 引擎并设 model,避免把 model 写到当前引擎上。
   function pickLocalvqeModel(path: string) {
-    const selectedModel =
-      kindRef.current === "localvqe"
-        ? paramsRef.current.model
-        : paramsByKind.current["localvqe"]?.model;
-    if (!shouldPickLocalvqeModel(selectedModel, path)) return;
+    if (kindRef.current === "localvqe" && paramsRef.current.model === path) {
+      return;
+    }
 
     const base =
       paramsByKind.current["localvqe"] ??
@@ -828,44 +882,35 @@ function useEngineConfig({
     applyChangeRef.current({ noiseMode: mode });
   }
 
-  function hotNearDelayValue(next: PipelineCfg): number {
-    return next.near_delay_ms ?? platformNearDelayDefault(platform);
-  }
-
   // 改管线项。near_delay_ms 可运行中热控;采样率/帧长/参考声道仍需重启。
   function changePipeline(patch: Partial<PipelineCfg>) {
     if (!canChangePipeline(kindRef.current, patch)) return;
-    const npl = { ...pipelineRef.current, ...patch };
-    pipelineRef.current = npl; // 同步更新 ref:探测后自动恢复引擎时能立刻读到新 near_delay
+    const cur = pipelineRef.current;
+    const entries = Object.entries(patch) as [keyof PipelineCfg, unknown][];
+    if (entries.every(([k, v]) => Object.is(cur[k], v))) return;
+    const npl = { ...cur, ...patch };
+    pipelineRef.current = npl;
     updateEngine({ pipeline: npl });
     if (isNearDelayOnlyPatch(patch)) {
-      if (powerOnRef.current) {
-        if (!hasRunControl("set_near_delay_ms")) {
-          reportMissingRunControl("set_near_delay_ms");
-          return;
-        }
+      dispatchHotControl("near_delay_ms", () => {
         setNearDelayMs(hotNearDelayValue(npl)).catch((e) =>
           noteError(String(e)),
         );
-      }
+      });
       return;
     }
     applyChangeRef.current({ pipeline: npl });
   }
 
-  // 输出音量(滚轮 0-100):落进 pipeline(下次 start 用);运行中走 stdin 实时控制,
-  // 逐 buffer 生效、零掉音(不 applyChange —— 那会 stop+start 抖音频)。
+  // 输出音量(滚轮 0-100):落进 pipeline(下次 start 用);运行中走 stdin 实时控制。
   function changeOutVolume(v: number) {
+    if (Object.is(pipelineRef.current.output_level ?? 50, v)) return;
     const npl = { ...pipelineRef.current, output_level: v };
     pipelineRef.current = npl;
     updateEngine({ pipeline: npl });
-    if (powerOnRef.current) {
-      if (!hasRunControl("set_output_level")) {
-        reportMissingRunControl("set_output_level");
-        return;
-      }
+    dispatchHotControl("output_level", () => {
       setOutputLevel(v).catch((e) => noteError(String(e)));
-    }
+    });
   }
 
   // 引擎配置持久化:kind/pipeline/params 任一变更即写回(paramsByKind 随写,
@@ -891,6 +936,7 @@ function useEngineConfig({
   return {
     engineState,
     updateEngine,
+    kindRef,
     noiseModeRef,
     noiseParamsByModeRef,
     pipelineRef,
@@ -904,11 +950,13 @@ function useEngineConfig({
     pickLocalvqeModel,
     changePipeline,
     changeOutVolume,
+    flushPendingHotControls,
   };
 }
 
 type RunLifecycleDeps = {
   busy: boolean;
+  probing: boolean;
   powerOn: boolean;
   bypassed: boolean;
   bypassPending: boolean | null;
@@ -926,22 +974,22 @@ type RunLifecycleDeps = {
   pipelineRef: MutableRefObject<PipelineCfg>;
   paramsRef: MutableRefObject<Record<string, unknown>>;
   telRef: MutableRefObject<Telemetry>;
-  cliVersionRef: MutableRefObject<string | null>;
-  runControlsRef: MutableRefObject<Set<string> | null>;
   powerOnRef: MutableRefObject<boolean>;
+  runStartedRef: MutableRefObject<boolean>;
+  pendingHotControlsRef: MutableRefObject<Set<HotControlKey>>;
+  flushPendingHotControlsRef: MutableRefObject<() => void>;
   applyChangeRef: MutableRefObject<(next: Override) => void>;
   stopForEngineSetupRef: MutableRefObject<() => void>;
   updateApp: Dispatch<Patch<AppState>>;
   noteError: (err: string | null) => void;
   gotoView: (view: View) => void;
-  hasRunControl: (cmd: string) => boolean;
-  reportMissingRunControl: (cmd: string) => void;
   onRunReservedRef: MutableRefObject<(runId: number) => void>;
   onRunStartedRef: MutableRefObject<(runId: number) => void>;
 };
 
 function useRunLifecycle({
   busy,
+  probing,
   powerOn,
   bypassed,
   bypassPending,
@@ -957,16 +1005,15 @@ function useRunLifecycle({
   pipelineRef,
   paramsRef,
   telRef,
-  cliVersionRef,
-  runControlsRef,
   powerOnRef,
+  runStartedRef,
+  pendingHotControlsRef,
+  flushPendingHotControlsRef,
   applyChangeRef,
   stopForEngineSetupRef,
   updateApp,
   noteError,
   gotoView,
-  hasRunControl,
-  reportMissingRunControl,
   onRunReservedRef,
   onRunStartedRef,
 }: RunLifecycleDeps) {
@@ -1005,12 +1052,8 @@ function useRunLifecycle({
 
   // 录制就地起停命令(运行中改录制态用 stdin,不重启 run)。
   const startDiag = useCallback(() => {
-    if (!hasRunControl("start_diagnostics")) {
-      reportMissingRunControl("start_diagnostics");
-      return;
-    }
     startDiagnostics(diagSecondsRef.current).catch((e) => noteError(String(e)));
-  }, [hasRunControl, noteError, reportMissingRunControl]);
+  }, [noteError]);
 
   useEffect(() => {
     // 清理可能残留的 sidecar(前端 reload 后 Rust 子进程可能还活着 → 状态脱同步)。
@@ -1024,20 +1067,9 @@ function useRunLifecycle({
           runGenerationRef.current = decision.generation;
           if (!decision.accepted) return;
           if (ev.type === "started") {
+            runStartedRef.current = true;
             onRunStartedRef.current(ev.run_id);
             telRef.current.on = true;
-            cliVersionRef.current = ev.cli_version ?? null;
-            runControlsRef.current = Array.isArray(ev.supported_controls)
-              ? new Set(ev.supported_controls)
-              : null;
-            const missingControls = REQUIRED_RUN_CONTROLS.filter(
-              (cmd) => !hasRunControl(cmd),
-            );
-            if (missingControls.length > 0) {
-              noteError(
-                `CLI ${cliVersionRef.current ?? "unknown"} is missing runtime controls: ${missingControls.join(", ")}. Rebuild or replace the bundled echoless CLI.`,
-              );
-            }
             refSourceRef.current = ev.reference_source ?? null;
             updateApp({
               io: {
@@ -1045,8 +1077,8 @@ function useRunLifecycle({
                 micRate: ev.mic_device_sample_rate ?? null,
               },
             });
-            // run 已起;若录制开关为开,就地下发 start_diagnostics(power-on-with-rec /
-            // 改设置重启 后的统一入口)。session 目录随后由 diagnostics_started 给出。
+            flushPendingHotControlsRef.current();
+            // run 已起;若录制开关为开,就地下发 start_diagnostics。
             if (recRef.current) startDiag();
             return;
           }
@@ -1191,11 +1223,10 @@ function useRunLifecycle({
           runGenerationRef.current = decision.generation;
           if (!decision.accepted) return;
           telRef.current.on = false;
+          runStartedRef.current = false;
           resetRuntimeLive(); // 清掉停机后残留的 dBFS / 延迟读数
           updateApp({ io: null, bypassed: false, bypassPending: null });
           refSourceRef.current = null;
-          cliVersionRef.current = null;
-          runControlsRef.current = null;
           // 后端按子进程标记:intentional=主动停/重启 → 正常,不报错。
           if (ev.intentional) return;
           if (
@@ -1247,9 +1278,10 @@ function useRunLifecycle({
     };
   }, [
     clearStreamRecoveryTimer,
-    hasRunControl,
+    flushPendingHotControlsRef,
     noteError,
     resetStreamRecovery,
+    runStartedRef,
     startDiag,
     updateApp,
   ]);
@@ -1275,6 +1307,8 @@ function useRunLifecycle({
     if (!recovering) resetStreamRecovery();
     const startIntent = runIntentRef.current.request(true);
     const restartBypassed = recovering ? bypassTargetRef.current : false;
+    runStartedRef.current = false;
+    pendingHotControlsRef.current.clear();
     powerOnRef.current = true;
     updateApp({ busy: true, err: null });
     resetRuntimeHealth();
@@ -1336,6 +1370,8 @@ function useRunLifecycle({
   async function stop() {
     resetStreamRecovery();
     runIntentRef.current.request(false);
+    runStartedRef.current = false;
+    pendingHotControlsRef.current.clear();
     powerOnRef.current = false;
     bypassTargetRef.current = false;
     updateApp({ busy: true });
@@ -1380,13 +1416,8 @@ function useRunLifecycle({
   //   穿透中     → set_bypass(false):瞬时恢复 AEC(零重收敛)。
   // 「完全停机」不是用户级操作(退出应用 = 停);stop() 只服务重启/probe/错误路径。
   async function togglePower() {
-    if (busy) return;
+    if (busy || probing) return;
     if (powerOn) {
-      if (!hasRunControl("set_bypass")) {
-        // 旧 CLI 兼容:没有热穿透命令时退回整机停转。
-        await stop();
-        return;
-      }
       const next = bypassToggleTarget({ bypassed, bypassPending });
       if (next == null) return;
       updateApp({ bypassPending: next });
@@ -1437,6 +1468,8 @@ function useRunLifecycle({
     const applyIntent = runIntentRef.current.snapshot();
     if (!runIntentRef.current.allowsStart(applyIntent)) return;
     const restartBypassed = bypassTargetRef.current;
+    runStartedRef.current = false;
+    pendingHotControlsRef.current.clear();
     updateApp({ busy: true });
     try {
       await stopRun();
@@ -1490,29 +1523,23 @@ function useRunLifecycle({
     }
   }
 
-  // 诊断录制开关:运行中 → 经 stdin 就地起停(不重启 run);未运行 → 仅置位,
-  // 等 run 启动后由 started 处理。
+  // 诊断录制开关:运行中且已 started → 经 stdin 就地起停(不重启 run);
+  // 未运行或尚在启动窗口期 → 仅置位,等 started 到达后统一处理。
   const setRecording = useCallback((on: boolean) => {
     updateApp({ rec: on });
     recRef.current = on;
-    if (!powerOnRef.current) return;
+    if (!powerOnRef.current || !runStartedRef.current) return;
     if (on) startDiag();
     else {
-      if (!hasRunControl("stop_diagnostics")) {
-        reportMissingRunControl("stop_diagnostics");
-        return;
-      }
       stopDiagnostics().catch((e) => noteError(String(e)));
     }
-  }, [hasRunControl, noteError, reportMissingRunControl, startDiag, updateApp]);
+  }, [noteError, powerOnRef, runStartedRef, startDiag, updateApp]);
 
-  // 时长:仅更新状态。录制中改动 → 重发 start_diagnostics 让新参数立即生效
-  // (后端先收尾旧 session 再开新的)。
+  // 时长:仅更新状态,供下次录制使用(后端拒绝录制中重复 start_diagnostics)。
   const setRecSeconds = useCallback((v: number | null) => {
     updateApp({ diagSeconds: v });
     diagSecondsRef.current = v;
-    if (powerOnRef.current && recRef.current) startDiag();
-  }, [startDiag, updateApp]);
+  }, [updateApp]);
   return {
     start,
     runtimeCleanupReady,
@@ -1535,19 +1562,24 @@ function AppShell() {
   const [startupMode, setStartupMode] = useState<StartupMode>("unknown");
   const [startupCoreReady, setStartupCoreReady] = useState(false);
   const [nvafxChecked, setNvafxChecked] = useState(false);
+  const [probing, setProbing] = useState(false);
   const autoStartAttemptedRef = useRef(false);
-  const autostartHadStartedRef = useRef(false);
+  const startupSettledRef = useRef(false);
   const autostartHandshakeRef = useRef(INITIAL_STARTUP_RUN_HANDSHAKE);
   const startupModeRef = useRef(startupMode);
   startupModeRef.current = startupMode;
   const onRunReservedRef = useRef<(runId: number) => void>(() => {});
   const onRunStartedRef = useRef<(runId: number) => void>(() => {});
+  const settleStartupOnce = useCallback(() => {
+    if (startupSettledRef.current) return;
+    startupSettledRef.current = true;
+    settleStartupLaunch().catch(() => {});
+  }, []);
   const updateAutostartHandshake = (next: typeof INITIAL_STARTUP_RUN_HANDSHAKE) => {
     const wasSettled = autostartHandshakeRef.current.settled;
     autostartHandshakeRef.current = next;
     if (wasSettled || !next.settled) return;
-    autostartHadStartedRef.current = true;
-    settleStartupLaunch().catch(() => {});
+    settleStartupOnce();
   };
   onRunReservedRef.current = (runId) => {
     if (startupModeRef.current !== "autostart") return;
@@ -1616,8 +1648,8 @@ function AppShell() {
   } = appState;
 
   const telRef = useRef<Telemetry>({ mic: -120, ref: -120, out: -120, on: false });
-  const cliVersionRef = useRef<string | null>(null);
-  const runControlsRef = useRef<Set<string> | null>(null);
+  const runStartedRef = useRef(false);
+  const pendingHotControlsRef = useRef<Set<HotControlKey>>(new Set());
   const powerOnRef = useRef(powerOn);
   const renderedPowerOnRef = useRef(powerOn);
   if (renderedPowerOnRef.current !== powerOn) {
@@ -1665,16 +1697,6 @@ function AppShell() {
     updateApp({ devMicState });
   }, []);
 
-  const hasRunControl = useCallback((cmd: string): boolean => {
-    return runControlsRef.current?.has(cmd) ?? false;
-  }, []);
-
-  const reportMissingRunControl = useCallback((cmd: string) => {
-    noteError(
-      `CLI ${cliVersionRef.current ?? "unknown"} does not support runtime control "${cmd}". Rebuild or replace the bundled echoless CLI.`,
-    );
-  }, [noteError]);
-
   const {
     engineState,
     updateEngine,
@@ -1691,6 +1713,7 @@ function AppShell() {
     pickLocalvqeModel,
     changePipeline,
     changeOutVolume,
+    flushPendingHotControls,
   } = useEngineConfig({
     processors,
     noiseSuppression,
@@ -1698,14 +1721,16 @@ function AppShell() {
     dev,
     nvafx,
     powerOnRef,
+    runStartedRef,
+    pendingHotControlsRef,
     applyChangeRef,
     stopForEngineSetupRef,
     noteError,
     gotoView,
-    hasRunControl,
-    reportMissingRunControl,
   });
   const { kind, noiseMode, noiseParamsByMode, pipeline, params } = engineState;
+  const flushPendingHotControlsRef = useRef(flushPendingHotControls);
+  flushPendingHotControlsRef.current = flushPendingHotControls;
 
   const {
     start,
@@ -1716,6 +1741,7 @@ function AppShell() {
     setRecSeconds,
   } = useRunLifecycle({
     busy,
+    probing,
     powerOn,
     bypassed,
     bypassPending,
@@ -1731,16 +1757,15 @@ function AppShell() {
     pipelineRef,
     paramsRef,
     telRef,
-    cliVersionRef,
-    runControlsRef,
     powerOnRef,
+    runStartedRef,
+    pendingHotControlsRef,
+    flushPendingHotControlsRef,
     applyChangeRef,
     stopForEngineSetupRef,
     updateApp,
     noteError,
     gotoView,
-    hasRunControl,
-    reportMissingRunControl,
     onRunReservedRef,
     onRunStartedRef,
   });
@@ -1765,26 +1790,29 @@ function AppShell() {
       gotoView(kind === "nvidia_afx_aec" ? "rtxsetup" : "engine");
       noteError("Auto Start could not run because the selected engine is not ready.");
       revealMainWindow();
-      settleStartupLaunch().catch(() => {});
+      settleStartupOnce();
       return;
     }
     void autoStartRunRef.current().then((runId) => {
       if (runId != null) return;
       revealMainWindow();
-      settleStartupLaunch().catch(() => {});
+      settleStartupOnce();
     });
-  }, [kind, nvafxChecked, powerOn, runtimeCleanupReady, startupCoreReady, startupMode]);
+  }, [kind, nvafxChecked, powerOn, runtimeCleanupReady, settleStartupOnce, startupCoreReady, startupMode]);
 
   useEffect(() => {
     if (
-      startupMode === "autostart" &&
-      autostartHadStartedRef.current &&
-      !powerOn &&
-      err
+      shouldRevealAutostartFailure({
+        mode: startupMode,
+        attempted: autoStartAttemptedRef.current,
+        running: powerOn,
+        err,
+      })
     ) {
       revealMainWindow();
+      settleStartupOnce();
     }
-  }, [err, powerOn, startupMode]);
+  }, [err, powerOn, settleStartupOnce, startupMode]);
 
   // 平台 + 设备/处理器枚举 + 设备热插拔
   useEffect(() => {
@@ -2371,7 +2399,7 @@ function AppShell() {
           <SlideSwitch
             on={uiOn}
             onToggle={togglePower}
-            disabled={busy || bypassPending != null}
+            disabled={busy || probing || bypassPending != null}
           />
           <RuntimeStatusStrip statusKind={statusKind} />
           <RuntimeSubline
@@ -2609,6 +2637,7 @@ function AppShell() {
             output={selOutput}
             running={powerOn}
             onSetRun={setRunForProbe}
+            onProbingChange={setProbing}
             visible={view === "advanced"}
             trayPrefs={trayPrefs}
             onTrayPrefs={(patch) =>

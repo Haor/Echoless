@@ -1,7 +1,11 @@
-import { memo, useEffect, useRef, useState } from "react";
+import { memo } from "react";
 import { openUrl } from "../api";
 import { useI18n } from "../i18n";
-import { useRuntimeLive } from "../runtimeTelemetry";
+import {
+  useRunStatusKind,
+  useRuntimeLive,
+  type RunStatusKind,
+} from "../runtimeTelemetry";
 import { ScrambleText } from "./ScrambleText";
 import { dash } from "../numeric";
 
@@ -9,10 +13,8 @@ import { dash } from "../numeric";
 export const SYS_AUDIO_PRIVACY_URL =
   "x-apple.systempreferences:com.apple.preference.security?Privacy_AudioCapture";
 
-// 运行五态:工作中 / 无参考 / 不稳定 / 穿透(P8-D1:OFF = mic 直通) / 已停止。
-export type RunStatusKind = "live" | "noref" | "warn" | "bypass" | "stopped";
+export { useRunStatusKind, type RunStatusKind };
 
-// srail 监视状态字(v14:随状态 scramble)。
 export const RAIL_TEXT: Record<RunStatusKind, string> = {
   live: "MONITOR LIVE",
   noref: "REF SILENT",
@@ -20,88 +22,6 @@ export const RAIL_TEXT: Record<RunStatusKind, string> = {
   bypass: "AEC BYPASS",
   stopped: "MONITOR HELD",
 };
-
-// 四态判定 + A4 防抖。两层配合:
-//   1. 参考电平滞回:REF 有声(> -100 dBFS)立即视为有参考;判「参考静音」
-//      须连续静音 REF_SILENT_HOLD_MS —— 音乐/语音的自然间隙逐帧跌破阈值,
-//      瞬时判定会让恢复计时不断被重置,状态卡死在 NO REFERENCE。
-//   2. 状态不对称防抖:劣化(live→warn/noref)须稳定 STATUS_HOLD_MS 才显示;
-//      恢复到 live 与电源开关切换立即反映。
-const STATUS_HOLD_MS = 2500;
-const REF_SILENT_HOLD_MS = 3000;
-
-export function useRunStatusKind(
-  powerOn: boolean,
-  refSel: string,
-  dev: boolean,
-  bypassed = false,
-): RunStatusKind {
-  const live = useRuntimeLive();
-
-  // 滞回:记录最近一次「参考有声」时刻;开机时刻也算(给采集链路启动宽限)。
-  const lastRefLoudAt = useRef(0);
-  useEffect(() => {
-    if (powerOn) lastRefLoudAt.current = performance.now();
-  }, [powerOn]);
-  if (live.ref !== null && live.ref > -100) {
-    lastRefLoudAt.current = performance.now();
-  }
-  const refSilent =
-    live.ref !== null &&
-    live.ref <= -100 &&
-    performance.now() - lastRefLoudAt.current > REF_SILENT_HOLD_MS;
-  const hasReference = refSel !== "none" && (dev || !refSilent);
-
-  const raw: RunStatusKind = !powerOn
-    ? "stopped"
-    : bypassed
-      ? "bypass"
-      : !live.healthy
-        ? "warn"
-        : !hasReference
-          ? "noref"
-          : "live";
-
-  const [shown, setShown] = useState<RunStatusKind>(raw);
-  const pending = useRef<{ kind: RunStatusKind; timer: number } | null>(null);
-  useEffect(() => {
-    const clearPending = () => {
-      if (pending.current) {
-        clearTimeout(pending.current.timer);
-        pending.current = null;
-      }
-    };
-    if (raw === shown) {
-      clearPending(); // 候选态回归当前显示 → 取消切换
-      return;
-    }
-    if (
-      raw === "stopped" ||
-      shown === "stopped" ||
-      raw === "bypass" ||
-      shown === "bypass" ||
-      raw === "live"
-    ) {
-      clearPending();
-      setShown(raw); // 开/关机、进出穿透、恢复正常立即反映;只有劣化才防抖
-      return;
-    }
-    if (pending.current?.kind === raw) return; // 已在计时
-    clearPending();
-    const timer = window.setTimeout(() => {
-      pending.current = null;
-      setShown(raw);
-    }, STATUS_HOLD_MS);
-    pending.current = { kind: raw, timer };
-  }, [raw, shown]);
-  useEffect(
-    () => () => {
-      if (pending.current) clearTimeout(pending.current.timer);
-    },
-    [],
-  );
-  return shown;
-}
 
 const BOX_CLASS: Record<RunStatusKind, string> = {
   live: "box",

@@ -197,6 +197,7 @@ export function DiagnosticsPage({
               numeric
               min={1}
               integer
+              disabled={active}
               placeholder={t("unlimited")}
               onCommit={(v) => onSeconds(v as number | null)}
             />

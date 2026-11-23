@@ -6,6 +6,7 @@ import {
   observeStartupRunStarted,
   startupDataReady,
   shouldAttemptAutoStart,
+  shouldRevealAutostartFailure,
   shouldRevealWindow,
 } from "./startupMode";
 
@@ -80,5 +81,32 @@ describe("startup launch policy", () => {
     const reserved = expectStartupRun(early, 11);
 
     expect(reserved.settled).toBe(true);
+  });
+
+  it("reveals the window immediately when autostart fails before or after started (B-11)", () => {
+    expect(
+      shouldRevealAutostartFailure({
+        mode: "autostart",
+        attempted: true,
+        running: false,
+        err: "WASAPI device open failed",
+      }),
+    ).toBe(true);
+    expect(
+      shouldRevealAutostartFailure({
+        mode: "autostart",
+        attempted: true,
+        running: true,
+        err: "transient warning",
+      }),
+    ).toBe(false);
+    expect(
+      shouldRevealAutostartFailure({
+        mode: "manual",
+        attempted: true,
+        running: false,
+        err: "error",
+      }),
+    ).toBe(false);
   });
 });

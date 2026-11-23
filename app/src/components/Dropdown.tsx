@@ -68,7 +68,7 @@ export function Dropdown({
               type="button"
               className={`dd-opt ${o.value === value ? "sel" : ""}`}
               onClick={() => {
-                onChange(o.value);
+                if (!Object.is(o.value, value)) onChange(o.value);
                 setOpen(false);
               }}
             >
