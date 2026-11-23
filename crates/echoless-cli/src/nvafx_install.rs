@@ -327,12 +327,17 @@ fn cmd_nvafx_download_install(a: NvafxDownloadInstallArgs) -> Result<()> {
 
     let release_sha256sums = match fetch_release_sha256sums(tag, &download_dir, a.json) {
         Ok(sums) => sums,
-        Err(err) => {
+        Err(err) if tag == DEFAULT_NVAFX_RELEASE_TAG => {
             install_log(
                 a.json,
-                format!("failed to read SHA256SUMS.txt: {err:#}; will fall back to built-in hashes or only record actual hashes"),
+                format!("failed to read SHA256SUMS.txt: {err:#}; falling back to built-in pins"),
             );
             HashMap::new()
+        }
+        Err(err) => {
+            return Err(err).with_context(|| {
+                format!("refusing to download unverified custom NVAFX release {tag}: failed to read SHA256SUMS.txt")
+            });
         }
     };
 
@@ -349,7 +354,7 @@ fn cmd_nvafx_download_install(a: NvafxDownloadInstallArgs) -> Result<()> {
     download_release_asset(
         &common_url,
         &common_zip,
-        common_expected.as_deref(),
+        Some(common_expected.as_str()),
         common_size,
         "common runtime",
         a.json,
@@ -357,7 +362,7 @@ fn cmd_nvafx_download_install(a: NvafxDownloadInstallArgs) -> Result<()> {
     download_release_asset(
         &model_url,
         &model_zip,
-        model_expected.as_deref(),
+        Some(model_expected.as_str()),
         model_size,
         "model",
         a.json,
@@ -366,8 +371,8 @@ fn cmd_nvafx_download_install(a: NvafxDownloadInstallArgs) -> Result<()> {
     let report = install_nvafx_runtime(NvafxInstallRequest {
         common_zip: &common_zip,
         model_zip: &model_zip,
-        common_sha256: common_expected.as_deref(),
-        model_sha256: model_expected.as_deref(),
+        common_sha256: Some(common_expected.as_str()),
+        model_sha256: Some(model_expected.as_str()),
         install_source: json!({
             "kind": "github-release",
             "tag": tag,
@@ -608,7 +613,7 @@ fn expected_sha256_for_release_asset(
     tag: &str,
     release_sha256sums: &HashMap<String, String>,
     asset: &str,
-) -> Result<Option<String>> {
+) -> Result<String> {
     if tag == DEFAULT_NVAFX_RELEASE_TAG {
         if let Some(embedded) = expected_sha256_for_asset(Path::new(asset)) {
             if let Some(release) = release_sha256sums.get(asset) {
@@ -617,11 +622,15 @@ fn expected_sha256_for_release_asset(
                     "SHA256SUMS.txt does not match the built-in pin: asset={asset}, release={release}, embedded={embedded}"
                 );
             }
-            return Ok(Some(embedded.to_string()));
+            return Ok(embedded.to_string());
         }
     }
 
-    Ok(release_sha256sums.get(asset).cloned())
+    release_sha256sums.get(asset).cloned().with_context(|| {
+        format!(
+            "refusing to extract unverified asset {asset} from release {tag}: missing entry in SHA256SUMS.txt"
+        )
+    })
 }
 
 fn expected_size_for_release_asset(tag: &str, asset: &str) -> Option<u64> {
@@ -1014,9 +1023,18 @@ fn extract_zip(zip_path: &Path, dest: &Path) -> Result<()> {
         let mut entry = archive.by_index(index).with_context(|| {
             format!("failed to read zip entry #{index}: {}", zip_path.display())
         })?;
-        let enclosed = entry
-            .enclosed_name()
-            .with_context(|| format!("unsafe zip entry path: {}", entry.name()))?;
+        if entry.is_symlink() {
+            bail!(
+                "refusing to extract symlink zip entry: {}",
+                String::from_utf8_lossy(entry.name_raw())
+            );
+        }
+        let enclosed = entry.enclosed_name().with_context(|| {
+            format!(
+                "unsafe zip entry path: {}",
+                String::from_utf8_lossy(entry.name_raw())
+            )
+        })?;
         let out_path = dest.join(enclosed);
         if entry.is_dir() {
             create_dir_all(&out_path)
@@ -1379,9 +1397,8 @@ mod tests {
                 &sums,
                 NVAFX_COMMON_RUNTIME_ASSET
             )
-            .unwrap()
-            .as_deref(),
-            Some("dcacac954b7973ae18369b252d13f24b973b10114d00e5293eab0713601c7bcb")
+            .unwrap(),
+            "dcacac954b7973ae18369b252d13f24b973b10114d00e5293eab0713601c7bcb"
         );
         assert_eq!(
             expected_sha256_for_release_asset(
@@ -1389,25 +1406,25 @@ mod tests {
                 &HashMap::new(),
                 NVAFX_COMMON_RUNTIME_ASSET,
             )
-            .unwrap()
-            .as_deref(),
-            Some("dcacac954b7973ae18369b252d13f24b973b10114d00e5293eab0713601c7bcb")
-        );
-        assert_eq!(
-            expected_sha256_for_release_asset(
-                "custom-tag",
-                &HashMap::new(),
-                NVAFX_COMMON_RUNTIME_ASSET
-            )
             .unwrap(),
-            None
+            "dcacac954b7973ae18369b252d13f24b973b10114d00e5293eab0713601c7bcb"
+        );
+        let missing_err = expected_sha256_for_release_asset(
+            "custom-tag",
+            &HashMap::new(),
+            NVAFX_COMMON_RUNTIME_ASSET,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            missing_err.contains("missing entry in SHA256SUMS.txt"),
+            "{missing_err}"
         );
 
         assert_eq!(
             expected_sha256_for_release_asset("custom-tag", &sums, NVAFX_COMMON_RUNTIME_ASSET)
-                .unwrap()
-                .as_deref(),
-            Some("dcacac954b7973ae18369b252d13f24b973b10114d00e5293eab0713601c7bcb")
+                .unwrap(),
+            "dcacac954b7973ae18369b252d13f24b973b10114d00e5293eab0713601c7bcb"
         );
     }
 
