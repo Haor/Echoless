@@ -523,20 +523,6 @@ async fn enqueue_run_control(state: &RunState, line: String) -> Result<(), Strin
 }
 
 #[tauri::command]
-pub(crate) async fn set_bypass(state: State<'_, RunState>, enabled: bool) -> Result<(), String> {
-    let line = bypass_control_line(enabled);
-    enqueue_run_control(&state, line).await
-}
-
-pub(crate) fn bypass_control_line(enabled: bool) -> String {
-    json!({
-        "cmd": "set_bypass",
-        "enabled": enabled,
-    })
-    .to_string()
-}
-
-#[tauri::command]
 pub(crate) fn stop_run(
     app: tauri::AppHandle,
     state: State<RunState>,

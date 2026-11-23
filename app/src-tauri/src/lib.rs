@@ -36,7 +36,7 @@ use localvqe::{download_localvqe_model, localvqe_assets};
 use nvafx::{nvafx_doctor, nvafx_download_install, nvafx_install};
 use platform::{default_diag_dir, open_diagnostics_dir, open_path, open_url};
 use proc::{terminate_run, RunState};
-use sidecar::{probe_delay, send_run_control, set_bypass, start_run, stop_run, validate_config};
+use sidecar::{probe_delay, send_run_control, start_run, stop_run, validate_config};
 use startup::{
     get_autostart_enabled, get_startup_mode, set_autostart_enabled, settle_startup_launch,
     should_focus_existing_instance, StartupLaunch, AUTOSTART_WATCHDOG_TIMEOUT,
@@ -75,8 +75,6 @@ pub fn run() {
 
     #[cfg(target_os = "windows")]
     let builder = builder.manage(TrayIconState(Mutex::new(None)));
-    #[cfg(target_os = "macos")]
-    let builder = builder.manage(device_watch::DeviceWatchState::default());
 
     builder
         .invoke_handler(tauri::generate_handler![
@@ -100,7 +98,6 @@ pub fn run() {
             validate_config,
             start_run,
             send_run_control,
-            set_bypass,
             stop_run,
             set_tray_prefs,
             get_startup_mode,
@@ -181,10 +178,7 @@ pub fn run() {
                 register_windows_tray(app)?;
             }
             #[cfg(target_os = "macos")]
-            {
-                let device_watch_state = app.state::<device_watch::DeviceWatchState>();
-                device_watch::start(app.handle(), &device_watch_state);
-            }
+            device_watch::start(app.handle());
             let _ = &window;
             Ok(())
         })
@@ -207,8 +201,6 @@ pub fn run() {
             // 统一在 ExitRequested 回收 sidecar,避免孤儿 CLI 占用麦克风/虚拟麦。
             if let tauri::RunEvent::ExitRequested { .. } = event {
                 let _ = terminate_run(&app_handle.state::<RunState>());
-                #[cfg(target_os = "macos")]
-                device_watch::stop(&app_handle.state::<device_watch::DeviceWatchState>());
             }
         });
 }

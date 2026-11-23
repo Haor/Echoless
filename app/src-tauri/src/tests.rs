@@ -6,7 +6,6 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::json;
-use serde_json::Value;
 
 use crate::bin_resolve::find_localvqe_library_in_dir;
 use crate::localvqe::{
@@ -24,7 +23,7 @@ use crate::proc::{
     ChildShutdownTarget, JsonlLineEvent, RunChild, RunControlWriter, RunFinalization, RunState,
 };
 use crate::sidecar::write_run_control_line;
-use crate::sidecar::{attach_run_id, bypass_control_line, is_recoverable_stream_failure};
+use crate::sidecar::{attach_run_id, is_recoverable_stream_failure};
 use crate::tray::{set_tray_prefs_inner, TrayPrefs};
 
 static DATA_ROOT_ENV_LOCK: Mutex<()> = Mutex::new(());
@@ -270,17 +269,6 @@ fn run_state_guard_recovers_poisoned_lock() {
     let guard = run_state_guard(&state);
     assert!(guard.child.is_none());
     assert!(guard.active_run_id.is_none());
-}
-
-#[test]
-fn bypass_control_line_matches_runtime_contract() {
-    let enabled: Value = serde_json::from_str(&bypass_control_line(true)).unwrap();
-    assert_eq!(enabled["cmd"], "set_bypass");
-    assert_eq!(enabled["enabled"], true);
-
-    let disabled: Value = serde_json::from_str(&bypass_control_line(false)).unwrap();
-    assert_eq!(disabled["cmd"], "set_bypass");
-    assert_eq!(disabled["enabled"], false);
 }
 
 #[test]
@@ -615,7 +603,7 @@ fn write_run_control_line_reports_exited_writer_before_stop_reaps_child() {
         });
     }
 
-    let err = write_run_control_line(&state, &bypass_control_line(true)).unwrap_err();
+    let err = write_run_control_line(&state, r#"{"cmd":"set_bypass","enabled":true}"#).unwrap_err();
 
     assert!(err.contains("write run control failed"), "{err}");
     assert_eq!(terminate_run(&state), Some(1));
